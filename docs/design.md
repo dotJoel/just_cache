@@ -338,7 +338,9 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   the journal and startup recovery; CI running the EXDEV path. P0 is closed.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
-  within a tier; scrubbing.
+  within a tier; scrubbing. *(The filesystem half of `explain` has shipped in the symlink
+  provider: it reports the mover's own decision and carries the seam the catalog slots
+  into; the catalog-backed `explain`/`locate`/`restore` land with the catalog itself.)*
 - **P2 — FUSE namespace provider**: observe accesses properly; streaming recall;
   pins/restore semantics; gateway (S3/WebDAV) provider; cache overlays (§2.1) — a RAM
   promotion target first, since the same construct later fronts the HDD pool with SSD.
@@ -412,6 +414,26 @@ Still open, and honestly so:
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
 - Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
+- **`explain` never moved files and reads the filesystem, not the catalog.** The command
+  is the first half of the P1 item: it evaluates scope, guards and policy in the mover's
+  order and reports the outermost reason, but its "where does this live / when was it last
+  accessed" answers come from the filesystem. `src/explain.rs` carries a single commented
+  seam (`catalog_answer`) that returns `None` until the catalog exists; it names the one
+  query the catalog must provide (existence, `state`, primary `location`, `last_access`
+  and its provenance, `accesses`, `pinned_until`, `rule`). A disagreement between the two
+  sources is reported, not resolved silently — the branch exists and is tested through an
+  injected answer, but no catalog is read yet, because its schema belongs to the catalog
+  issue and guessing it would collide with the build happening in parallel.
+- **`explain` answers for one path, so it cannot account for the per-sweep `--limit`.**
+  A file can be in scope, unguarded and cold and still miss its slot to older files in a
+  real sweep over the tree. The command says what the policy decides for the path, not
+  what one particular sweep's ordering decided; naming the difference is preferable to a
+  "would move now" that a tree-level tie-break could overrule.
+- **The atime→mtime fallback cannot be reached on a normal Linux mount.** `stat` reports
+  an access time even under `noatime` (it is simply not updated), so the fallback branch
+  is exercised at its decision point in a unit test rather than end to end. What `explain`
+  *can* surface on such a mount is the symptom: when atime equals mtime it says so, since
+  the stamp may then be the last write rather than the last read.
 
 ## 10. Non-goals
 

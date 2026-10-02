@@ -17,9 +17,10 @@ just_cache \
 ```
 
 That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
-entries keep working); `just_cache sweep ...` is the explicit form, and
+entries keep working); `just_cache sweep ...` is the explicit form,
 [`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
-still agree.
+still agree, and [`just_cache explain ...`](#explaining-one-path) answers why one path is
+where it is.
 
 ## Why
 
@@ -217,6 +218,55 @@ excludes.
 `/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
 episode.
 
+## Explaining one path
+
+A sweep reports in aggregate, and `-v` buries each reason among every other file. When
+the question is "why is *this* file still here?", `explain` answers it for one path, in
+the order the mover evaluates — and it is read-only:
+
+```sh
+just_cache explain /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --min-idle-days 30
+```
+
+```
+explain: /mnt/cache/media/shows/s1/ep1.mkv
+  scope:   managed: no --include set, so every path under the watched tree is fair game; 1.2 GiB is within the [0 B, unlimited) size window
+  guards:  clear: not open by another process; 1 link(s), hardlinks refused; size unchanged since this scan
+  policy:  last use 1735689600 (2025-01-01T00:00:00Z) via atime; idle 154.0 d against --min-idle-days 30.0; not a symlink; 0 witnessed access(es) in this run (pin 1)
+  verdict: would move now -> /mnt/disk-slow/media/shows/s1/ep1.mkv (tier 0)
+```
+
+The four sections are the mover's own gates, in its own order, and the **outermost**
+decisive reason wins: a file that is both out of scope and too warm answers with the
+`--exclude` that excluded it and marks the later stages `not evaluated`, because that is
+the gate a sweep never reaches.
+
+- **scope** names the rule — `excluded by --exclude 'node_modules'`, `below the 1.0 MiB
+  size floor (5 B)`, `not under any --include pattern (...)`.
+- **guards** reports the pid holding a file open (when the `/proc` scan could see it), the
+  link count, and whether the size moved since the scan.
+- **policy** prints the last-use stamp and its *source* (atime, or the mtime fallback),
+  the idle duration against `--min-idle-days`, and the access pin.
+- **verdict** is `would move now`, `would move in N days`, or `would never move: <reason>`.
+
+Already-migrated paths answer with the cold location and the tier the symlink resolves
+into; a path that does not exist says so. `--json` prints the same content as a stable
+document, for a UI or a test.
+
+The exit code is the script contract: **`0` when the engine manages the path** (a sweep
+would move it now, or it is already a symlink into a configured tier), **`1` when it
+would not be moved** — out of scope, guarded, too warm, outside every tier, or absent —
+and **`2` on a bad invocation. `1` is an answer, not an error: a warm in-scope file is
+exit `1` on purpose.
+
+```sh
+# act only on files that are actually about to move
+just_cache explain "$path" --watch /mnt/cache/media --dest /mnt/disk-slow/media && reclaim "$path"
+```
+
 ## Auditing consistency
 
 The mover leaves one of a few states behind, and they can drift apart: a crash between
@@ -322,8 +372,10 @@ directories, a source that changed since the scan), the policy (idle thresholds,
 oldest-first ordering, access pins, dry runs, full tiers), scope (include/exclude globs
 and the size window), the guards (a real second process holding a real descriptor, and
 hardlinked pairs), metadata and sparseness across a real mount point, journal recovery
-(each crash state, plus the CLI against a damaged journal), and audit (every
-classification, the checksum-guarded repair, and the exit-code contract cron sees).
+(each crash state, plus the CLI against a damaged journal), audit (every
+classification, the checksum-guarded repair, and the exit-code contract cron sees), and
+explain (the four-stage ordering, a real holding process named by pid, the migrated and
+missing cases, and the exit-code contract through the binary — `--json` included).
 
 A few of these drive the actual binary rather than the library, because the promises that
 matter — exit codes, recovery messages, refusing to sweep with an unreadable journal —
@@ -379,12 +431,14 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
+| [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit` and `catalog` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog` and `explain` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
+| [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
