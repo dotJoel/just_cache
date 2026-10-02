@@ -478,11 +478,20 @@ just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
   --dest /mnt/disk-slow/media
 ```
 
-The cold copy is found by *state*, independently of the catalog (this command predates it
-and still does not read it): if the path is a symlink that resolves, its target is the copy
-the mover left; otherwise — a broken link, or a name that vanished — the mirrored relative
-path under each `--dest`, in order. If several candidates hold **different** bytes for one
-name, restore refuses and names them rather than guessing which tier is right.
+The cold copy itself is found by *state*, not by the catalog: if the path is a symlink
+that resolves, its target is the copy the mover left; otherwise — a broken link, or a
+name that vanished — the mirrored relative path under each `--dest`, in order. If several
+candidates hold **different** bytes for one name, restore refuses and names them rather
+than guessing which tier is right.
+
+The **verification**, though, prefers the catalog when one exists — `--catalog <FILE>`,
+or the default `.just_cache-catalog.sqlite` beside the watch root that `catalog sync`
+writes (consulted only if it is already there; `restore` never creates one). With a
+catalog, the restored bytes are checked against the object's **recorded checksum**, so a
+cold copy that was already corrupt is refused instead of restored faithfully, and a
+catalog that does not name the path is a hard error rather than a silent skip of the
+check. Without a catalog the bytes are verified against the cold copy itself — a torn
+copy is still caught, a pre-corrupt one cannot be.
 
 What it guarantees:
 
@@ -513,9 +522,10 @@ just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
 ```
 
 A named gap: with no catalog there is no recorded digest to check a cold copy against
-*before* copying it, so a copy that was already corrupt would be restored faithfully. The
-read-back catches a torn copy; only the catalog (issue #16) can catch a corrupt one, and
-`docs/design.md` §9 says so.
+*before* copying it, so a copy that was already corrupt would be restored faithfully —
+the read-back catches a torn copy, and only a catalog can catch a corrupt one
+(`docs/design.md` §9). With a catalog, restore verifies against the recorded checksum and
+refuses a corrupt cold copy; without one, that limitation is inherent and named.
 
 ## Scrubbing for bitrot
 

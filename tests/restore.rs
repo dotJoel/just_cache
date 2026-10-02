@@ -13,11 +13,31 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use just_cache::catalog::{Catalog, CATALOG_NAME};
 use just_cache::disk_management;
 use just_cache::restore::{self, RestoreOutcome, RestoreRequest};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_just_cache"))
+}
+
+/// Run `catalog sync` for the tree, creating the default catalog beside the watch root.
+/// Asserts it succeeded: the restore tests below are only meaningful against a real
+/// catalog, so a silent failure here would let them pass without one.
+fn sync_catalog(watch: &Path, cold: &Path) {
+    let output = bin()
+        .args(["catalog", "sync", "--watch"])
+        .arg(watch)
+        .arg("--dest")
+        .arg(cold)
+        .output()
+        .expect("catalog sync runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "catalog sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn link(target: &Path, at: &Path) {
@@ -89,6 +109,7 @@ fn restore_materializes_a_migrated_file_and_keeps_the_cold_copy() {
         watch: &watch,
         dests: &dests,
         remove_copy: false,
+        catalog: None,
     })
     .unwrap();
 
@@ -392,4 +413,155 @@ fn restore_brings_bytes_back_across_a_mount_point() {
     assert_eq!(fs::read(&hot).unwrap(), bytes_again, "still the same bytes");
     assert!(!cold_copy.exists(), "the cold copy is dropped");
     assert!(support::partial_files(&watch).is_empty());
+}
+
+/// With a catalog, the restored bytes are verified against the object's recorded checksum
+/// and the restore succeeds when they agree. The catalog is named explicitly here to
+/// exercise the `--catalog` form; the default-beside-the-watch case is covered below.
+#[test]
+fn restore_verifies_against_the_catalog_recorded_checksum() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("shows")).unwrap();
+    fs::create_dir_all(cold.join("shows")).unwrap();
+    let bytes = payload(16 * 1024);
+    fs::write(watch.join("shows/ep1.mkv"), &bytes).unwrap();
+    let hot = migrate(&watch, &cold, "shows/ep1.mkv");
+    sync_catalog(&watch, &cold);
+
+    let catalog = Catalog::default_path(&watch);
+    assert!(catalog.is_file(), "sync must have written the catalog");
+    assert_eq!(
+        catalog.file_name().unwrap().to_string_lossy(),
+        CATALOG_NAME,
+        "the default catalog lives beside the watch root"
+    );
+
+    let (code, stdout, stderr) = restore_via_binary(
+        &hot,
+        &watch,
+        &cold,
+        &["--catalog", catalog.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("restored"), "stdout: {stdout}");
+    assert_eq!(
+        fs::read(&hot).unwrap(),
+        bytes,
+        "the verified bytes read back"
+    );
+    assert!(!fs::symlink_metadata(&hot).unwrap().is_symlink());
+    assert!(cold.join("shows/ep1.mkv").is_file(), "the cold copy stays");
+}
+
+/// A cold copy that no longer matches the catalog's recorded checksum is refused, and
+/// nothing is touched: the hot path keeps its symlink, the cold bytes are left alone, and
+/// the private partial is cleaned up. This is the case a no-catalog restore cannot see —
+/// it would copy the corrupt bytes back and only compare them against themselves.
+///
+/// The default catalog beside the watch root is consulted when it exists (no `--catalog`
+/// flag is passed), so this also proves the open-if-present rule reaches restore.
+#[test]
+fn a_cold_copy_that_fails_the_catalog_checksum_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("shows")).unwrap();
+    fs::create_dir_all(cold.join("shows")).unwrap();
+    let bytes = payload(4096);
+    fs::write(watch.join("shows/ep1.mkv"), &bytes).unwrap();
+    let hot = migrate(&watch, &cold, "shows/ep1.mkv");
+    sync_catalog(&watch, &cold);
+    assert!(
+        Catalog::default_path(&watch).is_file(),
+        "the default catalog must exist for this test to mean anything"
+    );
+
+    // Corrupt the cold copy after the catalog recorded the good checksum. The catalog's
+    // digest is now the only thing that can tell these bytes are wrong.
+    let cold_copy = cold.join("shows/ep1.mkv");
+    fs::write(&cold_copy, b"bitrot, not the movie").unwrap();
+
+    let (code, stdout, stderr) = restore_via_binary(&hot, &watch, &cold, &[]);
+    assert_eq!(
+        code, 1,
+        "a checksum mismatch is a hard error; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("recorded checksum"),
+        "the refusal must name the catalog checksum: {stderr}"
+    );
+    assert!(
+        fs::symlink_metadata(&hot).unwrap().is_symlink(),
+        "the hot path must be left exactly as it was"
+    );
+    assert_eq!(
+        fs::read(&cold_copy).unwrap(),
+        b"bitrot, not the movie",
+        "the cold bytes must be untouched"
+    );
+    assert!(
+        support::partial_files(&watch).is_empty(),
+        "no .just_cache-partial-* leftovers: {:?}",
+        support::partial_files(&watch)
+    );
+    assert!(stdout.is_empty(), "nothing to report on stdout: {stdout}");
+}
+
+/// Without a catalog the behaviour is unchanged, and restore never brings one into being
+/// (invariant 9): the bytes come back, and no catalog file appears beside the watch root.
+#[test]
+fn restore_without_a_catalog_is_unchanged_and_creates_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let bytes = payload(1024);
+    fs::write(watch.join("clip.mov"), &bytes).unwrap();
+    let hot = migrate(&watch, &cold, "clip.mov");
+    assert!(
+        !Catalog::default_path(&watch).exists(),
+        "no catalog exists before the restore"
+    );
+
+    let (code, stdout, stderr) = restore_via_binary(&hot, &watch, &cold, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("restored"), "stdout: {stdout}");
+    assert_eq!(fs::read(&hot).unwrap(), bytes);
+    assert!(
+        !Catalog::default_path(&watch).exists(),
+        "restore must not create a catalog"
+    );
+}
+
+/// An explicitly named catalog that is not there is a usage error (exit 2), not a quiet
+/// fall back to filesystem-only verification.
+#[test]
+fn a_missing_named_catalog_is_a_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("clip.mov"), b"payload").unwrap();
+    let hot = migrate(&watch, &cold, "clip.mov");
+
+    let missing = tmp.path().join("nowhere.sqlite");
+    let (code, _, stderr) = restore_via_binary(
+        &hot,
+        &watch,
+        &cold,
+        &["--catalog", missing.to_str().unwrap()],
+    );
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(
+        stderr.contains("does not exist"),
+        "the usage error must say so: {stderr}"
+    );
+    assert!(
+        fs::symlink_metadata(&hot).unwrap().is_symlink(),
+        "nothing may be touched on a bad invocation"
+    );
 }

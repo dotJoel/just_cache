@@ -395,6 +395,14 @@ struct RestoreArgs {
     #[arg(long)]
     remove_copy: bool,
 
+    /// The catalog to verify the restored bytes against. Defaults to
+    /// `.just_cache-catalog.sqlite` beside the watch root, and is consulted only when that
+    /// file already exists — `restore` never creates a catalog. With a catalog, the
+    /// restored bytes are checked against the object's recorded checksum; with none,
+    /// against the cold copy, exactly as before.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
     /// Print only problems.
     #[arg(short, long)]
     quiet: bool,
@@ -921,11 +929,44 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
 
+    // The same open-if-present rule `audit` and `explain` use. An explicitly named
+    // catalog must exist: naming a file that is not there is a bad invocation, not a
+    // quiet fallback. The default beside the watch root is consulted only when it is
+    // already present — restore must never create a catalog (invariant 9), and one
+    // conjured empty here would answer "not in the catalog" for a tree that is fine.
+    let catalog_path = match &args.catalog {
+        Some(path) => {
+            if !path.is_file() {
+                eprintln!(
+                    "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+                    path.display()
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+            Some(path.clone())
+        }
+        None => {
+            let default = catalog::Catalog::default_path(&args.watch);
+            default.is_file().then_some(default)
+        }
+    };
+    let catalog = match &catalog_path {
+        Some(path) => match catalog::Catalog::open(path) {
+            Ok(catalog) => Some(catalog),
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+
     let request = RestoreRequest {
         path: &args.path,
         watch: &args.watch,
         dests: &args.dest,
         remove_copy: args.remove_copy,
+        catalog: catalog.as_ref(),
     };
     match restore::restore(&request) {
         Ok(outcome) => {
