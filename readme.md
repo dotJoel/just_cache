@@ -170,6 +170,40 @@ existing symlinks, resumed moves, size conflicts, same-named files in sibling
 directories), and the policy (idle thresholds, oldest-first ordering, access pins, dry
 runs, full tiers).
 
+### Testing the cross-device move
+
+A cold tier is a different mount by definition, so out in the world `rename` always
+fails with `EXDEV` and the move falls back to copy-then-delete. That fallback is the
+only path that can leave a partial file behind, so it is worth testing — but the rest
+of the suite keeps source and destination on one filesystem and never reaches it.
+
+The cross-device tests (`tests/cross_device.rs`) need a directory on a *second*
+filesystem. Point `JUST_CACHE_TEST_SECOND_FS` at one — a tmpfs is easiest:
+
+```sh
+sudo mkdir -p /mnt/just_cache_test
+sudo mount -t tmpfs -o size=256m tmpfs /mnt/just_cache_test
+
+JUST_CACHE_TEST_SECOND_FS=/mnt/just_cache_test cargo test
+sudo umount /mnt/just_cache_test   # when you are done
+```
+
+The tests compare the `st_dev` of the source and destination and refuse to run unless
+they really differ, so pointing the variable at an ordinary directory cannot turn them
+into a silent same-filesystem no-op. With no second filesystem available they **skip**
+(and say so on stderr) rather than fail, because a developer machine is not expected to
+have a spare mount. CI does have one — the workflow mounts a tmpfs — so it also sets
+`JUST_CACHE_REQUIRE_SECOND_FS=1`, which turns that skip into a hard failure. That way a
+broken mount in CI can never leave the job green while the coverage quietly disappears.
+
+They check byte-for-byte equality of the copied file, that reading through the
+symlink still works and resolves to the cold copy, that a failed copy (a source that
+shrinks after the scan) leaves the source untouched and both the destination and its
+`.just_cache-partial-*` temporary file cleaned up.
+
+A sibling set of tests for metadata preservation and interruption/repair uses the same
+`tests/support` helpers and the same two environment variables.
+
 ## Layout
 
 | Path | Contents |
@@ -179,6 +213,8 @@ runs, full tiers).
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
+| [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
+| [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 
 ## Design
 

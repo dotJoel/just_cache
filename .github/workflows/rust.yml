@@ -35,5 +35,22 @@ jobs:
 
     - name: Build
       run: cargo build --verbose
+    # A cold tier is a different mount, so production always moves files onto it with a
+    # copy — `rename` cannot cross a filesystem boundary. The ordinary tests keep source
+    # and destination on one filesystem and never reach that code, which is the only
+    # path that can leave a partial file behind. Mount a second filesystem here and the
+    # cross_device tests exercise it for real; JUST_CACHE_REQUIRE_SECOND_FS makes them
+    # fail loudly if this mount ever stops working, instead of skipping silently.
+    - name: Mount a second filesystem for cross-device tests
+      run: |
+        second_fs="$(mktemp -d)"
+        sudo mount -t tmpfs -o size=256m tmpfs "$second_fs"
+        echo "JUST_CACHE_TEST_SECOND_FS=$second_fs" >> "$GITHUB_ENV"
+        echo "JUST_CACHE_REQUIRE_SECOND_FS=1" >> "$GITHUB_ENV"
+
     - name: Run tests
       run: cargo test --verbose
+
+    - name: Unmount the second filesystem
+      if: always()
+      run: sudo umount "${JUST_CACHE_TEST_SECOND_FS:-}" || true
