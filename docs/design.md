@@ -252,6 +252,54 @@ Cost-aware placement (later phase): given a tier's cost model, report — and
 optionally act on — the delta of keeping each subtree where it is. This is the part
 S3 does inside one provider and self-hosted stacks don't do at all.
 
+### 5.1 Scope and exclusions: an allowlist, with size and path filters
+
+Nobody wants everything moved. A lifecycle engine that acts on a whole tree by default
+is a foot-gun, so scope is explicit and comes in three layers:
+
+```toml
+[scope]
+# Layer 1: only these subtrees are managed at all. Nothing outside them is observed,
+# scored, reported or moved — a tree is opted in, never swept by default.
+include = ["media/**", "scratch/**", "backups/nightly/**"]
+
+[scope.never]
+# Layer 2: patterns that are never candidates, at any tier, by any rule.
+paths = ["**/node_modules/**", "**/.git/**", "**/*.part", "**/*.db", "**/*.sqlite*"]
+# Live application state: moving it under a running writer is a corruption, not a
+# stale copy.
+min_size = "1MiB"          # symlink churn over 4 KiB files buys nothing
+max_size = "500GiB"        # a huge image takes hours to move; handle deliberately
+
+[scope.never.offsite]
+# Layer 3: tier-specific vetoes — never send this anywhere off the machine, no matter
+# how cold it gets.
+paths = ["documents/personal/**", "**/*.kdbx", "**/id_rsa*"]
+```
+
+Why the layers are separated:
+
+- **Allowlist over denylist.** A denylist fails open: a new directory nobody thought
+  about gets swept. An allowlist fails closed, which is the only acceptable direction
+  for something that moves other people's files.
+- **Size bounds are policy, not trivia.** Tiny files make symlinks that cost more than
+  the bytes they save; enormous files turn a sweep into a multi-hour transfer and a
+  free-space gamble. Both deserve to be named in config rather than hit by accident.
+- **Tier-specific vetoes matter once remote tiers exist.** Cost and latency are not the
+  only reasons to keep data home — privacy and legal scope are, and the moment a tier
+  leaves the building the answer can differ per subtree.
+- **Exclusions are explainable too.** `just_cache explain <path>` must be able to say
+  "not managed: outside `scope.include`" or "excluded by `scope.never.paths`", in the
+  same way it names the rule that moved something. An exclusion that cannot be
+  explained is indistinguishable from a bug.
+- **Belt and braces in the mover.** Exclusion is checked where candidates are chosen
+  *and* again immediately before the bytes move, so a miscomputed rule or a stale
+  catalog entry cannot move something an exclusion protects.
+
+This is a P0 requirement for the existing tool, not a future nicety: `--include` and
+`--exclude` globs, plus `--min-size`/`--max-size`, belong in the CLI before anyone
+points it at a real tree.
+
 ## 6. Durability
 
 - **Checksums everywhere**: computed at ingest, verified on every copy and at scrub.
@@ -283,9 +331,10 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
 ## 8. Phases
 
 - **P0 — harden what exists** (symlink provider): journal + startup repair;
-  preserve mode/owner/xattrs/sparse; `--exclude` globs; size floor/ceiling; do-not-move
-  if the file is open or hardlinked elsewhere; `audit` command (cold copies without a
-  symlink, symlinks without a target); CI test that exercises the EXDEV path.
+  preserve mode/owner/xattrs/sparse; scope controls — `--include`/`--exclude` globs and
+  `--min-size`/`--max-size` (§5.1); do-not-move if the file is open or hardlinked
+  elsewhere; `audit` command (cold copies without a symlink, symlinks without a target);
+  CI test that exercises the EXDEV path.
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
   within a tier; scrubbing.
@@ -307,6 +356,8 @@ part nothing else does.
   adoption compares size only.
 - Crash window between source removal and symlink creation (P0's journal fixes it).
 - No open-file/hardlink guard before moving a file.
+- No scope controls: everything under `--watch` is a candidate, with no include/exclude
+  globs and no size bounds (§5.1).
 - CI never exercises the EXDEV path the mover actually takes in production.
 - Access tracking depends on atime semantics of the host mounts.
 
