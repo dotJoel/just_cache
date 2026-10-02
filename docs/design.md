@@ -338,9 +338,12 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   the journal and startup recovery; CI running the EXDEV path. P0 is closed.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
-  within a tier; scrubbing. *(The filesystem half of `explain` has shipped in the symlink
-  provider: it reports the mover's own decision and carries the seam the catalog slots
-  into; the catalog-backed `explain`/`locate`/`restore` land with the catalog itself.)*
+  within a tier; scrubbing. *(Two-disk replication has shipped as `sweep --copies N`
+  with verify-before-delete, a recorded per-tier floor, and `under-replicated` /
+  `replica-lost` reporting; the copy is same-host — see §9 and §10. The filesystem half
+  of `explain` has shipped in the symlink provider: it reports the mover's own decision
+  and carries the seam the catalog slots into; the catalog-backed
+  `explain`/`locate`/`restore` land with the catalog itself.)*
 - **P2 — FUSE namespace provider**: observe accesses properly; streaming recall;
   pins/restore semantics; gateway (S3/WebDAV) provider; cache overlays (§2.1) — a RAM
   promotion target first, since the same construct later fronts the HDD pool with SSD.
@@ -376,6 +379,29 @@ is never stranded pointing at an object with nowhere to live.
 
 Still open, and honestly so:
 
+- **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
+  N distinct `--dest` roots before it retires the source, and `catalog sync --copies N`
+  records the floor per tier and reports objects below it as `under-replicated` (a lost
+  copy is a `location-missing` finding that names the disk it was on). What distinctness
+  means is a configured *root*, not a device: two directories on one pool count as two,
+  and the operator can see that in the command they ran. With a floor of 2 and one other
+  disk the second copy lands on that disk on the **same host** — this is replication
+  across a disk failure, not off-host backup (§10); a machine-level loss still takes both
+  copies. Off-host tiers are P3.
+- **A disk that was out is reported, not reconciled.** Re-adding a disk that was missing
+  during a sweep does not yet rebuild the copies that were never made from a surviving
+  sibling; `audit --copies N` reports `replica-lost` and `catalog sync --copies N` reports
+  `under-replicated`, and a human runs the sweep again. Nothing recreates a missing copy
+  automatically, and nothing is deleted to balance a floor.
+- **A copy the mover could not verify is unknown, never good.** The mover counts only a
+  copy whose read-back digest matched, and it does not retire the source until the floor
+  is met; the catalog's `location.verified` is 0 until a sync hashes the bytes, and rows
+  that stay unverified are reported as `replica-unknown`. The state a crash between
+  "written" and "checked" leaves is that unknown row, and no floor counts it.
+- **`--limit` under replication is per sweep, not per disk.** With `--copies N` the sweep
+  replicates the same `--limit` candidates across all destinations; it does not fill each
+  disk to its own limit first, because a floor is about one object living in N places, not
+  about how many objects a disk takes.
 - **A tree edited by hand is reported, not reconciled.** A name the catalog recorded that
   is gone or now hashes differently, and a location whose file vanished or was replaced,
   are reported — `sync` exits non-zero — and their rows are left exactly as they were; new
@@ -453,6 +479,11 @@ Still open, and honestly so:
 
 ## 10. Non-goals
 
+- **Off-host replication is not what a floor of 2 buys.** The `--copies` floor replicates
+  within (or across) the destinations on one host; it survives a disk failure, not the
+  loss of the machine or a site. Remote/object/offline tiers are P3, and until they exist
+  a floor of 2 is not a backup. More than one copy *per disk* is backup tooling too, and
+  is out of scope (§6.1 of the issue).
 - Block-level tiering (dm-cache/bcache/L2ARC): different layer, no per-file policy;
   out of scope but composes (a block cache in front of this is fine).
 - Multi-user quotas/permissions: single-trust-domain system.
