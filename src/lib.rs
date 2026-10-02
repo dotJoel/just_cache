@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod digest;
 
 pub mod disk_management;
+pub mod explain;
 pub mod file_movement;
 pub mod journal;
 pub mod opened;
@@ -20,12 +21,16 @@ pub use catalog::{
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{
-    available_space, list_files_recursive, move_file_with_symlink, DiskError, FileEntry,
-    MoveOutcome,
+    allocated_bytes, available_space, destination_with_room, last_use, list_files_recursive,
+    move_file_with_symlink, AccessSource, DiskError, FileEntry, MoveOutcome,
+};
+pub use explain::{
+    explain, explain_with, CatalogAnswer, ExplainContext, Explanation, GuardsReport, PolicyReport,
+    ScopeReport, Verdict as ExplainVerdict,
 };
 pub use file_movement::{
     log_file_movement, migrate_least_used, select_candidates, FileOutcome, MigrationRecord,
     MigrationReport, Policy, SkipReason, UsageTracker,
 };
-pub use opened::{Coverage, FileId, Guards, InUse, OpenFiles};
-pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError};
+pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
+pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};

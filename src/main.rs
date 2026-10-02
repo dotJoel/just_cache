@@ -1,10 +1,12 @@
 //! `just_cache` — move cold, rarely used files onto slower disks and leave a symlink
 //! behind so every path keeps working.
 //!
-//! Two subcommands share the same binary: `sweep` (the original mover) and `audit`
+//! Three subcommands share the same binary: `sweep` (the original mover), `audit`
 //! (read-only report, with `--repair`, of structural inconsistency between the watched
-//! tree and the cold tiers). The original flat invocation — flags with no subcommand —
-//! still runs a sweep, so existing cron entries and scripts keep working unchanged.
+//! tree and the cold tiers), and `explain` (read-only: why one path is where it is, and
+//! what a sweep would do with it next). The original flat invocation — flags with no
+//! subcommand — still runs a sweep, so existing cron entries and scripts keep working
+//! unchanged.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use clap::{Args, Parser, Subcommand};
 use just_cache::audit::{self, RepairAction};
 use just_cache::catalog;
 use just_cache::disk_management::{self, FileEntry};
+use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::journal::{self, Journal};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
@@ -60,6 +63,8 @@ enum Command {
     Audit(AuditArgs),
     /// Manage the catalog: the source of truth for where files live.
     Catalog(CatalogArgs),
+    /// Explain why one path is where it is, and what a sweep would do with it next.
+    Explain(ExplainArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -217,12 +222,85 @@ struct CatalogSyncArgs {
     catalog: Option<PathBuf>,
 }
 
+/// Everything `explain` needs to answer for one path. The flags deliberately mirror
+/// `sweep`'s, because the answer is only trustworthy if it is computed with the same
+/// knobs a sweep would use — a different `--exclude` here would explain a different tool.
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    /// The path to explain. Absolute, or relative to `--watch`.
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
+
+    /// Directory to watch. The same tree a sweep moves files out of.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk. Required so the
+    /// answer can name where the file would go (or where a migrated one already lives).
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Only manage files matching these globs — the same `--include` a sweep uses.
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+
+    /// Never manage files matching these globs — the same `--exclude` a sweep uses.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+
+    /// Skip files smaller than this. Binary units: K, M, G, T (e.g. 1MiB, 4K).
+    #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_arg)]
+    min_size: u64,
+
+    /// Skip files larger than this. Binary units, as above.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size_arg)]
+    max_size: Option<u64>,
+
+    /// Only consider files whose last use is at least this many days old.
+    #[arg(long, value_name = "DAYS", default_value_t = 30.0)]
+    min_idle_days: f64,
+
+    /// Treat a file as pinned once accessed this many times during a run. Zero disables.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    min_observed_accesses: u64,
+
+    /// Move files that have more than one hard link. Off by default, matching `sweep`.
+    #[arg(long)]
+    allow_hardlinked: bool,
+
+    /// Leave a destination alone unless it has at least this much free space.
+    #[arg(long, value_name = "GB", default_value_t = 1.0)]
+    min_free_gb: f64,
+
+    /// Print a machine-readable JSON document instead of the four-line summary.
+    #[arg(long)]
+    json: bool,
+}
+
+impl ExplainArgs {
+    fn policy(&self) -> Policy {
+        Policy {
+            min_idle: Duration::from_secs_f64(self.min_idle_days.max(0.0) * 86_400.0),
+            observed_access_pin: self.min_observed_accesses,
+            limit: 10,
+            // `explain` never moves anything; dry_run in the policy is the mover's switch,
+            // and this command does not call the mover at all.
+            dry_run: true,
+        }
+    }
+
+    fn min_free_bytes(&self) -> u64 {
+        (self.min_free_gb.max(0.0) * 1_073_741_824.0) as u64
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Sweep(args)) => run_sweep(args),
         Some(Command::Audit(args)) => run_audit(args),
         Some(Command::Catalog(args)) => run_catalog(args),
+        Some(Command::Explain(args)) => run_explain(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -457,6 +535,69 @@ fn run_audit(args: AuditArgs) -> ExitCode {
     }
 }
 
+/// Explain one path. Read-only: it stats, it never opens the file for reading (which would
+/// bump the very atime it reports), and it moves nothing. Exit codes are the contract:
+/// `0` when the engine manages the path, `1` when it would not be moved, `2` on a bad
+/// invocation — so `explain` composes in a shell.
+fn run_explain(args: ExplainArgs) -> ExitCode {
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let scope = match Scope::build(&args.include, &args.exclude, args.min_size, args.max_size) {
+        Ok(scope) => scope,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if scope.is_empty_window() {
+        eprintln!(
+            "just_cache: warning: --min-size is above --max-size ({} vs {}), so nothing can qualify",
+            scope::human_bytes(scope.min_size()),
+            scope
+                .max_size()
+                .map(scope::human_bytes)
+                .unwrap_or_else(|| "unset".to_string())
+        );
+    }
+
+    let policy = args.policy();
+    // The snapshot names the processes holding the file open; unlike a sweep, nothing is
+    // taken live after it, so a descriptor opened during this command cannot be caught —
+    // which is the honest limit of a one-shot answer, and the guard report says so.
+    let guards = Guards::new(OpenFiles::snapshot(), !args.allow_hardlinked);
+    let tracker = UsageTracker::new();
+
+    // A relative path is relative to `--watch`, which is the tree it is documented to live
+    // under; an absolute path is used as given.
+    let path = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        args.watch.join(&args.path)
+    };
+    let context = ExplainContext {
+        path: &path,
+        watch: &args.watch,
+        dests: &args.dest,
+        scope: &scope,
+        policy: &policy,
+        guards: &guards,
+        tracker: &tracker,
+        min_free: args.min_free_bytes(),
+    };
+    let explanation = explain::explain(&context);
+
+    if args.json {
+        println!("{}", explanation.to_json());
+    } else {
+        for line in explanation.summary_lines() {
+            println!("{line}");
+        }
+    }
+    ExitCode::from(explanation.exit_code())
+}
+
 fn validate_sweep(watch: &Path, args: &SweepArgs) -> Result<(), String> {
     validate_paths(watch, &args.dest)?;
     if args.min_idle_days < 0.0 {
@@ -578,7 +719,13 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             tracker,
             &mut context,
             now,
-            |entry: &FileEntry| Ok(destination_with_room(dest, entry.allocated, min_free)),
+            |entry: &FileEntry| {
+                Ok(disk_management::destination_with_room(
+                    dest,
+                    entry.allocated,
+                    min_free,
+                ))
+            },
         );
 
         // Whatever this tier took (or would take) is off the table for slower disks.
@@ -642,26 +789,4 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     }
 
     report
-}
-
-/// The destination to use for a file, or `None` when the tier has no room left.
-///
-/// The floor keeps a sweep from filling the disk it is moving onto; a tier with no
-/// room is not an error, the file simply waits for the next sweep.
-/// Whether this tier can hold the bytes about to be written to it.
-///
-/// `needed` is the file's *allocated* size, not its apparent length: the copy preserves
-/// holes, so a 1 GiB sparse file needs kilobytes of room, and measuring it by `len()` would
-/// refuse a move the tier can easily afford. The risk of being wrong the other way (a
-/// destination that cannot preserve holes, where the fallback copy writes every byte) is
-/// covered downstream: a copy that runs out of space removes its partial file, reports a
-/// failure and leaves the source untouched, so the worst case is a failed move rather than
-/// a lost file.
-fn destination_with_room(dest: &Path, needed: u64, min_free: u64) -> Option<PathBuf> {
-    match disk_management::available_space(dest) {
-        Some(free) if free >= min_free.saturating_add(needed) => Some(dest.to_path_buf()),
-        Some(_) => None,
-        // Free space unknown on this filesystem: try the tier instead of stalling.
-        None => Some(dest.to_path_buf()),
-    }
 }

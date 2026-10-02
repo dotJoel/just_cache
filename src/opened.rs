@@ -9,7 +9,7 @@
 //! non-root run sees its own processes and not much else. Callers are told that via
 //! [`OpenFiles::coverage`] rather than being quietly reassured.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -64,6 +64,11 @@ pub enum Coverage {
 #[derive(Debug, Default)]
 pub struct OpenFiles {
     ids: HashSet<FileId>,
+    /// Which processes hold each open file, by pid. Only populated from the `/proc` scan;
+    /// kept beside `ids` because the mover only asks "is it open?", while `explain` has to
+    /// answer "by whom", and a second process-table scan just to name the pid would cost
+    /// more than the whole command.
+    holders: HashMap<FileId, Vec<u32>>,
     inspected: usize,
     /// Processes whose descriptor table could not be read, so their open files are
     /// invisible to us and the guard is weaker than it looks.
@@ -80,6 +85,7 @@ impl OpenFiles {
     pub fn snapshot() -> Self {
         let own_pid = std::process::id();
         let mut ids = HashSet::new();
+        let mut holders: HashMap<FileId, Vec<u32>> = HashMap::new();
         let mut inspected = 0usize;
         let mut unreadable = 0usize;
 
@@ -91,11 +97,11 @@ impl OpenFiles {
         for process in processes.flatten() {
             let name = process.file_name();
             let name = name.to_string_lossy();
-            let is_pid = !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit());
-            if !is_pid {
-                continue;
-            }
-            if name.parse::<u32>() == Ok(own_pid) {
+            let pid = match name.parse::<u32>() {
+                Ok(pid) => pid,
+                Err(_) => continue,
+            };
+            if pid == own_pid {
                 // Our own descriptors are not a reason to leave a file alone: the sweep
                 // opens files for its own checks and would otherwise pin everything.
                 continue;
@@ -113,6 +119,10 @@ impl OpenFiles {
                 // /proc/<pid>/fd/<n> is a symlink to the open file; metadata follows it.
                 if let Some(id) = FileId::of(&fd.path()) {
                     ids.insert(id);
+                    let holders = holders.entry(id).or_default();
+                    if !holders.contains(&pid) {
+                        holders.push(pid);
+                    }
                 }
             }
         }
@@ -124,6 +134,7 @@ impl OpenFiles {
         };
         Self {
             ids,
+            holders,
             inspected,
             unreadable,
             coverage,
@@ -138,6 +149,7 @@ impl OpenFiles {
     fn unsupported() -> Self {
         Self {
             ids: HashSet::new(),
+            holders: HashMap::new(),
             inspected: 0,
             unreadable: 0,
             coverage: Coverage::Unsupported,
@@ -146,6 +158,28 @@ impl OpenFiles {
 
     pub fn contains(&self, id: FileId) -> bool {
         self.ids.contains(&id)
+    }
+
+    /// Pids this snapshot saw holding `id` open, oldest scan order first. Empty when the
+    /// file is not open, or when it is open in a process the scan could not inspect — the
+    /// two are not distinguished here, which is why [`OpenFiles::coverage`] is reported
+    /// alongside.
+    pub fn holder_pids(&self, id: FileId) -> &[u32] {
+        self.holders.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Test-only: record that `id` is held open, without a `/proc` scan. The pids the
+    /// scan finds are what the real code names; this lets a test pin the naming path
+    /// deterministically instead of racing a child process.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&mut self, id: FileId, pid: Option<u32>) {
+        self.ids.insert(id);
+        if let Some(pid) = pid {
+            let holders = self.holders.entry(id).or_default();
+            if !holders.contains(&pid) {
+                holders.push(pid);
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -233,6 +267,12 @@ impl Guards {
         &self.open_files
     }
 
+    /// Whether more-than-one-link files are refused. `explain` reports the rule that is in
+    /// force, not just whether it fired.
+    pub fn hardlink_check(&self) -> bool {
+        self.check_hardlinks
+    }
+
     /// Is this file safe to move, given what is using it right now?
     pub fn check(&self, entry: &FileEntry) -> Result<(), InUse> {
         if let Some(id) = FileId::of_entry(entry) {
@@ -252,13 +292,13 @@ impl Guards {
 }
 
 #[cfg(unix)]
-fn link_count(path: &Path) -> Option<u64> {
+pub fn link_count(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(path).ok().map(|metadata| metadata.nlink())
 }
 
 #[cfg(not(unix))]
-fn link_count(_path: &Path) -> Option<u64> {
+pub fn link_count(_path: &Path) -> Option<u64> {
     None
 }
 
@@ -338,19 +378,27 @@ mod tests {
         // Wait for the child to actually reach the open() before snapshotting.
         let target = FileId::of(&path).unwrap();
         let mut seen = false;
+        let mut named = Vec::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            if OpenFiles::snapshot().contains(target) {
+            let snapshot = OpenFiles::snapshot();
+            if snapshot.contains(target) {
                 seen = true;
+                named = snapshot.holder_pids(target).to_vec();
                 break;
             }
         }
+        let child_pid = child.id();
         let _ = child.kill();
         let _ = child.wait();
 
         assert!(
             seen,
             "a file held open by a child process must appear in the snapshot"
+        );
+        assert!(
+            named.contains(&child_pid),
+            "the snapshot must name the pid holding the file ({child_pid} not in {named:?})"
         );
     }
 
