@@ -360,6 +360,7 @@ mod tests {
             objects: vec![ObjectRecord {
                 id: "42".repeat(32),
                 size: 11,
+                checksum: "42".repeat(32),
                 state: "restoring".to_string(),
                 last_access: Some(0),
                 accesses: Some(3),

@@ -17,8 +17,9 @@ pub mod scope;
 pub mod scrub;
 
 pub use audit::{
-    audit, audit_with_copies, classify, repair, AuditError, AuditReport, Finding, RepairAction,
-    RepairOutcome, SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
+    audit, audit_with_copies, catalog_audit, catalog_repair, classify, repair, AuditError,
+    AuditReport, AuditSource, Finding, RepairAction, RepairOutcome, SourceState, Verdict,
+    VerdictKind, COPY_FLOOR, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
     Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, ObjectRecord, ScrubSummary,

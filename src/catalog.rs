@@ -283,6 +283,11 @@ pub struct ObjectRecord {
     /// The object id, hex-encoded. This is the identity, not a path.
     pub id: String,
     pub size: u64,
+    /// The recorded digest a copy must match to be intact, hex-encoded. Equal to `id`
+    /// today (identity *is* the hash at ingest), but kept as its own field: `audit`
+    /// compares a copy against `checksum`, not against the id, and a scrub may re-record a
+    /// checksum of the same identity after verifying a copy.
+    pub checksum: String,
     /// `present` | `offloaded` | `restoring`.
     pub state: String,
     /// Unix seconds of the last observed access, from `lifecycle`.
@@ -1028,6 +1033,39 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every object row, in id order.
+    ///
+    /// `audit` needs the recorded `checksum` to compare a copy against, which the other
+    /// read-only accessors do not carry: `object_for_path` returns identity, and identity
+    /// is not what a scrub verifies.
+    pub fn all_objects(&self) -> Result<Vec<ObjectRecord>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, size, checksum, state FROM object ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ObjectRecord {
+                id: hex(&row.get::<_, Vec<u8>>(0)?),
+                size: row.get::<_, i64>(1)? as u64,
+                checksum: hex(&row.get::<_, Vec<u8>>(2)?),
+                state: row.get::<_, String>(3)?,
+                // `all_objects` reads only what an audit compares a copy against; the
+                // lifecycle and namespace fields belong to `record_for_object`, which reads
+                // them per object and is not used here.
+                last_access: None,
+                accesses: None,
+                pinned_until: None,
+                rule: None,
+                names: Vec::new(),
+                locations: Vec::new(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Record a replica the mover placed for an object the catalog already knows.
     ///
     /// Returns `Ok(false)` when the object is not in the catalog — nothing is inserted,
@@ -1225,12 +1263,18 @@ impl Catalog {
         let base = self
             .conn
             .query_row(
-                "SELECT size, state FROM object WHERE lower(hex(id)) = ?1",
+                "SELECT size, state, lower(hex(checksum)) FROM object WHERE lower(hex(id)) = ?1",
                 params![id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((size, state)) = base else {
+        let Some((size, state, checksum)) = base else {
             return Ok(None);
         };
 
@@ -1286,6 +1330,7 @@ impl Catalog {
         Ok(Some(ObjectRecord {
             id,
             size: size.max(0) as u64,
+            checksum,
             state,
             last_access,
             accesses: accesses.map(|value| value.max(0) as u64),
