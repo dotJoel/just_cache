@@ -14,8 +14,9 @@ use std::time::{Duration, SystemTime};
 use clap::{Args, Parser, Subcommand};
 
 use just_cache::audit::{self, RepairAction};
-use just_cache::disk_management;
+use just_cache::disk_management::{self, FileEntry};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
+use just_cache::journal::{self, Journal};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::scope::{self, Scope};
 
@@ -224,20 +225,62 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         );
     }
 
+    // The journal lives beside the tree it describes. A journal that cannot be read stops
+    // the sweep rather than being ignored: it may describe a move whose bytes are already
+    // on a cold tier, and sweeping on would both lose that knowledge and start new moves
+    // through an unguarded window.
+    let mut journal = match Journal::in_tree(&watch) {
+        Ok(journal) => journal,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            eprintln!(
+                "just_cache: refusing to sweep until the journal can be read; look at the \
+                 line above, or move the file aside if it is beyond saving"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // What the last run was in the middle of. Run once, before any new work, so a recovered
+    // name is visible to this very sweep rather than the one after it.
+    match journal::repair(&mut journal, &watch) {
+        Ok(report) => {
+            if let Some(summary) = report.summary() {
+                println!("{summary}");
+                for (relative, outcome) in &report.outcomes {
+                    // Routine outcomes only with -v; a restored name or anything that needs
+                    // attention always, because "a file came back" is not a quiet event.
+                    if outcome.is_notable() || args.verbose > 0 {
+                        println!("{}", outcome.describe(relative));
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let mut tracker = UsageTracker::new();
     let mut pass = 0u64;
 
     loop {
         pass += 1;
-        let report = sweep(
-            &watch,
-            &args.dest,
-            &args,
-            &policy,
-            &scope,
-            &mut tracker,
-            pass,
-        );
+        let mut state = Sweep {
+            watch: &watch,
+            dests: &args.dest,
+            args: &args,
+            policy: &policy,
+            scope: &scope,
+            tracker: &mut tracker,
+            journal: &mut journal,
+        };
+        let report = sweep(&mut state, pass);
+        // Compaction is what keeps the journal describing only what is still in flight:
+        // finished moves are dropped, and any incomplete record is written back so the
+        // next start reads a file the size of the work actually outstanding.
+        let _ = journal.compact();
         if args.once {
             return if report.failed() > 0 {
                 ExitCode::FAILURE
@@ -359,15 +402,29 @@ fn validate_paths(watch: &Path, dests: &[PathBuf]) -> Result<(), String> {
 }
 
 /// One sweep over the watched tree: fill each cold tier in turn, fastest disk first.
-fn sweep(
-    watch: &Path,
-    dests: &[PathBuf],
-    args: &SweepArgs,
-    policy: &Policy,
-    scope: &Scope,
-    tracker: &mut UsageTracker,
-    pass: u64,
-) -> MigrationReport {
+/// Everything one sweep works with, in one place.
+///
+/// Gathered here because the parameter list grew every time the mover learned something
+/// new — the journal was the third such addition, and the fourth would have been the one
+/// that made the call sites unreadable.
+struct Sweep<'a> {
+    watch: &'a Path,
+    dests: &'a [PathBuf],
+    args: &'a SweepArgs,
+    policy: &'a Policy,
+    scope: &'a Scope,
+    tracker: &'a mut UsageTracker,
+    journal: &'a mut Journal,
+}
+
+fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
+    let watch = state.watch;
+    let dests = state.dests;
+    let args = state.args;
+    let policy = state.policy;
+    let scope = state.scope;
+    let tracker: &mut UsageTracker = state.tracker;
+    let journal: &mut Journal = state.journal;
     let now = SystemTime::now();
 
     // One snapshot per sweep, not one per candidate: a process-table scan per file would
@@ -418,14 +475,18 @@ fn sweep(
         // Both sides matter: the guards are live state (a descriptor can open at any
         // moment), and the room check measures allocated bytes, since the copy preserves
         // holes and `size` would refuse moves the tier can afford.
+        let mut context = file_movement::MoveContext {
+            policy,
+            scope,
+            guards: &guards,
+            journal,
+        };
         let tier = file_movement::migrate_least_used(
             &pending,
             tracker,
-            policy,
-            scope,
-            &guards,
+            &mut context,
             now,
-            |entry| Ok(destination_with_room(dest, entry.allocated, min_free)),
+            |entry: &FileEntry| Ok(destination_with_room(dest, entry.allocated, min_free)),
         );
 
         // Whatever this tier took (or would take) is off the table for slower disks.

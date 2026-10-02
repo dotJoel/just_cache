@@ -108,6 +108,38 @@ The sweep summary counts these separately (`N in use`), so a busy box reads diff
 from a genuinely cold one — if every sweep reports files in use, the guard is working, not
 failing.
 
+### If the machine dies mid-move
+
+A move is three filesystem operations that cannot be one: the bytes land on the cold
+tier, the source is removed, the symlink appears. Crash between the last two and the
+file is still on disk but nothing points at it. So every move writes an **intent** to
+`<watch>/.just_cache-journal` — and fsyncs it — before anything moves, and clears the
+record once the symlink is in place.
+
+The next run reads that journal and asks the *filesystem* what happened, because the
+journal only knows what was attempted:
+
+- **bytes cold and complete, name gone** → the symlink is recreated, and the run says
+  so (`restored the name shows/ep2.mkv -> /dev/shm/cold/shows/ep2.mkv`). This is the
+  case the journal exists for.
+- **both copies present** → left alone; the next sweep's adoption path hashes the
+  destination and either adopts or refuses it. Recovery does not guess.
+- **nothing moved yet** → nothing to do.
+- **an interrupted copy, with the source intact** → removed (it is ours and worthless).
+- **an interrupted copy with nothing else left** → *kept*, deliberately: deleting it
+  could be deleting the only surviving bytes.
+- **no source and no complete copy** → reported as `DATA LOST` and kept in the journal,
+  because nothing on disk remains for `audit` to find later.
+
+Two rules hold throughout: recovery never deletes anything that might be the only copy,
+and it never creates a name pointing at a copy it cannot vouch for — a cold file whose
+size does not match what the move promised is refused, not linked.
+
+A journal that cannot be *read* stops the sweep, naming the damaged line: it may
+describe bytes already on a cold tier, and there is no safe way to guess. The journal
+itself is never a move candidate, and after a clean pass it is empty — a finished move
+is cleared rather than recorded, since the symlink is better evidence that it finished.
+
 **Destinations are never created.** A missing `--dest` is a startup error, not a
 `mkdir`: if a slow disk is unmounted, silently creating its mount point would have the
 tool write terabytes into a directory on the wrong filesystem.
@@ -287,6 +319,7 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 |---|---|
 | [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
 | [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
+| [`src/journal.rs`](src/journal.rs) | What the mover was in the middle of: the intent record, and recovery from an interrupted move. |
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
