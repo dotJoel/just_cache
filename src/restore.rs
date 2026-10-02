@@ -9,8 +9,9 @@
 //!
 //! # How the cold copy is found
 //!
-//! There is no catalog yet (issue #16, being built separately), so the search is by
-//! filesystem state, in this order:
+//! The copy itself is found by filesystem state (the catalog records *where* a copy is,
+//! and `locate` answers that; this command still has to name the bytes it is about to
+//! copy), in this order:
 //!
 //! 1. if the path is a symlink that resolves, its target is the copy the mover left;
 //! 2. otherwise — a broken link, or no name at all — the mirrored relative path under
@@ -20,15 +21,28 @@
 //! a situation to guess through: restoring either would be a coin flip over someone's
 //! data, so the command refuses and names them. If they agree, the first is used.
 //!
-//! # What "verified" means without a catalog
+//! # What "verified" means
 //!
 //! The freshly written bytes are read back and hashed (BLAKE3, the one digest the whole
-//! tool uses) and compared to the cold copy before they are renamed into place, so a torn
-//! copy can never become the file at the path. What this *cannot* do — and does not
-//! pretend to — is detect a cold copy that was already corrupt before this command ran:
-//! with no recorded digest there is nothing independent to compare against. A catalog
-//! digest is the fix; until then this gap is named in `docs/design.md` §9 rather than
-//! papered over.
+//! tool uses) before they are renamed into place, so a torn copy can never become the
+//! file at the path.
+//!
+//! When a catalog exists — `--catalog <FILE>`, or the default
+//! `.just_cache-catalog.sqlite` beside the watch root — the digest those bytes are
+//! compared against is the object's **recorded checksum**, not the cold copy's own bytes.
+//! That is the difference between catching a torn copy and catching a cold copy that was
+//! already corrupt before this command ran: with a recorded digest there is something
+//! independent to compare against, and a copy that no longer matches it is refused rather
+//! than restored faithfully. A catalog that is present but does not name the path is a
+//! hard error too: the catalog is the source of truth for "does this object exist"
+//! (`docs/design.md` §3), so silently falling back to the filesystem would skip exactly
+//! the verification this command now owes. `restore` never creates a catalog (invariant
+//! 9); the same open-if-present rule `explain` and `audit` use applies here.
+//!
+//! With no catalog, a copy that was already corrupt cannot be detected — there is no
+//! independent digest — and the restored bytes are checked against the cold copy, exactly
+//! as before. `docs/design.md` §9 records that the catalog digest has closed this gap for
+//! the catalog path and that the no-catalog path still has no independent check.
 //!
 //! # What is never overwritten
 //!
@@ -49,6 +63,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::catalog::{self, Catalog};
 use crate::digest;
 use crate::disk_management;
 
@@ -72,14 +87,30 @@ pub enum RestoreError {
 
     #[error(
         "refusing to overwrite {path}: it is already a regular file whose content differs \
-         from the cold copy {cold} (BLAKE3 {hot_digest} vs {cold_digest}); nothing was touched"
+         from the copy that would be restored from {cold} (BLAKE3 {hot_digest} vs expected \
+         {expected_digest}); nothing was touched"
     )]
     HotPathMismatch {
         path: PathBuf,
         cold: PathBuf,
         hot_digest: String,
-        cold_digest: String,
+        expected_digest: String,
     },
+
+    #[error(
+        "cannot restore {path}: a catalog is configured but does not name this path; \
+         nothing was touched (run `catalog sync` if the tree has changed)"
+    )]
+    CatalogUnknownPath { path: PathBuf },
+
+    #[error(
+        "cannot restore {path}: the catalog records a malformed checksum {checksum:?}; \
+         nothing was touched"
+    )]
+    CatalogChecksumMalformed { path: PathBuf, checksum: String },
+
+    #[error("the catalog could not be read: {error}")]
+    Catalog { error: catalog::CatalogError },
 
     #[error("{path} is a directory; restore only handles a regular file or a symlink")]
     HotPathIsDirectory { path: PathBuf },
@@ -97,6 +128,17 @@ pub enum RestoreError {
          left as it was"
     )]
     VerifyMismatch {
+        path: PathBuf,
+        expected_digest: String,
+        found_digest: String,
+    },
+
+    #[error(
+        "verification failed: {path} was written but its content does not match the \
+         catalog's recorded checksum (restored BLAKE3 {found_digest}, recorded \
+         {expected_digest}); the path was left as it was and the cold copy was not touched"
+    )]
+    CatalogChecksumMismatch {
         path: PathBuf,
         expected_digest: String,
         found_digest: String,
@@ -177,8 +219,8 @@ impl RestoreOutcome {
     }
 }
 
-/// Everything one restore needs.
-#[derive(Debug)]
+/// Everything one restore needs. (The catalog is not `Debug`-printed: the struct derives
+/// it for the error paths, and a catalog's contents are its rows, not its handle.)
 pub struct RestoreRequest<'a> {
     /// The path to bring back. May be a symlink (working or broken) or missing.
     pub path: &'a Path,
@@ -188,6 +230,13 @@ pub struct RestoreRequest<'a> {
     pub dests: &'a [PathBuf],
     /// Drop the cold copy once the restored file has been verified.
     pub remove_copy: bool,
+    /// The catalog to verify the restored bytes against, when one exists.
+    ///
+    /// `None` is the honest default: with no catalog the bytes are checked against the
+    /// cold copy, exactly as this command always did. The caller — `main` — owns the
+    /// open-if-present rule (`--catalog` must exist; the default beside the watch root is
+    /// used only when it is already there) and never creates one for a restore.
+    pub catalog: Option<&'a Catalog>,
 }
 
 /// Bring the object at `request.path` back from a cold tier.
@@ -205,6 +254,11 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         }
     };
 
+    // The catalog's answer, when there is one, is the digest every check below compares
+    // against. Resolved once, up front: a catalog that does not name the path fails here,
+    // before anything is opened or copied.
+    let recorded = recorded_checksum(request.catalog, &relative, &path)?;
+
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() => Err(RestoreError::HotPathIsDirectory { path }),
         // A real file at the path is the state restore is trying to reach. Never replace
@@ -212,20 +266,27 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         Ok(metadata) if metadata.is_file() => match locate(&path, &relative, request.dests)? {
             None => Ok(RestoreOutcome::AlreadyPresent { cold_copy: None }),
             Some(cold) => {
+                // Without a catalog the expected digest can only come from the cold copy;
+                // with one it is the recorded checksum, so a hot file that agrees with a
+                // corrupt cold copy is still refused rather than mistaken for the state
+                // restore was trying to reach.
+                let expected_digest = match &recorded {
+                    Some(hash) => *hash,
+                    None => digest_of(&cold)?,
+                };
                 let hot_digest = digest_of(&path)?;
-                let cold_digest = digest_of(&cold)?;
-                if hot_digest != cold_digest {
+                if hot_digest != expected_digest {
                     return Err(RestoreError::HotPathMismatch {
                         path,
                         cold,
                         hot_digest: hex(&hot_digest),
-                        cold_digest: hex(&cold_digest),
+                        expected_digest: hex(&expected_digest),
                     });
                 }
-                // The path already holds bytes verified identical to the cold copy, so
-                // `--remove-copy` can reclaim the cold bytes now: verify-before-delete is
-                // satisfied by the digest comparison just above. Without it there is
-                // nothing to do at all — this is the idempotent no-op.
+                // The path already holds bytes verified identical to the recorded
+                // content, so `--remove-copy` can reclaim the cold bytes now:
+                // verify-before-delete is satisfied by the digest comparison just above.
+                // Without it there is nothing to do at all — this is the idempotent no-op.
                 if request.remove_copy {
                     let cold_metadata =
                         fs::metadata(&cold).map_err(|error| RestoreError::Stat {
@@ -256,9 +317,41 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                     dests: request.dests.to_vec(),
                 }
             })?;
-            restore_from(&path, &cold, request.remove_copy)
+            restore_from(&path, &cold, request.remove_copy, recorded.as_ref())
         }
     }
+}
+
+/// The catalog's recorded checksum for one namespace path.
+///
+/// Returns `Ok(None)` only when no catalog is configured; with one, a path it does not
+/// name is an error rather than a quiet fall back to filesystem-only verification. The
+/// catalog is the source of truth for "does this object exist" (`docs/design.md` §3), and
+/// restoring an object it has never seen would mean skipping the independent check this
+/// command exists to perform.
+fn recorded_checksum(
+    catalog: Option<&Catalog>,
+    relative: &Path,
+    path: &Path,
+) -> Result<Option<blake3::Hash>, RestoreError> {
+    let Some(catalog) = catalog else {
+        return Ok(None);
+    };
+    // Names are stored relative to the watch root — the same key `catalog sync` ingested.
+    let record = catalog
+        .record_for_path(&relative.to_string_lossy())
+        .map_err(|error| RestoreError::Catalog { error })?;
+    let Some(record) = record else {
+        return Err(RestoreError::CatalogUnknownPath {
+            path: path.to_path_buf(),
+        });
+    };
+    blake3::Hash::from_hex(&record.checksum)
+        .map(Some)
+        .map_err(|_| RestoreError::CatalogChecksumMalformed {
+            path: path.to_path_buf(),
+            checksum: record.checksum.clone(),
+        })
 }
 
 /// Find the cold copy for one relative path, refusing if the candidates disagree.
@@ -322,16 +415,25 @@ fn locate(hot: &Path, relative: &Path, dests: &[PathBuf]) -> Result<Option<PathB
 }
 
 /// Copy `cold` onto `hot`, verifying before the swap, optionally dropping the cold copy.
+///
+/// `recorded` is the catalog's checksum for the object, when a catalog is configured: the
+/// private copy is read back and hashed against it rather than against the cold copy's own
+/// bytes, so a cold copy that was already corrupt is refused instead of restored. Without
+/// one, the cold copy is the only digest available and the behaviour is unchanged.
 fn restore_from(
     hot: &Path,
     cold: &Path,
     remove_copy: bool,
+    recorded: Option<&blake3::Hash>,
 ) -> Result<RestoreOutcome, RestoreError> {
     let cold_metadata = fs::metadata(cold).map_err(|error| RestoreError::Stat {
         path: cold.to_path_buf(),
         error,
     })?;
-    let expected_digest = digest_of(cold)?;
+    let expected_digest = match recorded {
+        Some(hash) => *hash,
+        None => digest_of(cold)?,
+    };
 
     let parent = hot.parent().unwrap_or_else(|| Path::new("."));
     // A path whose name vanished entirely (an audited "orphaned-copy") may need the
@@ -361,11 +463,22 @@ fn restore_from(
         }
     })?;
     if found_digest != expected_digest {
+        // The partial is dropped and the path untouched either way; the error only names
+        // which comparison failed, because the two say different things about the data:
+        // a cold-copy mismatch is a torn copy, a recorded-checksum mismatch is a cold
+        // copy that was already corrupt before this command ran.
         let _ = fs::remove_file(&partial);
-        return Err(RestoreError::VerifyMismatch {
-            path: hot.to_path_buf(),
-            expected_digest: hex(&expected_digest),
-            found_digest: hex(&found_digest),
+        return Err(match recorded {
+            Some(_) => RestoreError::CatalogChecksumMismatch {
+                path: hot.to_path_buf(),
+                expected_digest: hex(&expected_digest),
+                found_digest: hex(&found_digest),
+            },
+            None => RestoreError::VerifyMismatch {
+                path: hot.to_path_buf(),
+                expected_digest: hex(&expected_digest),
+                found_digest: hex(&found_digest),
+            },
         });
     }
 
@@ -395,7 +508,7 @@ fn restore_from(
                 path: hot.to_path_buf(),
                 copy: cold.to_path_buf(),
                 detail: format!(
-                    "restored BLAKE3 {} != cold BLAKE3 {}",
+                    "restored BLAKE3 {} != expected BLAKE3 {}",
                     hex(&restored_digest),
                     hex(&expected_digest)
                 ),
@@ -658,6 +771,7 @@ mod tests {
             watch,
             dests,
             remove_copy: false,
+            catalog: None,
         }
     }
 

@@ -407,6 +407,23 @@ preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of 
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
 
+Closed in P1 by `just_cache restore` through the catalog (#18): restoring an object now
+verifies the bytes it writes against the object's **recorded checksum**, not against the
+cold copy's own bytes. The open-if-present rule the rest of the tool uses applies: a
+`--catalog <FILE>` must exist (a bad invocation otherwise), the default
+`.just_cache-catalog.sqlite` beside the watch root is consulted only when it is already
+there, and `restore` never creates a catalog (invariant 9). With a catalog, the digest the
+read-back is compared to is independent of the bytes being copied, so a cold copy that was
+already corrupt before the command ran is refused and nothing is touched — the hot path
+keeps its link, the cold bytes stay, and no partial is left behind. A catalog that is
+present but does not name the path is also a hard error: silently falling back to
+filesystem-only verification would skip exactly the check the catalog exists to provide.
+A hot regular file is likewise compared against the recorded checksum, so a path that
+already holds the right bytes is still the idempotent no-op and `--remove-copy` still
+drops the cold copy only after the restored file verifies. Without a catalog the restore
+is byte-for-byte what it was before (verify against the cold copy; a pre-corrupt copy
+cannot be caught — there is nothing independent to compare against, see below).
+
 Closed in P1 by `just_cache audit` reading the catalog (#19): "audit is a query" (§3) is
 now true rather than an aspiration. When a catalog exists — `--catalog <FILE>`, or the
 default `.just_cache-catalog.sqlite` beside the watch root — the audit answers from the
@@ -562,13 +579,13 @@ Still open, and honestly so:
   "hashing a sparse file means materializing its holes" — was wrong about *reading*: it is
   a non-hole-preserving *copy* that materializes holes, and `copy_contents` already
   preserves them. `tests/scrub.rs` measures it.
-- **Restore has no catalog digest to check a cold copy against.** `restore` reads its own
-  write back and hashes it before the atomic swap, so a torn copy cannot reach the path,
-  but with no recorded digest there is nothing independent to compare a *pre-existing*
-  cold copy to: a copy that was already corrupt would be restored faithfully. The catalog
-  (issue #16) is what closes this; until then `restore` also refuses to overwrite a hot
-  regular file whose content differs from the cold copy (checked by digest, not size), so
-  the one thing it can compare is never ignored.
+- **A restore without a catalog still has no independent digest.** With a catalog, restore
+  verifies against the recorded checksum and a pre-corrupt cold copy is refused (above).
+  Without one, the cold copy is the only digest available: the read-back catches a torn
+  copy, a copy that was already corrupt would be restored faithfully, and that limitation
+  is inherent — there is nothing independent to compare against. It is named rather than
+  papered over, and `restore` refuses outright (rather than falling back) when a catalog
+  is configured but does not name the path, so verification is never silently skipped.
 - **A >8-character prefix collision is unit-tested, not end-to-end.** `locate` lists every
   match (a library test writes two objects sharing a prefix), but forcing two real BLAKE3
   hashes to share eight hex characters needs an impossible amount of data, so the
