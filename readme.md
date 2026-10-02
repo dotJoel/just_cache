@@ -379,6 +379,36 @@ different bytes, or a location's file vanished or changed, the difference is pri
 the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
 bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
 the tree is worse than none.
+## Finding an object
+
+`locate` answers "where does this live" straight from the catalog, without walking the
+tree — so it works for an object whose tier is not mounted.
+
+```sh
+# by namespace path
+just_cache locate shows/s1/ep1.mkv \
+  --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+
+# by content digest, full or a prefix of at least 8 hex characters
+just_cache locate 8a623e5d \
+  --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+A query of at least eight hex characters is read as a digest prefix and matched against
+object ids; anything else is read as a name. `--json` reports which reading (`kind`) it
+chose. The answer names every copy and its tier, marks the tier of record (`[PRIMARY]`),
+and reports the object's state (`present` / `offloaded` / `restoring`); an offloaded copy
+is called out as needing its tier mounted to read. A prefix that matches several objects
+lists them all — never a guess at which one was meant.
+
+Exit codes: `0` found, `1` nothing found (an answer, not an error), `2` a missing or
+unreadable catalog.
+
+`explain` consults the same catalog when one exists — the default beside the watch root,
+or `--catalog` — and **reports** a disagreement between the catalog and the filesystem
+instead of silently resolving it. With no catalog it answers from the filesystem exactly
+as before.
+
 ## Restoring a file
 
 `restore` is the other half of the loop: it brings the bytes of an offloaded object back
@@ -390,11 +420,11 @@ just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
   --dest /mnt/disk-slow/media
 ```
 
-The cold copy is found by *state*, because there is no catalog yet: if the path is a
-symlink that resolves, its target is the copy the mover left; otherwise — a broken link,
-or a name that vanished — the mirrored relative path under each `--dest`, in order. If
-several candidates hold **different** bytes for one name, restore refuses and names them
-rather than guessing which tier is right.
+The cold copy is found by *state*, independently of the catalog (this command predates it
+and still does not read it): if the path is a symlink that resolves, its target is the copy
+the mover left; otherwise — a broken link, or a name that vanished — the mirrored relative
+path under each `--dest`, in order. If several candidates hold **different** bytes for one
+name, restore refuses and names them rather than guessing which tier is right.
 
 What it guarantees:
 

@@ -347,3 +347,114 @@ fn a_bad_invocation_exits_two() {
     ]);
     assert_eq!(code(&output), 2, "stderr: {}", stderr(&output));
 }
+
+/// Build a catalog beside the watched tree, ingesting whatever the tree holds.
+fn sync_catalog(tree: &Tree) {
+    let output = bin()
+        .args(["catalog", "sync", "--watch"])
+        .arg(&tree.watch)
+        .arg("--dest")
+        .arg(&tree.cold)
+        .output()
+        .expect("catalog sync runs");
+    assert!(output.status.success(), "sync failed: {}", stderr(&output));
+}
+
+/// With no catalog, the answer is unchanged and the report says why: the filesystem is the
+/// source of truth, exactly as before the catalog existed.
+#[test]
+fn explain_says_when_no_catalog_is_configured() {
+    let tree = tree();
+    let path = tree.watch.join("cold.bin");
+    fs::write(&path, b"payload").unwrap();
+    set_times(&path, days_ago(90));
+
+    let output = explain(&[
+        path.to_str().unwrap(),
+        "--watch",
+        tree.watch.to_str().unwrap(),
+        "--dest",
+        tree.cold.to_str().unwrap(),
+    ]);
+
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("catalog: no catalog is configured"),
+        "the absent catalog must be stated, not implied: {text}"
+    );
+}
+
+/// A catalog that exists is consulted, and when the tree was edited by hand afterwards the
+/// two sources disagree. The disagreement is reported — never resolved silently, because a
+/// silent resolution is how a UI ends up trusting a number nothing on disk agrees with.
+#[test]
+fn explain_consults_a_catalog_and_reports_a_disagreement() {
+    let tree = tree();
+    fs::create_dir_all(tree.cold.join("shows")).unwrap();
+    fs::write(tree.cold.join("shows/moved.mkv"), b"movie bytes").unwrap();
+    fs::create_dir_all(tree.watch.join("shows")).unwrap();
+    let link = tree.watch.join("shows/moved.mkv");
+    std::os::unix::fs::symlink(Path::new("../../cold/shows/moved.mkv"), &link).unwrap();
+
+    // The catalog is built against the migrated tree: the object is offloaded, its cold
+    // copy is the tier of record.
+    sync_catalog(&tree);
+    assert!(tree.watch.join(just_cache::catalog::CATALOG_NAME).is_file());
+
+    // Hand-modify the tree after the sync: the path is a regular file now, while the
+    // catalog still places the object on a cold tier.
+    fs::remove_file(&link).unwrap();
+    fs::write(&link, b"movie bytes").unwrap();
+
+    let output = explain(&[
+        link.to_str().unwrap(),
+        "--watch",
+        tree.watch.to_str().unwrap(),
+        "--dest",
+        tree.cold.to_str().unwrap(),
+    ]);
+
+    let text = stdout(&output);
+    assert!(
+        text.contains("catalog: consulted"),
+        "the catalog must be consulted when it exists: {text}"
+    );
+    assert!(
+        text.contains("WARNING: catalog and filesystem disagree"),
+        "the disagreement must be reported, not resolved: {text}"
+    );
+    assert!(
+        text.contains("places this object on a tier"),
+        "the disagreement must name what disagrees: {text}"
+    );
+}
+
+/// The same consultation through the injected public entry point: a disagreement is a
+/// report, and the verdict still comes from the filesystem the mover acts on.
+#[test]
+fn explain_json_reports_the_consulted_catalog() {
+    let tree = tree();
+    let path = tree.watch.join("live.bin");
+    fs::write(&path, b"payload").unwrap();
+    sync_catalog(&tree);
+    // Stamp the idle times *after* the sync. `catalog sync` reads every file to hash it, and
+    // on a `relatime` mount that read bumps atime — so a stamp set before the sync is not the
+    // stamp `explain` sees. This host is `noatime`, where the ordering is invisible, which is
+    // exactly why the test passed here and failed on CI.
+    set_times(&path, days_ago(90));
+
+    let output = explain(&[
+        path.to_str().unwrap(),
+        "--watch",
+        tree.watch.to_str().unwrap(),
+        "--dest",
+        tree.cold.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("\"consulted\":true"), "{text}");
+    assert!(text.contains("\"source\":\"catalog\""), "{text}");
+    assert!(text.contains("\"accesses\":"), "{text}");
+}
