@@ -87,10 +87,9 @@ Hard rules:
 
 ### 2.1 Cache overlays: RAM is a promotion target, not a tier
 
-RAM is the top of the ladder in *speed*, but it is not the top tier, because a tier has
-to be somewhere a file can live. RAM is better modelled as a **promotion target layered
-over a tier**: a hot file gets a copy promoted into RAM while continuing to live on
-SSD, exactly as reads are served from a cache in front of the tier of record.
+Decided in review: **RAM acts as a fast read cache in front of a durable tier, never as
+a home.** A hot file gets a copy promoted into RAM while continuing to live on SSD,
+exactly as reads are served from a cache in front of the tier of record.
 
 ```toml
 [[cache]]
