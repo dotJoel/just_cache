@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS location (
     storage_key TEXT NOT NULL,         -- path within the tier
     is_primary  INTEGER NOT NULL,      -- tier of record
     updated_at  INTEGER NOT NULL,
+    verified    INTEGER NOT NULL DEFAULT 0,  -- 1 once a digest vouched for this copy
+    checksum    BLOB,                        -- digest this copy verified to; NULL = unknown
     PRIMARY KEY (tier, storage_key)
 );
 CREATE TABLE IF NOT EXISTS name (
@@ -109,6 +111,13 @@ CREATE TABLE IF NOT EXISTS volume (
     id    TEXT PRIMARY KEY,            -- 'drawer-07'
     state TEXT NOT NULL,               -- 'in_vault' | 'mounted' | 'loaned' | 'lost'
     note  TEXT
+);
+-- The durability floor, recorded once per tier rather than guessed from how many
+-- locations happen to exist (issue #20). Sweep --copies N declares it; a missing copy
+-- against it is an under-replicated finding, not silence.
+CREATE TABLE IF NOT EXISTS tier (
+    name   TEXT PRIMARY KEY,           -- canonical root of the tier
+    copies INTEGER NOT NULL DEFAULT 1  -- the copy floor for objects that live here
 );
 -- Ephemeral, observability only: a promotion target's contents are re-derivable and
 -- MUST NOT be read as data of record (§2.1). No code path in this module writes here.
@@ -174,6 +183,12 @@ pub enum DifferenceKind {
     DanglingSymlink,
     /// A symlink resolves outside every configured `--dest`.
     UnexpectedTarget,
+    /// Fewer verified copies than the object's tier floor requires. The detail names
+    /// the disks it is on and the ones it is not.
+    UnderReplicated,
+    /// A location the mover wrote but no digest has vouched for. It counts toward no
+    /// floor until a sync hashes it — unknown, not assumed good.
+    ReplicaUnknown,
 }
 
 impl DifferenceKind {
@@ -186,6 +201,8 @@ impl DifferenceKind {
             DifferenceKind::OrphanedCopy => "orphaned-copy",
             DifferenceKind::DanglingSymlink => "dangling-symlink",
             DifferenceKind::UnexpectedTarget => "unexpected-target",
+            DifferenceKind::UnderReplicated => "under-replicated",
+            DifferenceKind::ReplicaUnknown => "replica-unknown",
         }
     }
 }
@@ -220,6 +237,11 @@ pub struct LocationRecord {
     pub tier: String,
     pub storage_key: String,
     pub is_primary: bool,
+    /// True when a digest has vouched for the bytes at this location; false means the
+    /// mover wrote bytes it could not verify — unknown, not good.
+    pub verified: bool,
+    /// The digest the copy verified to, hex-encoded. `None` when unverified.
+    pub checksum: Option<String>,
     /// The object id, hex-encoded so it is printable.
     pub object: String,
 }
@@ -302,6 +324,9 @@ struct Existing {
     objects: BTreeMap<ObjectId, String>,
     names: BTreeMap<String, ObjectId>,
     locations: BTreeMap<LocationKey, ObjectId>,
+    /// Location keys the mover wrote but no digest has vouched for yet. A sync that
+    /// hashes one of these upgrades it rather than assuming it was good.
+    unverified: BTreeSet<LocationKey>,
 }
 
 /// What one `apply` did, before it is folded into a [`SyncReport`].
@@ -352,7 +377,25 @@ impl Catalog {
                 path: path.clone(),
                 source,
             })?;
+        migrate(&conn).map_err(|source| CatalogError::Open {
+            path: path.clone(),
+            source,
+        })?;
         Ok(Catalog { conn, path })
+    }
+
+    /// Open the catalog only if it already exists, never creating one.
+    ///
+    /// This is what the mover uses to record a replica it placed: the sweep is not
+    /// allowed to bring a catalog into being (invariant 9 — only `catalog sync` does
+    /// that), but when one is there it is the right place to note "I wrote a copy, and
+    /// here is whether a digest vouched for it".
+    pub fn open_existing(path: impl Into<PathBuf>) -> Result<Option<Self>, CatalogError> {
+        let path = path.into();
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::open(path).map(Some)
     }
 
     /// The catalog that belongs to this watched root, when `--catalog` is not given.
@@ -370,6 +413,11 @@ impl Catalog {
         let observation = observe(watch, dests)?;
         let existing = self.load_state()?;
         let applied = self.apply(&observation, &existing)?;
+        // Under-replication is computed after the ingest but from the observation, so a
+        // copy that vanished between the walk and the transaction is still counted as
+        // absent — the floor is about what is really on the disks, not what was.
+        let mut differences = applied.differences;
+        differences.extend(self.under_replicated(&observation, dests)?);
         Ok(SyncReport {
             catalog: self.path.clone(),
             watch: watch.to_path_buf(),
@@ -380,8 +428,81 @@ impl Catalog {
             objects_ingested: applied.objects_new,
             names_ingested: applied.names_new,
             locations_ingested: applied.locations_new,
-            differences: applied.differences,
+            differences,
         })
+    }
+
+    /// Objects that have fewer verified copies than their recorded tier floor.
+    ///
+    /// The floor is read from the `tier` table, which only `catalog sync --copies N`
+    /// writes; a plain sync has no floors recorded and therefore reports nothing here.
+    /// An object that still has a hot copy is skipped — replication is a property of
+    /// offloaded bytes, and requiring two copies of a file that has not moved yet would
+    /// make a fresh tree look broken.
+    fn under_replicated(
+        &self,
+        observation: &Observation,
+        dests: &[PathBuf],
+    ) -> Result<Vec<Difference>, CatalogError> {
+        let mut differences = Vec::new();
+
+        let mut dest_floors: BTreeMap<String, usize> = BTreeMap::new();
+        for dest in dests {
+            let tier = key_of(&canonical(dest));
+            if let Some(copies) = self.tier_floor(&tier)? {
+                dest_floors.insert(tier, copies);
+            }
+        }
+        if dest_floors.is_empty() {
+            return Ok(differences);
+        }
+        let expected = dest_floors.values().copied().max().unwrap_or(1);
+
+        for id in observation.objects.keys() {
+            let has_hot = observation
+                .locations
+                .iter()
+                .any(|((tier, _), object)| object == id && *tier == observation.watch_tier);
+            if has_hot {
+                continue;
+            }
+
+            let mut present: BTreeSet<String> = BTreeSet::new();
+            for ((tier, _), object) in &observation.locations {
+                if object == id && *tier != observation.watch_tier {
+                    present.insert(tier.clone());
+                }
+            }
+            if present.len() >= expected {
+                continue;
+            }
+
+            let missing: Vec<String> = dest_floors
+                .keys()
+                .filter(|tier| !present.contains(*tier))
+                .cloned()
+                .collect();
+            let path = observation
+                .names
+                .iter()
+                .find(|(_, object)| *object == id)
+                .map(|(path, _)| path.clone())
+                .unwrap_or_default();
+            differences.push(Difference {
+                kind: DifferenceKind::UnderReplicated,
+                path: PathBuf::from(path),
+                detail: format!(
+                    "object {} has {} verified copy/copies on [{}], floor {expected}; missing on [{}]",
+                    hex(id),
+                    present.len(),
+                    present.into_iter().collect::<Vec<_>>().join(", "),
+                    missing.join(", ")
+                ),
+            });
+        }
+
+        differences.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(differences)
     }
 
     /// Write one observation inside a single transaction. Either every fact lands or
@@ -483,10 +604,20 @@ impl Catalog {
         }
 
         // 4. Locations. Same rule as names: a new one is ingested, a changed one is
-        //    reported and the row keeps saying what the catalog recorded.
+        //    reported and the row keeps saying what the catalog recorded. A location
+        //    the mover wrote but could not verify is upgraded here — this pass has now
+        //    hashed the bytes, which is exactly the vouch it was missing.
         for (key, id) in &observation.locations {
             match existing.locations.get(key) {
-                Some(previous) if previous == id => {}
+                Some(previous) if previous == id => {
+                    if existing.unverified.contains(key) {
+                        tx.execute(
+                            "UPDATE location SET verified = 1, checksum = ?1, updated_at = ?2
+                              WHERE tier = ?3 AND storage_key = ?4",
+                            params![id, now, key.0, key.1],
+                        )?;
+                    }
+                }
                 Some(previous) => applied.differences.push(Difference {
                     kind: DifferenceKind::LocationChanged,
                     path: PathBuf::from(&key.1),
@@ -499,12 +630,31 @@ impl Catalog {
                     let primary =
                         i64::from(key.0 != observation.watch_tier && !hot_objects.contains(id));
                     tx.execute(
-                        "INSERT INTO location (object_id, tier, storage_key, is_primary, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        "INSERT INTO location
+                             (object_id, tier, storage_key, is_primary, updated_at, verified, checksum)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?1)",
                         params![id, key.0, key.1, primary, now],
                     )?;
                     applied.locations_new += 1;
                 }
+            }
+        }
+
+        // 4b. A location the mover recorded but no digest has vouched for, still present
+        //     on disk and NOT observed as a copy of this object (otherwise it was
+        //     upgraded above). It counts toward no floor: unknown, not assumed good.
+        for (tier, key) in &existing.unverified {
+            let observed_here = observation
+                .locations
+                .contains_key(&(tier.clone(), key.clone()));
+            if !observed_here {
+                applied.differences.push(Difference {
+                    kind: DifferenceKind::ReplicaUnknown,
+                    path: PathBuf::from(key),
+                    detail: format!(
+                        "on {tier}: written but never verified, and not found at its key now"
+                    ),
+                });
             }
         }
 
@@ -603,16 +753,20 @@ impl Catalog {
 
         let mut locations = self
             .conn
-            .prepare("SELECT tier, storage_key, object_id FROM location")?;
+            .prepare("SELECT tier, storage_key, object_id, verified FROM location")?;
         let rows = locations.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)? != 0,
             ))
         })?;
         for row in rows {
-            let (tier, key, id) = row?;
+            let (tier, key, id, verified) = row?;
+            if !verified {
+                existing.unverified.insert((tier.clone(), key.clone()));
+            }
             existing.locations.insert((tier, key), id);
         }
 
@@ -661,15 +815,18 @@ impl Catalog {
 
     /// Every location row, in tier/key order.
     pub fn all_locations(&self) -> Result<Vec<LocationRecord>, CatalogError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT tier, storage_key, is_primary, object_id FROM location ORDER BY tier, storage_key")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT tier, storage_key, is_primary, verified, checksum, object_id
+             FROM location ORDER BY tier, storage_key",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(LocationRecord {
                 tier: row.get::<_, String>(0)?,
                 storage_key: row.get::<_, String>(1)?,
                 is_primary: row.get::<_, i64>(2)? != 0,
-                object: hex(&row.get::<_, Vec<u8>>(3)?),
+                verified: row.get::<_, i64>(3)? != 0,
+                checksum: row.get::<_, Option<Vec<u8>>>(4)?.map(|bytes| hex(&bytes)),
+                object: hex(&row.get::<_, Vec<u8>>(5)?),
             })
         })?;
         let mut out = Vec::new();
@@ -677,6 +834,90 @@ impl Catalog {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Declare the copy floor for a tier. Recorded once per tier, updated when the
+    /// operator asks for a different floor; never inferred from the rows that exist.
+    pub fn set_tier_floor(&self, tier: &str, copies: usize) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO tier (name, copies) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET copies = excluded.copies",
+            params![tier, copies as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The copy floor recorded for a tier, if any.
+    pub fn tier_floor(&self, tier: &str) -> Result<Option<usize>, CatalogError> {
+        self.conn
+            .query_row(
+                "SELECT copies FROM tier WHERE name = ?1",
+                params![tier],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|found| found.map(|copies| copies.max(0) as usize))
+            .map_err(Into::into)
+    }
+
+    /// Every recorded tier floor, as `(tier, copies)`, in tier order.
+    pub fn all_tier_floors(&self) -> Result<Vec<(String, usize)>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, copies FROM tier ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Record a replica the mover placed for an object the catalog already knows.
+    ///
+    /// Returns `Ok(false)` when the object is not in the catalog — nothing is inserted,
+    /// because the mover is not allowed to ingest (that is `sync`'s job, and invariant 9
+    /// keeps the sweep away from creating catalog state beyond noting a copy it made).
+    /// `verified = false` records bytes the mover wrote but could not vouch for: the row
+    /// exists so a later sync hashes them, but it counts toward no floor.
+    pub fn record_replica(
+        &self,
+        object: &[u8],
+        tier: &str,
+        storage_key: &str,
+        verified: bool,
+        checksum: Option<&[u8]>,
+    ) -> Result<bool, CatalogError> {
+        let known: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object WHERE id = ?1)",
+            params![object],
+            |row| row.get(0),
+        )?;
+        if !known {
+            return Ok(false);
+        }
+        let now = now_seconds();
+        self.conn.execute(
+            "INSERT INTO location
+                 (object_id, tier, storage_key, is_primary, updated_at, verified, checksum)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+             ON CONFLICT(tier, storage_key) DO UPDATE SET
+                 object_id = excluded.object_id,
+                 updated_at = excluded.updated_at,
+                 verified = excluded.verified,
+                 checksum = excluded.checksum",
+            params![
+                object,
+                tier,
+                storage_key,
+                now,
+                i64::from(verified),
+                checksum
+            ],
+        )?;
+        Ok(true)
     }
 
     /// The state of the object a namespace path names, if that path is in the catalog.
@@ -881,6 +1122,30 @@ fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Bring an older catalog file up to the current schema without touching its data.
+///
+/// `CREATE TABLE IF NOT EXISTS` covers new *tables* (the `tier` table), but a column
+/// added to an existing table is invisible to an existing file. A catalog written before
+/// replication existed has no `verified`/`checksum` on `location`, so this adds them with
+/// defaults that mean "unknown" — never "good": an unverified pre-existing copy must be
+/// hashed by a later sync before it counts toward a floor. Backward compatible in the
+/// direction that matters: a new binary opens an old file, and the old rows keep saying
+/// exactly what they said.
+fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_verified: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('location') WHERE name = 'verified'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_verified == 0 {
+        conn.execute_batch(
+            "ALTER TABLE location ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE location ADD COLUMN checksum BLOB;",
+        )?;
+    }
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -965,5 +1230,169 @@ mod tests {
                 location.tier
             );
         }
+    }
+
+    #[test]
+    fn a_sync_verified_every_copy_it_ingested() {
+        // The identity is the digest, so a location observed by the walk has been hashed
+        // and can be vouched for. A row that is not verified would be one nothing read.
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold = tmp.path().join("cold");
+        fs::create_dir_all(cold.join("shows")).unwrap();
+        fs::create_dir_all(watch.join("shows")).unwrap();
+        fs::write(cold.join("shows/moved.mkv"), b"movie bytes").unwrap();
+        std::os::unix::fs::symlink("../../cold/shows/moved.mkv", watch.join("shows/moved.mkv"))
+            .unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+
+        for location in catalog.all_locations().unwrap() {
+            assert!(
+                location.verified,
+                "a hashed location must be verified: {location:?}"
+            );
+            assert_eq!(
+                location.checksum.as_deref(),
+                Some(location.object.as_str()),
+                "the stored checksum is the object identity"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_location_is_reported_as_unknown_not_counted() {
+        // A mover that wrote bytes it could not vouch for leaves `verified = 0`. If the
+        // file is then gone, a sync must say so — it must never quietly promote the row
+        // to a good copy just because it has a row.
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold = tmp.path().join("cold");
+        fs::create_dir_all(&cold).unwrap();
+        fs::create_dir_all(&watch).unwrap();
+        fs::write(cold.join("ghost.bin"), b"maybe").unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        // Break the vouch by hand: the row now says "written, never verified".
+        catalog
+            .conn
+            .execute("UPDATE location SET verified = 0, checksum = NULL", [])
+            .unwrap();
+        // The bytes vanish too.
+        fs::remove_file(cold.join("ghost.bin")).unwrap();
+
+        let report = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert!(
+            report
+                .differences
+                .iter()
+                .any(|difference| difference.kind == DifferenceKind::ReplicaUnknown),
+            "an unknown copy must be reported: {:?}",
+            report.differences
+        );
+    }
+
+    #[test]
+    fn a_floor_is_recorded_once_per_tier_and_under_replication_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold_a = tmp.path().join("cold-a");
+        let cold_b = tmp.path().join("cold-b");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold_a).unwrap();
+        fs::create_dir_all(&cold_b).unwrap();
+        fs::write(cold_a.join("movie.bin"), b"movie bytes").unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog
+            .set_tier_floor(&key_of(&canonical(&cold_a)), 2)
+            .unwrap();
+        catalog
+            .set_tier_floor(&key_of(&canonical(&cold_b)), 2)
+            .unwrap();
+        assert_eq!(
+            catalog.tier_floor(&key_of(&canonical(&cold_a))).unwrap(),
+            Some(2)
+        );
+        assert_eq!(catalog.tier_floor("/nowhere").unwrap(), None);
+
+        // The copy is a cold location with a name pointing at it, but only one of the two
+        // disks holds it — below the recorded floor of 2.
+        std::os::unix::fs::symlink("../cold-a/movie.bin", watch.join("movie.bin")).unwrap();
+        let report = catalog
+            .sync(&watch, &[cold_a.clone(), cold_b.clone()])
+            .unwrap();
+        let finding = report
+            .differences
+            .iter()
+            .find(|difference| difference.kind == DifferenceKind::UnderReplicated)
+            .unwrap_or_else(|| panic!("expected under-replicated: {:?}", report.differences));
+        assert!(
+            finding.detail.contains(&key_of(&canonical(&cold_b))),
+            "the missing disk must be named: {}",
+            finding.detail
+        );
+
+        // Add the second copy: the floor is met and the finding disappears.
+        fs::write(cold_b.join("movie.bin"), b"movie bytes").unwrap();
+        let healed = catalog
+            .sync(&watch, &[cold_a.clone(), cold_b.clone()])
+            .unwrap();
+        assert!(
+            !healed
+                .differences
+                .iter()
+                .any(|difference| difference.kind == DifferenceKind::UnderReplicated),
+            "two copies meet the floor: {:?}",
+            healed.differences
+        );
+    }
+
+    #[test]
+    fn a_replica_is_recorded_only_for_an_object_the_catalog_knows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = catalog_in(tmp.path());
+        assert!(
+            !catalog
+                .record_replica(&[9u8; 32], "/cold", "a.bin", true, Some(&[9u8; 32]))
+                .unwrap(),
+            "an unknown object must not be ingested by a replica record"
+        );
+        assert_eq!(catalog.location_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_old_catalog_file_without_verification_columns_still_opens() {
+        // A catalog written before replication has a `location` table with no `verified`
+        // column. Opening it must migrate the columns in with a default of "unknown", not
+        // fail and not claim the old rows were verified.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE object (
+                     id BLOB PRIMARY KEY, size INTEGER NOT NULL, checksum BLOB NOT NULL,
+                     created_at INTEGER NOT NULL, state TEXT NOT NULL);
+                 CREATE TABLE location (
+                     object_id BLOB NOT NULL, tier TEXT NOT NULL, storage_key TEXT NOT NULL,
+                     is_primary INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                     PRIMARY KEY (tier, storage_key));
+                 INSERT INTO object VALUES (x'0102', 3, x'0102', 0, 'offloaded');
+                 INSERT INTO location VALUES (x'0102', '/cold', 'a.bin', 1, 0);",
+            )
+            .unwrap();
+        }
+
+        let catalog = Catalog::open(&path).expect("an old catalog must still open");
+        let locations = catalog.all_locations().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert!(
+            !locations[0].verified,
+            "a pre-existing row is unknown until a sync hashes it"
+        );
+        assert_eq!(locations[0].checksum, None);
     }
 }

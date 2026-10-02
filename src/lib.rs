@@ -10,12 +10,13 @@ pub mod explain;
 pub mod file_movement;
 pub mod journal;
 pub mod opened;
+pub mod replication;
 pub mod restore;
 pub mod scope;
 
 pub use audit::{
-    audit, classify, repair, AuditError, AuditReport, Finding, RepairAction, RepairOutcome,
-    SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
+    audit, audit_with_copies, classify, repair, AuditError, AuditReport, Finding, RepairAction,
+    RepairOutcome, SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
     Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, SyncReport, CATALOG_NAME,
@@ -30,9 +31,10 @@ pub use explain::{
     ScopeReport, Verdict as ExplainVerdict,
 };
 pub use file_movement::{
-    log_file_movement, migrate_least_used, select_candidates, FileOutcome, MigrationRecord,
-    MigrationReport, Policy, SkipReason, UsageTracker,
+    log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
+    MigrationRecord, MigrationReport, Policy, ReplicationDetail, SkipReason, UsageTracker,
 };
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
+pub use replication::{replicate, ReplicaPlacement, ReplicaStatus, ReplicationOutcome};
 pub use restore::{RestoreError, RestoreOutcome, RestoreRequest};
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};

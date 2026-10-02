@@ -49,6 +49,7 @@ Every option is a flag; there is no config file and nothing is hardcoded.
 | `--min-idle-days <DAYS>` | `30` | Only touch files last used at least this long ago. |
 | `--min-observed-accesses <N>` | `1` | Pin a file once it has been read `N` times *during this run*; `0` disables the pin. |
 | `--limit <N>` | `10` | Most files moved per destination per sweep. |
+| `--copies <N>` | `1` | Durability floor: place this many verified copies on N distinct `--dest` roots before removing the source. `1` is the original single-copy mover. |
 | `--min-free-gb <GB>` | `1.0` | Floor of free space a destination must keep, on top of room for the file. |
 | `--interval <SECS>` | `3600` | Delay between sweeps. |
 | `--once` | | One sweep, then exit. |
@@ -155,6 +156,32 @@ With several destinations, sweeps fill the fastest tier first and only spill ont
 next when a tier is out of room (or has hit `--limit`). A file too large for what a tier
 can spare is reported as *waiting for room* rather than failed — it will be picked up on
 a later sweep, and the source is left untouched until then.
+
+### Replication: `--copies N`
+
+With `--copies N` (N > 1) a file is copied to N **distinct** `--dest` roots and every
+copy is hashed and compared to the source before the original is removed. A copy that
+fails its checksum — even a same-size one — does not count toward the floor, and if the
+floor is not met the source is kept and the file is reported as *under-replicated*. The
+tool never deletes the only copy to satisfy a number.
+
+```sh
+just_cache --watch /mnt/cache/media \
+  --dest /mnt/disk-a/media --dest /mnt/disk-b/media \
+  --copies 2 --min-idle-days 30 --once
+```
+
+An invocation that cannot satisfy the floor (fewer distinct `--dest` roots than
+`--copies`) is refused before anything moves. `catalog sync --copies N` records the floor
+once per destination tier: afterwards a sync reports objects holding fewer verified copies
+as `under-replicated` (with the disks they *are* and *are not* on), and a copy deleted by
+hand shows up as `location-missing` naming the disk it was on. `audit --copies N` reports
+the same filesystem-side as `replica-lost`.
+
+Distinctness is by configured root, not by device: two directories on one pool are two
+destinations. With a floor of 2 and one other disk, the second copy lands on that other
+disk **on the same host** — this survives a disk failure, not the loss of the machine.
+Off-host copies are a later phase.
 
 ## How a file is chosen
 
