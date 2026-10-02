@@ -5,9 +5,10 @@ Status: draft. This doc defines where the project is going; the current symlink 
 
 ## 1. The idea
 
-One namespace over every storage tier you own — RAM, SSD, spinning disks, a LAN peer,
-cloud object storage, an offline disk in a drawer — with files placed by observed use,
-and transparently promoted back when they go hot again.
+One namespace over every storage tier you own — SSD, spinning disks, a LAN peer, cloud
+object storage, an offline disk in a drawer — plus cache overlays in front of them (RAM
+being the fastest of those), with files placed by observed use, and transparently
+promoted back when they go hot again.
 
 The model is S3 storage classes without S3: classes there are defined by **recall
 latency and price**, not by hardware. The same holds locally. A tier is:
@@ -31,13 +32,6 @@ is a catalog (below) so that its state is auditable and recoverable.
 A tier is configured, not discovered. `tiers.toml`:
 
 ```toml
-[tiers.ram]
-kind = "fs"                # fs | object | peer | offline
-path = "/mnt/ramdisk"
-volatility = "volatile"    # lost on reboot: never a tier of record
-recall = "us"
-copies = 1                 # cache only — data of record lives one tier down
-
 [tiers.ssd]
 kind = "fs"
 path = "/mnt/nvme-pool"
@@ -77,20 +71,63 @@ vaults = ["drawer-07", "drawer-08"]   # where this tier's volumes physically liv
 |---|---|
 | `kind` | Which transport driver serves this tier. |
 | `recall` | Latency class: `us` / `ms` / `s` / `min` / `hours`. Drives policy and recall UX. |
-| `volatility` | `volatile` tiers may only hold copies; a volatile tier can never be the last location of anything. |
+| `volatility` | `persistent` for every tier of record; `volatile` only for cache overlays (§2.1). |
 | `copies` | Durability floor *within* the tier. The engine schedules replication; scrubbing verifies it. |
 | `cost` | Optional $/GB-month or W-idle. Enables honest placement decisions later. |
 
 Hard rules:
 
-1. **A volatile tier is never a tier of record.** The engine may put a copy in `ram`,
-   but the catalog records `ssd` as the file's home. On boot, RAM entries are
-   re-hydrated from their home tier (or simply dropped, as a cache would be).
+1. **Every tier of record is durable.** A file's home tier is always one that survives
+   a reboot and a disk swap; anything volatile is a mirror, never a home (§2.1).
 2. **Every tier edge is a different transport.** fs→fs is copy + fsync; fs→object is
    chunked upload with resumable state; fs→offline is export-to-volume plus a
    catalog handshake; anything crossing the machine boundary is encrypted first.
 3. **Recall latency is honest.** A parked pool is not "fast when idle"; it is `recall =
    s`, and recall-aware consumers get that answer before the read is attempted.
+
+### 2.1 Cache overlays: RAM is a promotion target, not a tier
+
+RAM is the top of the ladder in *speed*, but it is not the top tier, because a tier has
+to be somewhere a file can live. RAM is better modelled as a **promotion target layered
+over a tier**: a hot file gets a copy promoted into RAM while continuing to live on
+SSD, exactly as reads are served from a cache in front of the tier of record.
+
+```toml
+[[cache]]
+name = "ram"
+over = "ssd"                # the tier it accelerates; never a home
+kind = "fs"
+path = "/mnt/ramdisk"
+max_size = "32GiB"
+promote_on = "2 accesses / 24h"
+evict = "lru"               # eviction is cache policy, not a lifecycle rule
+write_policy = "write-invalidate"   # writes go to the home tier; the RAM copy is dropped
+```
+
+Why the distinction earns its keep:
+
+- **A tier transition moves the file; a cache population copies bytes.** The catalog's
+  authoritative locations change in the first case and not in the second, so cache
+  traffic never churns lifecycle state or durability accounting.
+- **Losing a cache entry is not data loss**, so it needs no journal, no copy floor, no
+  scrub — the resilience machinery simply does not apply. On boot the catalog's homes
+  are all durable and the RAM contents are re-derivable (or just gone, as a cache).
+- **Eviction is a different algorithm.** Tiers are governed by lifecycle rules (§5);
+  caches are governed by capacity and recency. Keeping them separate stops the policy
+  engine from growing "rules" that are really cache tuning.
+
+The same construct generalizes beyond RAM: an SSD mirror in front of the HDD pool is
+the same object with a larger `max_size` — a promotion target, not a lifecycle stage.
+
+Two consequences worth stating early:
+
+- **Coherency.** With `write-invalidate`, a write or rename through the namespace
+  provider lands on the home tier and drops the RAM copy; a writeback cache would be
+  faster but has no battery, which makes it a data-loss design on a storage server.
+- **The best use of a RAM promotion target is not media.** Its real value is hot small
+  files — indexes, thumbnail caches, application metadata — where residency survives a
+  reboot deliberately rather than being re-warmed by re-reading. Media is already
+  served acceptably from SSD, and the page cache covers incidental reuse for free.
 
 ## 3. The catalog is the source of truth
 
@@ -149,6 +186,10 @@ Consequences:
   durability floor allows it.
 - **Audit is a query**: names whose primary location is missing, copies failing
   checksum, objects below their tier's copy floor, symlinks pointing at nothing.
+- **Cache residency is not a location.** A copy in a promotion target (§2.1) is never
+  written to `location` and never counts toward a tier's copy floor; if it is recorded
+  at all it is in a separate ephemeral table for observability, so a restart can never
+  make the catalog believe a volatile copy is data of record.
 
 ## 4. Namespace providers
 
@@ -203,6 +244,11 @@ Rules must be **explainable**: every transition records which rule fired and why
 (`rule` column), and `just_cache explain <path>` answers "where is this file and why".
 Dry-run remains a first-class mode for the whole engine.
 
+Policy governs **tiers only**. Populating and evicting a cache overlay (§2.1) is
+capacity- and recency-driven and never appears here — a file "promoted to RAM" is not a
+lifecycle transition, and no rule should be able to make a volatile copy the place a
+file lives.
+
 Cost-aware placement (later phase): given a tier's cost model, report — and
 optionally act on — the delta of keeping each subtree where it is. This is the part
 S3 does inside one provider and self-hosted stacks don't do at all.
@@ -245,7 +291,8 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
   within a tier; scrubbing.
 - **P2 — FUSE namespace provider**: observe accesses properly; streaming recall;
-  pins/restore semantics; gateway (S3/WebDAV) provider.
+  pins/restore semantics; gateway (S3/WebDAV) provider; cache overlays (§2.1) — a RAM
+  promotion target first, since the same construct later fronts the HDD pool with SSD.
 - **P3 — remote tiers**: object-store driver (chunked, resumable, encrypted);
   LAN-peer driver; offline-volume driver with vault tracking and insert-prompt recall.
 - **P4 — cost-aware policy**: per-tier cost models, placement reports, rule
