@@ -27,6 +27,17 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-
 
+    # A half-resolved merge carries its marker lines as ordinary content, so the file
+    # rebases and merges cleanly forever after, and a markdown doc is neither compiled nor
+    # tested — nothing else fails on it. A marker that reaches a commit renders in the
+    # shipped documentation, so fail here instead.
+    - name: Reject committed conflict markers
+      run: |
+        if git grep -nE '^(<{7}|={7}$|>{7})' -- .; then
+          echo "::error::conflict markers committed as text; resolve the file properly, do not commit them"
+          exit 1
+        fi
+
     - name: Format
       run: cargo fmt --all -- --check
 
