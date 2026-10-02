@@ -377,6 +377,7 @@ only removed when another location still holds the object (a normal offload, whe
 stale hot row is replaced by the cold one) or when no name references the object: a name
 is never stranded pointing at an object with nowhere to live.
 
+<<<<<<< HEAD
 Closed in P1 by `just_cache locate` (#18): finding an object is now a catalog query, not a
 walk. `locate <QUERY> --catalog <FILE>` reads the `name` table for a namespace path and
 searches `object` by hex-id prefix for a content digest (a query of at least eight hex
@@ -406,6 +407,22 @@ without allocating disk blocks or unsharing a reflink extent on common Linux fil
 preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of a 64 MiB
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
+
+Closed in P1 by `just_cache audit` reading the catalog (#19): "audit is a query" (§3) is
+now true rather than an aspiration. When a catalog exists — `--catalog <FILE>`, or the
+default `.just_cache-catalog.sqlite` beside the watch root — the audit answers from the
+recorded `name`, `object` and `location` rows plus a *single* pass over the watched
+namespace, instead of walking the tree and every tier and reconstructing the truth from
+both. It reports a name the tree no longer has (`name-vanished`), a recorded location with
+no file (`missing-copy`, primary or replica), a primary copy whose bytes no longer match
+the recorded checksum (`checksum-mismatch`), an object with no surviving copy
+(`copy-floor`), a symlink that resolves to a version the catalog does not hold
+(`unknown-version`), and a path the catalog has never seen (`unknown-path`) — the last is
+reported and never adopted. The walk-based audit stays as the bootstrap and the fallback
+(auto-selected when no catalog file exists), manual `--repair` there is unchanged, and a
+catalog/file disagreement is a finding, never a rewrite: catalog-mode `--repair` marks each
+finding for resync and touches neither the tree nor the rows. The exit-code contract is
+unchanged (`0` clean / `1` findings / `2` usage).
 
 Still open, and honestly so:
 
@@ -439,6 +456,27 @@ Still open, and honestly so:
   resolution step: deciding a vanished name was a rename might be a human command, but it
   does not exist yet, so a difference repeats on every sync. That is deliberately louder
   than auto-healing in the wrong direction, and it is the honest state of #16.
+- **The copy floor is not in the schema, so `audit` can only enforce one.** §6 wants a
+  *per-tier* `copies` floor the scheduler maintains; the catalog shipped without a floor
+  column, and adding one needs a versioned migration (an `ALTER TABLE` a `CREATE TABLE IF
+  NOT EXISTS` schema never reaches), which is more than the small, honest change #19
+  allowed. The audit therefore enforces the only floor the schema expresses — every object
+  must keep at least one existing location — and reports an object whose every copy is gone
+  as `copy-floor`. A per-tier floor is later work.
+- **`audit` verifies the copy of record, not every replica.** Hashing both a hot and a cold
+  copy of a `restoring` object (or of a replicated tier, once that exists) on every audit is
+  the scrub §6 describes, and it would double the I/O an audit costs. Catalog mode hashes
+  the primary location and only *stats* the others, so a corrupt non-primary replica is not
+  caught by an audit; catching it is the scrubber's job.
+- **There is no catalog-only (`--no-filesystem`) audit.** #19 allows one "where even that is
+  unavailable"; not built. Every catalog-mode audit makes one pass over the watched tree,
+  which is also what lets it see a path the catalog does not know. An answer with no
+  filesystem at all (a catalog for a tier that is not mounted) is a thing the schema could
+  support and no command does yet.
+- **Catalog-mode `repair` marks for resync in its report, not in a row.** A durable per-row
+  `needs_resync` flag would need the same migration the copy floor needs; until then the mark
+  is the printed outcome plus the non-zero exit, and the operator runs `catalog sync` to
+  re-record the tree.
 - **Only the symlink provider's flat mirrored layout is understood.** Two-disk replication
   within a tier, remote/object tiers, and offline volumes are later work; the `volume`
   table ships empty.
