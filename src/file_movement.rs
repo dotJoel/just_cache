@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::disk_management::{self, DiskError, FileEntry, MoveOutcome};
+use crate::journal::Journal;
 use crate::opened::{Guards, InUse};
 use crate::scope::{Rejected, Scope};
 
@@ -185,6 +186,20 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
+/// Everything a sweep decides with, in one place.
+///
+/// These four arrived one at a time — configuration, then eligibility, then live state,
+/// then the record of what is in flight — and the parameter list grew with each. Grouping
+/// them keeps call sites readable and, more usefully, names what a sweep actually depends
+/// on: how aggressive it may be, what it may touch, what is currently in use, and what it
+/// is in the middle of.
+pub struct MoveContext<'a> {
+    pub policy: &'a Policy,
+    pub scope: &'a Scope,
+    pub guards: &'a Guards,
+    pub journal: &'a mut Journal,
+}
+
 /// The files a sweep would move, oldest use first, capped at [`Policy::limit`].
 ///
 /// Already-migrated symlinks and non-regular files are excluded; the reasons for the
@@ -194,11 +209,10 @@ impl std::fmt::Display for SkipReason {
 pub fn select_candidates<'a>(
     entries: &'a [FileEntry],
     tracker: &UsageTracker,
-    policy: &Policy,
-    scope: &Scope,
-    guards: &Guards,
+    context: &MoveContext<'_>,
     now: SystemTime,
 ) -> (Vec<&'a FileEntry>, Vec<(&'a FileEntry, SkipReason)>) {
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
     let mut eager: Vec<(&FileEntry, SystemTime)> = Vec::new();
     let mut skipped: Vec<(&FileEntry, SkipReason)> = Vec::new();
 
@@ -405,16 +419,18 @@ impl MigrationReport {
 pub fn migrate_least_used<F>(
     entries: &[FileEntry],
     tracker: &UsageTracker,
-    policy: &Policy,
-    scope: &Scope,
-    guards: &Guards,
+    context: &mut MoveContext<'_>,
     now: SystemTime,
     mut choose_destination: F,
 ) -> MigrationReport
 where
     F: FnMut(&FileEntry) -> Result<Option<PathBuf>, DiskError>,
 {
-    let (candidates, skipped) = select_candidates(entries, tracker, policy, scope, guards, now);
+    let (candidates, skipped) = select_candidates(entries, tracker, context, now);
+    // The copy fields are read out before the journal is borrowed mutably below: the
+    // references are `Copy`, so this does not keep the context borrowed.
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let journal: &mut Journal = context.journal;
     let mut report = MigrationReport::default();
 
     for (entry, reason) in skipped {
@@ -473,12 +489,42 @@ where
         let outcome = if policy.dry_run {
             FileOutcome::Planned
         } else {
-            match disk_management::move_file_with_symlink(&destination, entry) {
+            // The intent is recorded *before* anything moves and flushed to disk, because
+            // the window this covers is the machine dying mid-move. Without it, a crash
+            // between removing the source and creating the symlink leaves bytes on a cold
+            // tier that nothing in the namespace points at — recoverable only if we wrote
+            // down that we were about to do it.
+            let target = destination.join(&entry.relative);
+            let journalled = journal.intent(&entry.relative, &target, entry.size).is_ok();
+            let moved = match disk_management::move_file_with_symlink(&destination, entry) {
                 Ok(MoveOutcome::Moved) => FileOutcome::Moved,
                 Ok(MoveOutcome::LinkedExisting) => FileOutcome::LinkedExisting,
                 Ok(MoveOutcome::AlreadyLinked) => FileOutcome::AlreadyLinked,
                 Err(err) => FileOutcome::Failed(err.to_string()),
+            };
+            // Only a completed move clears the record. A failure leaves it and the sweep
+            // ends, so the journal keeps describing what is on disk.
+            if journalled
+                && matches!(
+                    moved,
+                    FileOutcome::Moved | FileOutcome::LinkedExisting | FileOutcome::AlreadyLinked
+                )
+            {
+                // Cleared, not marked: the symlink now at this path is the evidence the
+                // move finished, and a daemon that kept a line per move would grow a file
+                // describing nothing.
+                journal.forget(&entry.relative);
             }
+            if !journalled {
+                // Reported, not swallowed: an unwritable journal means the crash window is
+                // unguarded, and the user is the only one who can fix that.
+                eprintln!(
+                    "just_cache: cannot record the move of {} in the journal; a crash during \
+                     this move would not be recoverable",
+                    entry.path.display()
+                );
+            }
+            moved
         };
 
         report.records.push(MigrationRecord {
@@ -526,8 +572,16 @@ mod tests {
         }
     }
 
+    /// A journal in its own temporary directory, so no test writes to a shared path.
+    fn test_journal() -> (tempfile::TempDir, Journal) {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = Journal::at(tmp.path().join("journal")).unwrap();
+        (tmp, journal)
+    }
+
     #[test]
     fn only_files_idle_past_the_threshold_are_candidates() {
+        let (_tmp, mut journal) = test_journal();
         let now = SystemTime::now();
         let entries = vec![
             entry("/watch/cold.bin", 90 * 86_400, 10),
@@ -542,9 +596,12 @@ mod tests {
         let (candidates, skipped) = select_candidates(
             &entries,
             &UsageTracker::new(),
-            &policy,
-            &Scope::everything(),
-            &Guards::permissive(),
+            &MoveContext {
+                policy: &policy,
+                scope: &Scope::everything(),
+                guards: &Guards::permissive(),
+                journal: &mut journal,
+            },
             now,
         );
 
@@ -556,6 +613,7 @@ mod tests {
 
     #[test]
     fn oldest_files_win_when_over_the_limit() {
+        let (_tmp, mut journal) = test_journal();
         let now = SystemTime::now();
         let entries = vec![
             entry("/watch/b.bin", 10 * 86_400, 10),
@@ -571,9 +629,12 @@ mod tests {
         let (candidates, skipped) = select_candidates(
             &entries,
             &UsageTracker::new(),
-            &policy,
-            &Scope::everything(),
-            &Guards::permissive(),
+            &MoveContext {
+                policy: &policy,
+                scope: &Scope::everything(),
+                guards: &Guards::permissive(),
+                journal: &mut journal,
+            },
             now,
         );
 
@@ -606,12 +667,16 @@ mod tests {
             ..Policy::default()
         };
 
+        let (_tmp, mut journal) = test_journal();
         let (candidates, skipped) = select_candidates(
             &entries,
             &tracker,
-            &policy,
-            &Scope::everything(),
-            &Guards::permissive(),
+            &MoveContext {
+                policy: &policy,
+                scope: &Scope::everything(),
+                guards: &Guards::permissive(),
+                journal: &mut journal,
+            },
             now,
         );
         assert!(candidates.is_empty());
@@ -649,13 +714,17 @@ mod tests {
             limit: 10,
             dry_run: true,
         };
+        let mut journal = Journal::at(tmp.path().join("journal")).unwrap();
 
         let report = migrate_least_used(
             &entries,
             &UsageTracker::new(),
-            &policy,
-            &Scope::everything(),
-            &Guards::permissive(),
+            &mut MoveContext {
+                policy: &policy,
+                scope: &Scope::everything(),
+                guards: &Guards::permissive(),
+                journal: &mut journal,
+            },
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
         );

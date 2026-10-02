@@ -6,6 +6,7 @@ pub mod digest;
 
 pub mod disk_management;
 pub mod file_movement;
+pub mod journal;
 pub mod opened;
 pub mod scope;
 

@@ -333,8 +333,9 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
 - **P0 — harden what exists** (symlink provider): journal + startup repair;
   preserve mode/owner/xattrs/sparse; do-not-move if the file is open or hardlinked
   elsewhere; `audit` command (cold copies without a symlink, symlinks without a target);
-  CI test that exercises the EXDEV path. *(Scope controls — `--include`/`--exclude` and
-  `--min-size`/`--max-size` per §5.1 — are done.)*
+  CI test that exercises the EXDEV path. *(Done: scope controls per §5.1; metadata,
+  sparseness and checksum adoption; the open-file/hardlink guard; `audit` + `--repair`;
+  the journal and startup recovery; CI running the EXDEV path. P0 is closed.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
   within a tier; scrubbing.
@@ -350,14 +351,31 @@ Each phase ships something usable alone: P0 is a better standalone mover; P1 mak
 trustworthy; P2 removes the symlink breakage; P3 completes the S3 analogy; P4 is the
 part nothing else does.
 
-## 9. Known gaps in v0.2.0 (tracked, not hidden)
+## 9. Known gaps (tracked, not hidden)
 
-- Cross-device copy drops mode/owner/xattrs and sparseness; existing-destination
-  adoption compares size only.
-- Crash window between source removal and symlink creation (P0's journal fixes it).
-- No open-file/hardlink guard before moving a file.
-- CI never exercises the EXDEV path the mover actually takes in production.
-- Access tracking depends on atime semantics of the host mounts.
+Closed in P0: metadata/sparseness loss on cross-device copies; size-only adoption;
+the open-file/hardlink gap; the crash window between source removal and symlink
+creation; and CI's failure to exercise the EXDEV path.
+
+Still open, and honestly so:
+
+- **Journal records carry a size, not a digest.** Recovery refuses to link a name to a
+  copy whose size does not match what the move promised, which is the strongest check
+  available without hashing every file before every move. A same-size-but-corrupt copy
+  would still be linked; the catalog's digests (P1) are what close that, and the mover
+  already checksums destinations it *adopts*, so the hole is narrow and named.
+- **No read-back verification of freshly copied bytes.** A torn copy is caught by the
+  short-copy and source-changed guards, not by re-reading what was written: hashing a
+  sparse file means materializing its holes, and re-reading a 40 GB copy doubles I/O.
+- **The journal is one file per watched root**, not part of the catalog. Two sweeps of
+  different trees cannot see each other's in-flight moves, which is correct today and
+  a thing to revisit when the catalog exists.
+- **A damaged journal stops the sweep** rather than being ignored. Deliberate — it may
+  describe bytes already on a cold tier — but it is a hard stop a human has to clear.
+- **Root-owned files cannot be relocated** by a non-root sweep: the copy fails on
+  chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
+  not built.
+- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
 
 ## 10. Non-goals
 

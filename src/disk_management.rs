@@ -59,6 +59,10 @@ pub enum DiskError {
         #[source]
         source: io::Error,
     },
+    /// Recovery wanted to restore a name, but something already occupies it. Refusing is
+    /// the only safe answer: the occupant may be a link a human created deliberately.
+    #[error("refusing to link {link}: something is already there")]
+    LinkExists { link: PathBuf },
     #[error("cannot link {link} -> {target}: {source}")]
     SymlinkError {
         link: PathBuf,
@@ -136,7 +140,7 @@ pub enum MoveOutcome {
 
 /// Marker prefix used for the temporary files created during a cross-device copy.
 /// Files matching this are leftovers from an interrupted run and are ignored by the walk.
-const PARTIAL_PREFIX: &str = ".just_cache-partial-";
+pub const PARTIAL_PREFIX: &str = ".just_cache-partial-";
 
 /// Every file under `root`, recursively, in no particular order.
 ///
@@ -180,7 +184,13 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
                 continue;
             }
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with(PARTIAL_PREFIX) {
+            // Our own bookkeeping: the journal and any in-flight copies. Moving the
+            // journal onto a cold tier would be absurd, and worse, would destroy the
+            // record of what is in flight exactly when it is needed.
+            if name
+                .to_string_lossy()
+                .starts_with(crate::journal::INTERNAL_PREFIX)
+            {
                 continue;
             }
 
@@ -780,6 +790,25 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// The path to store *inside* the symlink: relative when the source and destination
 /// share an ancestor, absolute otherwise. Relative links keep the pair working when
 /// the whole tree is moved or the destination is mounted elsewhere.
+/// Make `link` a symlink to `target`, creating no directories and replacing nothing.
+///
+/// Shared by the mover and by journal recovery, so a link restored after a crash is
+/// byte-for-byte the kind of link a normal move would have left: relative where possible,
+/// absolute when the two paths share no ancestor.
+pub fn link_into_place(target: &Path, link: &Path) -> Result<(), DiskError> {
+    if fs::symlink_metadata(link).is_ok() {
+        return Err(DiskError::LinkExists {
+            link: link.to_path_buf(),
+        });
+    }
+    let relative = symlink_target(link, target);
+    create_symlink(&relative, link).map_err(|source| DiskError::SymlinkError {
+        link: link.to_path_buf(),
+        target: relative.clone(),
+        source,
+    })
+}
+
 pub fn symlink_target(src: &Path, dest: &Path) -> PathBuf {
     let (Some(src_dir), Some(dest_dir)) = (src.parent(), dest.parent()) else {
         return dest.to_path_buf();

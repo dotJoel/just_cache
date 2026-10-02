@@ -5,9 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use just_cache::disk_management::{self, DiskError, FileEntry, MoveOutcome};
-use just_cache::file_movement::{self, FileOutcome, Policy, UsageTracker};
+use just_cache::file_movement::{self, FileOutcome, MoveContext, Policy, UsageTracker};
+use just_cache::journal::Journal;
 use just_cache::opened::{FileId, Guards, OpenFiles};
 use just_cache::scope::Scope;
+
+/// A journal beside the test's tree, which is where the CLI keeps its own.
+fn journal_for(tmp: &tempfile::TempDir) -> Journal {
+    Journal::in_tree(tmp.path()).expect("test journal opens")
+}
 
 fn scan(root: &Path) -> Vec<FileEntry> {
     disk_management::list_files_recursive(root).expect("walk should succeed")
@@ -95,9 +101,12 @@ fn a_second_run_is_a_no_op() {
     let report = file_movement::migrate_least_used(
         &rescan,
         &tracker,
-        &policy,
-        &Scope::everything(),
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -231,9 +240,12 @@ fn a_sweep_skips_everything_outside_the_include_set() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &scope,
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &scope,
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -270,9 +282,12 @@ fn an_excluded_directory_survives_a_sweep_even_when_it_is_the_coldest_thing_ther
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &scope,
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &scope,
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -309,9 +324,12 @@ fn the_size_window_skips_tiny_and_enormous_files() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &scope,
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &scope,
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -411,9 +429,12 @@ fn a_file_something_else_has_open_is_left_alone() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &Scope::everything(),
-        &guards,
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &guards,
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -456,9 +477,12 @@ fn a_hardlinked_file_is_skipped_unless_the_guard_is_relaxed() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &Scope::everything(),
-        &guarded,
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &guarded,
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -469,9 +493,12 @@ fn a_hardlinked_file_is_skipped_unless_the_guard_is_relaxed() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &Scope::everything(),
-        &relaxed,
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &relaxed,
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -497,9 +524,12 @@ fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &Scope::everything(),
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(None), // the tier says it is out of space
     );
@@ -530,9 +560,12 @@ fn a_sweep_reports_failures_without_stopping_the_rest() {
     let report = file_movement::migrate_least_used(
         &entries,
         &UsageTracker::new(),
-        &policy,
-        &Scope::everything(),
-        &Guards::permissive(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
