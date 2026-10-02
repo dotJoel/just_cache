@@ -318,6 +318,53 @@ fn the_size_window_skips_tiny_and_enormous_files() {
     assert!(watch.join("huge.img").is_file());
 }
 
+/// A file that changes size between being scanned and being copied is a file something is
+/// using. Copying it anyway would put a torn view on the cold tier and then delete the
+/// only complete copy, so the discovery is exactly what the move must refuse.
+#[test]
+fn a_source_that_changed_since_the_scan_is_not_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let src = watch.join("shrinking.bin");
+    fs::write(&src, vec![b'a'; 4096]).unwrap();
+
+    let entries = scan(&watch);
+    let entry = find(&entries, "shrinking.bin");
+
+    // Shrink behind the scan's back, the way a truncating writer would.
+    fs::write(&src, vec![b'b'; 512]).unwrap();
+
+    let err = disk_management::move_file_with_symlink(&cold, entry)
+        .expect_err("a source that changed must not be moved");
+    match err {
+        DiskError::SourceChanged {
+            expected, actual, ..
+        } => {
+            assert_eq!(expected, 4096, "expected size comes from the scan");
+            assert_eq!(actual, 512, "actual size is what the source has now");
+        }
+        other => panic!("expected SourceChanged, got {other:?}"),
+    }
+
+    assert!(
+        fs::read(&src).is_ok(),
+        "the source must be left where it is"
+    );
+    assert_eq!(fs::read(&src).unwrap().len(), 512);
+    let leftovers: Vec<_> = fs::read_dir(&cold)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no partial file may be left behind: {leftovers:?}"
+    );
+}
+
 #[test]
 fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
     let tmp = tempfile::tempdir().unwrap();

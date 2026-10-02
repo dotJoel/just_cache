@@ -84,6 +84,18 @@ pub enum DiskError {
         dest_size: u64,
         src_size: u64,
     },
+    /// The source is not the file the scan decided to move: it changed size between
+    /// being scanned and being copied. Refused before any bytes are written, because a
+    /// file that changed under us is a file something is using, and copying it would put
+    /// a torn view on the cold tier and then delete the original.
+    #[error(
+        "source {path} changed since it was scanned: expected {expected} bytes, found {actual}"
+    )]
+    SourceChanged {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     #[error("copy of {path} onto {dest} left {actual} bytes, expected {expected}")]
     ShortCopy {
         path: PathBuf,
@@ -251,6 +263,20 @@ pub fn move_file_with_symlink(
         return Ok(MoveOutcome::AlreadyLinked);
     }
 
+    // The file must still be the one the policy chose. A size that moved since the scan
+    // means something is writing to it, and a file in flux must not be relocated on the
+    // strength of bytes we only *thought* we measured. Checked here, before either
+    // transfer path, because a same-filesystem `rename` would otherwise move the changed
+    // file without a murmur; `copy_then_remove` re-checks, since a cross-device copy takes
+    // long enough for the source to change underneath it.
+    if src_metadata.len() != entry.size {
+        return Err(DiskError::SourceChanged {
+            path: src.clone(),
+            expected: entry.size,
+            actual: src_metadata.len(),
+        });
+    }
+
     let dest = dest_root.join(&entry.relative);
     // The symlink target is computed before the move, while both paths still refer to
     // their final locations.
@@ -300,7 +326,7 @@ pub fn move_file_with_symlink(
             source,
         })?;
     } else {
-        transfer(src, &dest)?;
+        transfer(src, &dest, entry.size)?;
     }
 
     create_symlink(&link_target, src).map_err(|source| DiskError::SymlinkError {
@@ -332,7 +358,7 @@ fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
 /// Move `src` to `dest`, falling back to copy-then-delete when the two paths live on
 /// different filesystems (`rename` cannot cross a mount point, and a "slower disk" is
 /// almost always a different mount).
-fn transfer(src: &Path, dest: &Path) -> Result<(), DiskError> {
+fn transfer(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|source| DiskError::MoveError {
             from: src.to_path_buf(),
@@ -343,7 +369,7 @@ fn transfer(src: &Path, dest: &Path) -> Result<(), DiskError> {
 
     match fs::rename(src, dest) {
         Ok(()) => Ok(()),
-        Err(err) if is_cross_device(&err) => copy_then_remove(src, dest),
+        Err(err) if is_cross_device(&err) => copy_then_remove(src, dest, expected),
         Err(source) => Err(DiskError::MoveError {
             from: src.to_path_buf(),
             to: dest.to_path_buf(),
@@ -373,7 +399,7 @@ fn is_cross_device(err: &io::Error) -> bool {
 ///
 /// The temporary lives in the destination directory so the final rename stays on one
 /// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
-fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), DiskError> {
+fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let partial = dir.join(format!(
         "{PARTIAL_PREFIX}{}-{}.tmp",
@@ -381,38 +407,57 @@ fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), DiskError> {
         nanos()
     ));
 
-    let copied = (|| -> io::Result<u64> {
-        let src_file = File::open(src)?;
-        let src_metadata = src_file.metadata()?;
+    // Anything that fails here is reported as a failed move against this pair, except
+    // `SourceChanged`, which has already said precisely what went wrong.
+    let failed_move = |source: io::Error| DiskError::MoveError {
+        from: src.to_path_buf(),
+        to: dest.to_path_buf(),
+        source,
+    };
+
+    let copied = (|| -> Result<u64, DiskError> {
+        let src_file = File::open(src).map_err(failed_move)?;
+        let src_metadata = src_file.metadata().map_err(failed_move)?;
+        // Compare against the size the scan promised, not just against the live file:
+        // a source truncated between the scan and now would otherwise be copied happily
+        // and its short version accepted as a successful move. Checked before the copy
+        // starts so a file in flux costs nothing but a stat.
+        if src_metadata.len() != expected {
+            return Err(DiskError::SourceChanged {
+                path: src.to_path_buf(),
+                expected,
+                actual: src_metadata.len(),
+            });
+        }
         let mut dest_file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&partial)?;
+            .open(&partial)
+            .map_err(failed_move)?;
 
-        copy_contents(&src_file, &mut dest_file, src_metadata.len())?;
+        copy_contents(&src_file, &mut dest_file, src_metadata.len()).map_err(failed_move)?;
         // Metadata is applied while the file is still private, so the mode/owner never
         // briefly differ from the source for anything that can see the destination.
-        preserve_metadata(src, &partial, &src_metadata)?;
-        dest_file.sync_all()?;
+        preserve_metadata(src, &partial, &src_metadata).map_err(failed_move)?;
+        dest_file.sync_all().map_err(failed_move)?;
         Ok(src_metadata.len())
     })();
 
-    let expected = match copied {
-        Ok(expected) => expected,
-        Err(source) => {
+    let live_len = match copied {
+        Ok(live_len) => live_len,
+        Err(err) => {
+            // No partial was renamed into place, so nothing of ours survives.
             let _ = fs::remove_file(&partial);
-            return Err(DiskError::MoveError {
-                from: src.to_path_buf(),
-                to: dest.to_path_buf(),
-                source,
-            });
+            return Err(err);
         }
     };
 
-    // The source could have been truncated while we copied; a short destination must
-    // never replace the original.
+    // The source could have been truncated *while* we copied it; a short destination
+    // must never replace the original. Two comparisons, because they catch different
+    // failures: the copy must match what the scan promised, and it must match what the
+    // live file had when the copy started.
     match fs::symlink_metadata(&partial) {
-        Ok(metadata) if metadata.len() == expected => {}
+        Ok(metadata) if metadata.len() == expected && metadata.len() == live_len => {}
         Ok(metadata) => {
             let actual = metadata.len();
             let _ = fs::remove_file(&partial);
@@ -853,7 +898,8 @@ mod tests {
         )
         .is_ok();
 
-        copy_then_remove(&src, &dest).expect("copy path should succeed");
+        let expected = fs::metadata(&src).unwrap().len();
+        copy_then_remove(&src, &dest, expected).expect("copy path should succeed");
         assert!(
             !src.exists(),
             "the source is deleted after a successful copy"
