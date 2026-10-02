@@ -437,8 +437,12 @@ fn explain_json_reports_the_consulted_catalog() {
     let tree = tree();
     let path = tree.watch.join("live.bin");
     fs::write(&path, b"payload").unwrap();
-    set_times(&path, days_ago(90));
     sync_catalog(&tree);
+    // Stamp the idle times *after* the sync. `catalog sync` reads every file to hash it, and
+    // on a `relatime` mount that read bumps atime — so a stamp set before the sync is not the
+    // stamp `explain` sees. This host is `noatime`, where the ordering is invisible, which is
+    // exactly why the test passed here and failed on CI.
+    set_times(&path, days_ago(90));
 
     let output = explain(&[
         path.to_str().unwrap(),
