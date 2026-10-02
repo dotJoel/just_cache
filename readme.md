@@ -600,6 +600,40 @@ is a single `remove_file` beside the copy loop, and its comment says so.
 A sibling set of tests for metadata preservation and interruption/repair uses the same
 `tests/support` helpers and the same two environment variables.
 
+## How this codebase is built
+
+`just_cache` is written by AI coding agents (Hermes Agent subagents working in parallel),
+directed and reviewed by a human. Saying so plainly changes what to assume when reading a
+commit: nobody typed this from memory of the failure it prevents, so the reasoning lives in
+the comments and in [`docs/design.md`](docs/design.md), and an explanation that is not
+there is worth asking about.
+
+The workflow that is meant to keep that trustworthy:
+
+- **One issue, one worktree, one branch, one writer.** Each unit of work starts as an
+  issue and gets its own worktree on its own branch. Two agents are never pointed at one
+  checkout: concurrent writers produce a tree that looks coherent and that no single agent
+  ever verified.
+- **A PR per issue, squash-merged.** Conventional commit subjects. The PR body states what
+  was verified, and an issue whose acceptance criteria were not all met stays open with the
+  unmet criterion named, rather than closing on the strength of a passing test run.
+- **CI is the gate, not a green local run.** Format, clippy (`-D warnings`), build and the
+  full suite run in [`.github/workflows/rust.yml`](.github/workflows/rust.yml). The
+  workflow mounts a second filesystem so the cross-device tests reach the copy path, and
+  sets `JUST_CACHE_REQUIRE_SECOND_FS` so a missing mount fails instead of skipping — a skip
+  and a pass look identical in a test summary. It also rejects conflict markers committed
+  as text, which is a mistake no compiler or test can catch in markdown.
+- **Claims about the work are read from the remote, not from the summary.** "Done" means the
+  branch is on `origin`, the PR is open and CI is green — checked, not asserted. A branch
+  that is only committed locally counts as unfinished, because a scratch directory is one
+  cleanup away from taking the work with it.
+- **Gaps are named where the next reader will find them.** An untested path, an unverified
+  assumption, a question only a human can answer: those go into `docs/design.md` §9 and the
+  readme, not into a commit message.
+
+[`AGENTS.md`](AGENTS.md) carries the conventions in full, including the invariants a change
+must not break — the rules that make this tool safe to point at someone's data.
+
 ## Layout
 
 | Path | Contents |
