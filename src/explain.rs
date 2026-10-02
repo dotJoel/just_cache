@@ -37,6 +37,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::catalog::Catalog;
 use crate::disk_management::{self, AccessSource, FileEntry};
 use crate::file_movement::{Policy, UsageTracker};
 use crate::opened::{self, Coverage, FileId, Guards};
@@ -68,6 +69,13 @@ pub struct ExplainContext<'a> {
     pub tracker: &'a UsageTracker,
     /// The free-space floor a sweep applies to a tier before moving onto it.
     pub min_free: u64,
+    /// The catalog to consult for "where does this object live", when one exists.
+    ///
+    /// `None` is the honest default: with no catalog the filesystem is the only source of
+    /// truth, exactly where a sweep reads, and the report says so rather than inventing an
+    /// answer. `main` sets this only for a file that already exists — `explain` must never
+    /// conjure an empty catalog beside a healthy tree.
+    pub catalog: Option<PathBuf>,
 }
 
 /// What the engine concluded about one path.
@@ -746,6 +754,11 @@ pub struct CatalogReport {
     pub source: &'static str,
     pub note: String,
     pub disagreements: Vec<String>,
+    /// `lifecycle.accesses`, when the catalog answered. The access counter the mover's
+    /// observed-access pin is really about; `None` when there is no catalog.
+    pub accesses: Option<u64>,
+    /// `lifecycle.pinned_until` (unix seconds), when the catalog answered.
+    pub pinned_until: Option<u64>,
 }
 
 impl CatalogReport {
@@ -754,9 +767,11 @@ impl CatalogReport {
             consulted: false,
             source: "filesystem",
             note: "no catalog is configured, so these answers come from the filesystem — the \
-                   same place a sweep reads. Issue #16 adds the catalog."
+                   same place a sweep reads."
                 .to_string(),
             disagreements: Vec::new(),
+            accesses: None,
+            pinned_until: None,
         }
     }
 
@@ -774,10 +789,17 @@ impl CatalogReport {
             disagreements.push(json_string(item));
         }
         format!(
-            "{{\"consulted\":{},\"source\":{},\"note\":{},\"disagreements\":[{}]}}",
+            "{{\"consulted\":{},\"source\":{},\"note\":{},\"accesses\":{},\"pinned_until\":{},\
+             \"disagreements\":[{}]}}",
             self.consulted,
             json_string(self.source),
             json_string(&self.note),
+            self.accesses
+                .map(|accesses| accesses.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.pinned_until
+                .map(|until| until.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             disagreements.join(",")
         )
     }
@@ -798,41 +820,62 @@ pub struct CatalogAnswer {
     pub storage_key: Option<PathBuf>,
     /// Which lifecycle rule last decided a transition, if any.
     pub rule: Option<String>,
+    /// `lifecycle.accesses`: the observed counter since ingest.
+    pub accesses: u64,
+    /// `lifecycle.pinned_until` (unix seconds): a pin wins over the idle rule.
+    pub pinned_until: Option<u64>,
 }
 
-/// The single seam where the catalog (issue #16) will answer "where does this object live
+/// The single seam where the catalog (issue #16) answers "where does this object live
 /// and when was it last accessed".
 ///
-/// Today it returns `None`, so `explain` falls back to the filesystem — the same source the
-/// mover acts on, which is what keeps the explanation honest. When the catalog exists, this
-/// function will return its answer and the two must be compared: on disagreement, `explain`
-/// reports the disagreement (see [`CatalogReport::disagreements`]) rather than resolving it
-/// silently, because a silent resolution is how a UI ends up trusting a number nothing on
-/// disk agrees with.
+/// When a catalog file exists it is consulted, and its answer is compared with the
+/// filesystem: on disagreement `explain` reports the disagreement (see
+/// [`CatalogReport::disagreements`]) rather than resolving it silently, because a silent
+/// resolution is how a UI ends up trusting a number nothing on disk agrees with. When no
+/// catalog exists this returns `None` and the filesystem is the only source — the same
+/// source the mover acts on, which is what keeps the explanation honest.
 ///
-/// What the catalog must provide, for this command to prefer it, is one query:
+/// What the catalog provides, and this returns:
 ///
-/// * **existence** — `name(path) -> object_id`. The catalog, not the filesystem, is the
-///   source of truth for "does this object exist" (§3), which matters the moment a tier is
-///   offline.
+/// * **existence** — `name(path) -> object_id`: `None` when the path is not named.
 /// * **managed state** — `object.state` (`present` / `offloaded` / `restoring`).
 /// * **location** — the primary `location` row: `{ tier, storage_key }`.
-/// * **last access** — `lifecycle.last_access` (unix seconds) plus how it was observed
-///   (provider-observed or atime), replacing [`disk_management::last_use`]'s stamp.
-/// * **access count** — `lifecycle.accesses`, which is what an observed-access pin is
-///   really about.
-/// * **pin** — `lifecycle.pinned_until`, which wins over the idle rule.
-/// * **rule** — `lifecycle.rule`, the rule that last fired, for the verdict sentence.
-///
-/// None of the catalog's schema is guessed at here: this struct names the fields the
-/// command needs and nothing more.
-fn catalog_answer(_path: &Path) -> Option<CatalogAnswer> {
-    None
+/// * **last access** — `lifecycle.last_access` (unix seconds).
+/// * **access count** — `lifecycle.accesses`.
+/// * **pin** — `lifecycle.pinned_until`.
+/// * **rule** — `lifecycle.rule`, the rule that last fired.
+fn catalog_answer(context: &ExplainContext<'_>) -> Option<CatalogAnswer> {
+    let catalog_path = context.catalog.as_deref()?;
+    // Names are stored relative to the watch root — the same key `catalog sync` ingested.
+    // A path outside the tree has no namespace key and therefore no catalog answer.
+    let relative = context.path.strip_prefix(context.watch).ok()?;
+    // Never create a catalog at query time: an empty one would answer "not in the
+    // catalog" for a tree that is fine. `main` only sets `Some` for a file that already
+    // exists; this is belt-and-braces against a library caller.
+    if !catalog_path.is_file() {
+        return None;
+    }
+    let catalog = Catalog::open(catalog_path).ok()?;
+    let record = catalog
+        .record_for_path(&relative.to_string_lossy())
+        .ok()??;
+    let primary = record.primary();
+    Some(CatalogAnswer {
+        last_access: record.last_access.unwrap_or(0).max(0) as u64,
+        state: record.state.clone(),
+        tier: primary.map(|location| location.tier.clone()),
+        storage_key: primary.map(|location| PathBuf::from(&location.storage_key)),
+        rule: record.rule.clone(),
+        accesses: record.accesses.unwrap_or(0),
+        pinned_until: record.pinned_until.map(|until| until.max(0) as u64),
+    })
 }
 
-/// Explain one path, reading the filesystem.
+/// Explain one path, consulting the catalog when one is configured.
 pub fn explain(context: &ExplainContext<'_>) -> Explanation {
-    explain_with(context, catalog_answer(context.path).as_ref())
+    let answer = catalog_answer(context);
+    explain_with(context, answer.as_ref())
 }
 
 /// Explain one path, with an explicit catalog answer injected. The public entry point is
@@ -1155,15 +1198,22 @@ fn catalog_report(
         consulted: true,
         source: "catalog",
         note: format!(
-            "catalog state {:?}{}",
+            "catalog state {:?}, {} observed access(es){}; {}",
             answer.state,
+            answer.accesses,
+            answer
+                .pinned_until
+                .map(|until| format!(", pinned until {until}"))
+                .unwrap_or_default(),
             answer
                 .rule
                 .as_ref()
-                .map(|rule| format!(", last rule {rule:?}"))
-                .unwrap_or_default()
+                .map(|rule| format!("last rule {rule:?}"))
+                .unwrap_or_else(|| "no rule recorded".to_string())
         ),
         disagreements,
+        accesses: Some(answer.accesses),
+        pinned_until: answer.pinned_until,
     }
 }
 
@@ -1288,6 +1338,7 @@ mod tests {
             guards,
             tracker,
             min_free: 0,
+            catalog: None,
         }
     }
 
@@ -1736,6 +1787,8 @@ mod tests {
             tier: None,
             storage_key: None,
             rule: Some("intelligent-tiering".to_string()),
+            accesses: 3,
+            pinned_until: None,
         };
         let explanation = explain_with(
             &context(&path, &watch, &dests, &scope, &policy, &guards, &tracker),

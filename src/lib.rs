@@ -9,6 +9,7 @@ pub mod disk_management;
 pub mod explain;
 pub mod file_movement;
 pub mod journal;
+pub mod locate;
 pub mod opened;
 pub mod replication;
 pub mod restore;
@@ -19,7 +20,8 @@ pub use audit::{
     RepairOutcome, SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
-    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, SyncReport, CATALOG_NAME,
+    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, ObjectRecord, SyncReport,
+    CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{
@@ -34,6 +36,7 @@ pub use file_movement::{
     log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
     MigrationRecord, MigrationReport, Policy, ReplicationDetail, SkipReason, UsageTracker,
 };
+pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
 pub use replication::{replicate, ReplicaPlacement, ReplicaStatus, ReplicationOutcome};
 pub use restore::{RestoreError, RestoreOutcome, RestoreRequest};

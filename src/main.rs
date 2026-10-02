@@ -21,6 +21,7 @@ use just_cache::disk_management::{self, FileEntry};
 use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::journal::{self, Journal};
+use just_cache::locate::{self, LocateRequest};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
@@ -67,6 +68,9 @@ enum Command {
     Catalog(CatalogArgs),
     /// Explain why one path is where it is, and what a sweep would do with it next.
     Explain(ExplainArgs),
+    /// Where an object lives — every copy, its tier, and which one is the tier of record —
+    /// by namespace path or by content digest.
+    Locate(LocateArgs),
     /// Bring an offloaded file back to the hot path, verified.
     Restore(RestoreArgs),
 }
@@ -298,6 +302,13 @@ struct ExplainArgs {
     /// Print a machine-readable JSON document instead of the four-line summary.
     #[arg(long)]
     json: bool,
+
+    /// The catalog file to consult for "where does this object live". Defaults to
+    /// `.just_cache-catalog.sqlite` beside the watch root, and is consulted only when that
+    /// file already exists — `explain` never creates a catalog. When none exists the
+    /// filesystem is the only source, exactly as before.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
 }
 
 impl ExplainArgs {
@@ -315,6 +326,26 @@ impl ExplainArgs {
     fn min_free_bytes(&self) -> u64 {
         (self.min_free_gb.max(0.0) * 1_073_741_824.0) as u64
     }
+}
+
+/// Where an object lives, by namespace path or by content digest.
+#[derive(Debug, Args)]
+struct LocateArgs {
+    /// A namespace path (relative to the watched tree, the same string `catalog sync`
+    /// ingested), or a full or prefixed BLAKE3 hex id. A query of at least eight hex
+    /// characters is read as a digest prefix; anything else is read as a path.
+    #[arg(value_name = "QUERY")]
+    query: String,
+
+    /// The catalog file to read. It must already exist: `locate` never creates one, since
+    /// a catalog conjured empty at query time would answer "nothing found" for a tree
+    /// that is fine.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+
+    /// Print a machine-readable JSON document instead of the summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +383,7 @@ fn main() -> ExitCode {
 
         Some(Command::Catalog(args)) => run_catalog(args),
         Some(Command::Explain(args)) => run_explain(args),
+        Some(Command::Locate(args)) => run_locate(args),
         Some(Command::Restore(args)) => run_restore(args),
         None => run_sweep(cli.sweep),
     }
@@ -652,6 +684,26 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
     }
 
     let policy = args.policy();
+    // Which catalog to consult, if any. An explicit `--catalog` must exist: naming a file
+    // that is not there is a bad invocation, not a quiet fallback. The default beside the
+    // watch root is consulted only when it is already present — a plain sweep must never
+    // create a catalog (invariant 9), and neither must `explain`.
+    let catalog_path = match &args.catalog {
+        Some(path) => {
+            if !path.is_file() {
+                eprintln!(
+                    "just_cache: --catalog {} does not exist; run `catalog sync` first",
+                    path.display()
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+            Some(path.clone())
+        }
+        None => {
+            let default = catalog::Catalog::default_path(&args.watch);
+            default.is_file().then_some(default)
+        }
+    };
     // The snapshot names the processes holding the file open; unlike a sweep, nothing is
     // taken live after it, so a descriptor opened during this command cannot be caught —
     // which is the honest limit of a one-shot answer, and the guard report says so.
@@ -674,6 +726,7 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         guards: &guards,
         tracker: &tracker,
         min_free: args.min_free_bytes(),
+        catalog: catalog_path,
     };
     let explanation = explain::explain(&context);
 
@@ -685,6 +738,36 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         }
     }
     ExitCode::from(explanation.exit_code())
+}
+
+/// Where an object lives. The catalog is the source of truth (§3), so this asks it and
+/// never walks a tree — which is what keeps the answer available when a tier is unmounted.
+/// Exit codes are the contract: `0` found, `1` nothing found, `2` a bad invocation or an
+/// unusable catalog.
+fn run_locate(args: LocateArgs) -> ExitCode {
+    let request = LocateRequest {
+        query: &args.query,
+        catalog: &args.catalog,
+    };
+    let report = match locate::locate(&request) {
+        Ok(report) => report,
+        // A missing file or a catalog that cannot be read is a bad invocation, not
+        // "nothing found": exit 1 is reserved for a query that genuinely matched nothing,
+        // so a script cannot mistake a broken catalog for an empty one.
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    if args.json {
+        println!("{}", report.to_json());
+    } else {
+        for line in report.summary_lines() {
+            println!("{line}");
+        }
+    }
+    ExitCode::from(report.exit_code())
 }
 
 fn run_restore(args: RestoreArgs) -> ExitCode {

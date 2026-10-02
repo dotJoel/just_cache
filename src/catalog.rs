@@ -246,6 +246,44 @@ pub struct LocationRecord {
     pub object: String,
 }
 
+/// One object as `locate` and `explain` need to see it: identity, size, lifecycle, every
+/// copy, and every name that answers to it.
+///
+/// Names and locations both come along because a content digest is not a path: identical
+/// bytes can sit at two names, and one object can have a hot copy and a cold one at once.
+/// Reporting only the first would answer a question nobody asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRecord {
+    /// The object id, hex-encoded. This is the identity, not a path.
+    pub id: String,
+    pub size: u64,
+    /// `present` | `offloaded` | `restoring`.
+    pub state: String,
+    /// Unix seconds of the last observed access, from `lifecycle`.
+    pub last_access: Option<i64>,
+    /// The observed-access counter, from `lifecycle`.
+    pub accesses: Option<u64>,
+    /// Unix seconds until which a pin wins over the idle rule, from `lifecycle`.
+    pub pinned_until: Option<i64>,
+    /// The lifecycle rule that decided the last transition, if any.
+    pub rule: Option<String>,
+    /// Every namespace path that names this object, in path order.
+    pub names: Vec<String>,
+    /// Every copy, primary first.
+    pub locations: Vec<LocationRecord>,
+}
+
+impl ObjectRecord {
+    /// The tier of record: the primary location, or the first copy when no row is marked
+    /// primary (a catalog written by hand, or one whose primary was cleared).
+    pub fn primary(&self) -> Option<&LocationRecord> {
+        self.locations
+            .iter()
+            .find(|location| location.is_primary)
+            .or_else(|| self.locations.first())
+    }
+}
+
 /// The result of one sync.
 #[derive(Debug)]
 pub struct SyncReport {
@@ -944,6 +982,119 @@ impl Catalog {
             .map(|found| found.map(|id| hex(&id)))
             .map_err(Into::into)
     }
+
+    /// One object, by the namespace path it answers to. `None` when the path is not
+    /// named — which is an answer: the catalog, not the filesystem, is the source of
+    /// truth for "does this object exist" (§3).
+    pub fn record_for_path(&self, path: &str) -> Result<Option<ObjectRecord>, CatalogError> {
+        let Some(id) = self.object_for_path(path)? else {
+            return Ok(None);
+        };
+        self.record_for_object(&id)
+    }
+
+    /// Every object whose hex id starts with `prefix`, in id order.
+    ///
+    /// A prefix is not a guess: several matches are several objects and every one is
+    /// returned as its own record. Nothing here decides which match was meant.
+    pub fn records_with_prefix(&self, prefix: &str) -> Result<Vec<ObjectRecord>, CatalogError> {
+        // The prefix is validated hex by the caller, so it cannot smuggle a LIKE wildcard
+        // in and turn a digest query into "everything".
+        let mut stmt = self
+            .conn
+            .prepare("SELECT lower(hex(id)) FROM object WHERE lower(hex(id)) LIKE ?1 || '%' ORDER BY lower(hex(id))")?;
+        let rows = stmt.query_map(params![prefix.to_ascii_lowercase()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        let mut records = Vec::new();
+        for id in ids {
+            if let Some(record) = self.record_for_object(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// One object by its hex id, with its names, every copy, and its lifecycle row.
+    pub fn record_for_object(&self, id: &str) -> Result<Option<ObjectRecord>, CatalogError> {
+        let id = id.to_ascii_lowercase();
+        let base = self
+            .conn
+            .query_row(
+                "SELECT size, state FROM object WHERE lower(hex(id)) = ?1",
+                params![id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((size, state)) = base else {
+            return Ok(None);
+        };
+
+        // A lifecycle row is written at ingest, but a catalog hand-edited or written by an
+        // older schema might lack one; absence is reported, not guessed.
+        let (last_access, accesses, pinned_until, rule) = self
+            .conn
+            .query_row(
+                "SELECT last_access, accesses, pinned_until, rule FROM lifecycle
+                  WHERE lower(hex(object_id)) = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or((None, None, None, None));
+
+        let mut locations = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT tier, storage_key, is_primary, verified, checksum, lower(hex(object_id))
+             FROM location
+              WHERE lower(hex(object_id)) = ?1 ORDER BY is_primary DESC, tier, storage_key",
+        )?;
+        let rows = stmt.query_map(params![id], |row| {
+            Ok(LocationRecord {
+                tier: row.get::<_, String>(0)?,
+                storage_key: row.get::<_, String>(1)?,
+                is_primary: row.get::<_, i64>(2)? != 0,
+                verified: row.get::<_, i64>(3)? != 0,
+                checksum: row.get::<_, Option<Vec<u8>>>(4)?.map(|bytes| hex(&bytes)),
+                object: row.get::<_, String>(5)?,
+            })
+        })?;
+        for row in rows {
+            locations.push(row?);
+        }
+
+        let mut names = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM name WHERE lower(hex(object_id)) = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            names.push(row?);
+        }
+
+        Ok(Some(ObjectRecord {
+            id,
+            size: size.max(0) as u64,
+            state,
+            last_access,
+            accesses: accesses.map(|value| value.max(0) as u64),
+            pinned_until,
+            rule,
+            names,
+            locations,
+        }))
+    }
 }
 
 /// Walk the watched tree and the cold tiers and put down every fact they show.
@@ -1394,5 +1545,47 @@ mod tests {
             "a pre-existing row is unknown until a sync hashes it"
         );
         assert_eq!(locations[0].checksum, None);
+    }
+
+    /// A digest prefix that matches more than one object returns all of them — a prefix is
+    /// not a promise that the answer is unique, and guessing would be the one wrong move.
+    /// Two synthetic objects are written directly because forcing a real 8-hex collision
+    /// between BLAKE3 hashes needs an impossible amount of data.
+    #[test]
+    fn a_digest_prefix_returns_every_object_it_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = catalog_in(tmp.path());
+        let now = now_seconds();
+        for suffix in ["aa", "bb"] {
+            let mut id = vec![0u8; 32];
+            id[0] = 0x42;
+            id[1] = 0x17;
+            id[2] = u8::from_str_radix(suffix, 16).unwrap();
+            catalog
+                .conn
+                .execute(
+                    "INSERT INTO object (id, size, checksum, created_at, state)
+                     VALUES (?1, 1, ?1, ?2, 'present')",
+                    params![id, now],
+                )
+                .unwrap();
+            catalog
+                .conn
+                .execute(
+                    "INSERT INTO lifecycle (object_id, last_access, accesses, pinned_until, rule)
+                     VALUES (?1, ?2, 0, NULL, NULL)",
+                    params![id, now],
+                )
+                .unwrap();
+        }
+
+        // Six hex digits is not yet a digest query by the CLI's rule, so the method is
+        // exercised directly with a prefix both objects share.
+        let hits = catalog.records_with_prefix("4217").unwrap();
+        assert_eq!(hits.len(), 2, "both objects must be listed");
+        assert!(hits[0].id.starts_with("4217"));
+        assert!(hits[1].id.starts_with("4217"));
+        // A prefix that matches nothing is an empty list, not an error.
+        assert!(catalog.records_with_prefix("deadbeef").unwrap().is_empty());
     }
 }
