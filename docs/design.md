@@ -338,7 +338,9 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   the journal and startup recovery; CI running the EXDEV path. P0 is closed.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
-  within a tier; scrubbing.
+  within a tier; scrubbing. *(The filesystem half of `explain` has shipped in the symlink
+  provider: it reports the mover's own decision and carries the seam the catalog slots
+  into; the catalog-backed `explain`/`locate`/`restore` land with the catalog itself.)*
 - **P2 — FUSE namespace provider**: observe accesses properly; streaming recall;
   pins/restore semantics; gateway (S3/WebDAV) provider; cache overlays (§2.1) — a RAM
   promotion target first, since the same construct later fronts the HDD pool with SSD.
@@ -357,7 +359,43 @@ Closed in P0: metadata/sparseness loss on cross-device copies; size-only adoptio
 the open-file/hardlink gap; the crash window between source removal and symlink
 creation; and CI's failure to exercise the EXDEV path.
 
+Closed in P1 by `just_cache catalog sync` (#16): the catalog is now *written*, so "where
+does this file live" is finally a question the filesystem is not the only answer to. It is
+content-addressed (id = BLAKE3 of the bytes, computed at ingest, so a rename keeps its
+identity and a scrub can compare any copy to any other); a location is a `(tier,
+storage_key)` pair where a tier is a real root — the watch root or a `--dest` root — and
+never a cache overlay (§2.1); and idle files move through the lifecycle states
+`present` -> `offloaded` -> `restoring`. Ingest is one SQLite transaction, committed at the
+end, so an interrupted sync leaves the catalog exactly as it was rather than half-applied
+(the same guarantee `journal.rs` gives a move). A tree the mover has already been running
+against is ingested by the first sync — migrations that predate the catalog are found by
+the same walk, which is why the migration story is "ingest, not migrate". A location is
+only removed when another location still holds the object (a normal offload, where the
+stale hot row is replaced by the cold one) or when no name references the object: a name
+is never stranded pointing at an object with nowhere to live.
+
 Still open, and honestly so:
+
+- **A tree edited by hand is reported, not reconciled.** A name the catalog recorded that
+  is gone or now hashes differently, and a location whose file vanished or was replaced,
+  are reported — `sync` exits non-zero — and their rows are left exactly as they were; new
+  names and locations that nothing contradicts are still ingested. What is missing is a
+  resolution step: deciding a vanished name was a rename might be a human command, but it
+  does not exist yet, so a difference repeats on every sync. That is deliberately louder
+  than auto-healing in the wrong direction, and it is the honest state of #16.
+- **Only the symlink provider's flat mirrored layout is understood.** Two-disk replication
+  within a tier, remote/object tiers, and offline volumes are later work; the `volume`
+  table ships empty.
+- **`lifecycle` is ingested, not maintained.** `last_access` is filled at first ingest
+  from atime; nothing updates it yet because proper access observation is the namespace
+  provider's job (§4, P2). A `restoring` state is recorded when both a hot and a cold copy
+  exist, but no command drives a restore to completion; `audit` remains the tool that
+  tells a restore-in-progress from a true duplicate.
+- **Every file is hashed on every sync.** Correct, because identity is the hash, but not
+  cheap; there is no digest cache keyed on size and mtime yet.
+- **One unreadable file aborts the sync** rather than being skipped: a catalog built by
+  silently ignoring a file would be a catalog that disagrees with the tree. The mover's
+  rule that one failure never stops a sweep has no catalog equivalent yet.
 
 - **Journal records carry a size, not a digest.** Recovery refuses to link a name to a
   copy whose size does not match what the move promised, which is the strongest check
@@ -367,6 +405,22 @@ Still open, and honestly so:
 - **No read-back verification of freshly copied bytes.** A torn copy is caught by the
   short-copy and source-changed guards, not by re-reading what was written: hashing a
   sparse file means materializing its holes, and re-reading a 40 GB copy doubles I/O.
+- **Restore has no catalog digest to check a cold copy against.** `restore` reads its own
+  write back and hashes it before the atomic swap, so a torn copy cannot reach the path,
+  but with no recorded digest there is nothing independent to compare a *pre-existing*
+  cold copy to: a copy that was already corrupt would be restored faithfully. The catalog
+  (issue #16) is what closes this; until then `restore` also refuses to overwrite a hot
+  regular file whose content differs from the cold copy (checked by digest, not size), so
+  the one thing it can compare is never ignored.
+- **`locate` is not built.** Finding an object by path or digest across tiers is a catalog
+  question (§3), and it is issue #16's to answer; `restore` finds a copy by filesystem
+  state alone (the symlink, or the mirrored relative path under each `--dest`) and refuses
+  when the candidates disagree rather than guessing a schema the catalog has not defined.
+- **A default restore leaves a `duplicate` for `audit`.** Because the cold copy stays
+  unless `--remove-copy` is given, the tree ends with a regular file *and* its cold copy —
+  the exact state `audit` calls `duplicate`. That is the requested behavior (the copy stays
+  by default), but a user restoring many files without `--remove-copy` should expect the
+  duplicates, not be surprised by them.
 - **The journal is one file per watched root**, not part of the catalog. Two sweeps of
   different trees cannot see each other's in-flight moves, which is correct today and
   a thing to revisit when the catalog exists.
@@ -376,6 +430,26 @@ Still open, and honestly so:
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
 - Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
+- **`explain` never moved files and reads the filesystem, not the catalog.** The command
+  is the first half of the P1 item: it evaluates scope, guards and policy in the mover's
+  order and reports the outermost reason, but its "where does this live / when was it last
+  accessed" answers come from the filesystem. `src/explain.rs` carries a single commented
+  seam (`catalog_answer`) that returns `None` until the catalog exists; it names the one
+  query the catalog must provide (existence, `state`, primary `location`, `last_access`
+  and its provenance, `accesses`, `pinned_until`, `rule`). A disagreement between the two
+  sources is reported, not resolved silently — the branch exists and is tested through an
+  injected answer, but no catalog is read yet, because its schema belongs to the catalog
+  issue and guessing it would collide with the build happening in parallel.
+- **`explain` answers for one path, so it cannot account for the per-sweep `--limit`.**
+  A file can be in scope, unguarded and cold and still miss its slot to older files in a
+  real sweep over the tree. The command says what the policy decides for the path, not
+  what one particular sweep's ordering decided; naming the difference is preferable to a
+  "would move now" that a tree-level tie-break could overrule.
+- **The atime→mtime fallback cannot be reached on a normal Linux mount.** `stat` reports
+  an access time even under `noatime` (it is simply not updated), so the fallback branch
+  is exercised at its decision point in a unit test rather than end to end. What `explain`
+  *can* surface on such a mount is the symptom: when atime equals mtime it says so, since
+  the stamp may then be the last write rather than the last read.
 
 ## 10. Non-goals
 

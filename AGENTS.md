@@ -65,8 +65,10 @@ worth reading before editing the code around them.
    exits nonzero if any occurred.
 8. **The journal and `.just_cache-partial-*` files are never move candidates.** The walk skips
    that prefix; anything else written into the watched tree needs the same treatment.
-9. **Nothing is created in the watched tree without being asked for.** The journal is the only
-   file the tool leaves there, and it is empty after a clean pass.
+9. **Nothing is created in the watched tree without being asked for.** The journal and the
+   catalog are the only files the tool leaves there, both under the `.just_cache` prefix
+   the walk skips, and both empty-or-idle after a clean pass. The catalog is only created
+   when `catalog sync` is run (or `--catalog` names it elsewhere), never by a sweep.
 
 ## Conventions
 
@@ -98,6 +100,7 @@ worth reading before editing the code around them.
 | `src/scope.rs` | Eligibility: include/exclude globs, size window, size parsing. |
 | `src/opened.rs` | Live state: open descriptors (one `/proc` snapshot per sweep) and hard links. |
 | `src/journal.rs` | The intent record and recovery from an interrupted move. |
+| `src/catalog.rs` | The SQLite catalog: content-addressed locations, names, and the transactional `sync`. |
 | `src/audit.rs` | Classifying tree vs tiers, and the guarded `--repair`. |
 | `src/digest.rs` | BLAKE3, streamed. One digest for the whole tool. |
 | `tests/` | Integration tests against real temporary trees; `tests/support/` for the shared second-filesystem helpers. |

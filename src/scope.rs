@@ -42,6 +42,88 @@ pub enum Rejected {
     },
 }
 
+/// Why a path is out of scope, naming the rule that decided — not just "out".
+///
+/// [`Rejected`] is enough for a sweep: it only needs to know *that* a file is not its to
+/// move. `explain` needs the reason, because "outside the configured scope" is
+/// indistinguishable from a bug until it names the `--exclude` glob or the size bound
+/// that fired (`docs/design.md` §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeRefusal {
+    /// No `--include` pattern covered the path. The whole set is named, because a single
+    /// missing pattern is the absence of a match, not a match on something.
+    NotIncluded {
+        patterns: Vec<String>,
+    },
+    /// An `--exclude` pattern matched the path or one of its ancestors.
+    Excluded {
+        pattern: String,
+    },
+    TooSmall {
+        size: u64,
+        min: u64,
+    },
+    TooLarge {
+        size: u64,
+        max: u64,
+    },
+    /// A zero-length file: inside the window, but there is nothing to reclaim. The mover
+    /// raises this immediately after scope, before the guards, so `explain` keeps it in the
+    /// same stage rather than inventing a new one.
+    Empty,
+}
+
+impl ScopeRefusal {
+    /// Short machine-stable name, for JSON and tests.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ScopeRefusal::NotIncluded { .. } => "not-included",
+            ScopeRefusal::Excluded { .. } => "excluded",
+            ScopeRefusal::TooSmall { .. } => "too-small",
+            ScopeRefusal::TooLarge { .. } => "too-large",
+            ScopeRefusal::Empty => "empty",
+        }
+    }
+
+    /// One sentence a human can act on.
+    pub fn describe(&self) -> String {
+        match self {
+            ScopeRefusal::NotIncluded { patterns } => {
+                format!("not under any --include pattern ({})", patterns.join(", "))
+            }
+            ScopeRefusal::Excluded { pattern } => {
+                format!("excluded by --exclude '{pattern}'")
+            }
+            ScopeRefusal::TooSmall { size, min } => format!(
+                "below the {} size floor ({})",
+                human_bytes(*min),
+                human_bytes(*size)
+            ),
+            ScopeRefusal::TooLarge { size, max } => format!(
+                "above the {} size ceiling ({})",
+                human_bytes(*max),
+                human_bytes(*size)
+            ),
+            ScopeRefusal::Empty => "empty file (0 B), nothing to reclaim".to_string(),
+        }
+    }
+}
+
+impl From<ScopeRefusal> for Rejected {
+    fn from(refusal: ScopeRefusal) -> Self {
+        match refusal {
+            ScopeRefusal::NotIncluded { .. } | ScopeRefusal::Excluded { .. } => Self::OutOfScope,
+            ScopeRefusal::TooSmall { size, min } => Self::TooSmall { size, min },
+            ScopeRefusal::TooLarge { size, max } => Self::TooLarge { size, max },
+            // `Scope::refusal` never produces `Empty` (the mover raises it separately,
+            // after scope), so this arm is unreachable through `allows`. It exists only
+            // because the enum is shared; a sweep that somehow saw it would still leave
+            // the file alone, which is the safe direction.
+            ScopeRefusal::Empty => Self::TooSmall { size: 0, min: 0 },
+        }
+    }
+}
+
 /// The set of paths the engine may act on, plus the size window it will bother with.
 ///
 /// Patterns are matched against a file's path *relative to the watched root*, and against
@@ -52,7 +134,14 @@ pub enum Rejected {
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
     include: Option<GlobSet>,
+    /// The configured `--include` patterns, kept for the refusal message.
+    include_patterns: Vec<String>,
+    /// Original pattern behind each glob in `include`, in glob index order. One pattern
+    /// expands to several globs (the bare-name variants), so the index cannot be used
+    /// directly against the configured list.
+    include_sources: Vec<String>,
     exclude: GlobSet,
+    exclude_sources: Vec<String>,
     min_size: u64,
     max_size: Option<u64>,
 }
@@ -69,13 +158,19 @@ impl Scope {
         min_size: u64,
         max_size: Option<u64>,
     ) -> Result<Self, ScopeError> {
+        let (include_set, include_sources) = if include.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (set, sources) = build_set(include)?;
+            (Some(set), sources)
+        };
+        let (exclude_set, exclude_sources) = build_set(exclude)?;
         Ok(Self {
-            include: if include.is_empty() {
-                None
-            } else {
-                Some(build_set(include)?)
-            },
-            exclude: build_set(exclude)?,
+            include: include_set,
+            include_patterns: include.to_vec(),
+            include_sources,
+            exclude: exclude_set,
+            exclude_sources,
             min_size,
             max_size,
         })
@@ -86,33 +181,68 @@ impl Scope {
         matches!(self.max_size, Some(max) if self.min_size > max)
     }
 
-    /// May the engine touch this entry? `Err` carries the reason it may not.
-    pub fn allows(&self, entry: &FileEntry) -> Result<(), Rejected> {
+    /// The first refusal that applies to `entry`, or `None` when the engine may touch it.
+    ///
+    /// The order is the module's whole point: include, then exclude, then the size floor,
+    /// then the ceiling. A path that is both un-included and too small is reported as
+    /// un-included, because that is the gate the mover reaches first.
+    pub fn refusal(&self, entry: &FileEntry) -> Option<ScopeRefusal> {
         let relative = entry.relative.as_path();
 
         if let Some(include) = &self.include {
-            if !matches_path_or_ancestor(include, relative) {
-                return Err(Rejected::OutOfScope);
+            if matching_index(include, relative).is_none() {
+                return Some(ScopeRefusal::NotIncluded {
+                    patterns: self.include_patterns.clone(),
+                });
             }
         }
-        if matches_path_or_ancestor(&self.exclude, relative) {
-            return Err(Rejected::OutOfScope);
+        if let Some(index) = matching_index(&self.exclude, relative) {
+            return Some(ScopeRefusal::Excluded {
+                pattern: self
+                    .exclude_sources
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.exclude_sources.last().cloned().unwrap_or_default()),
+            });
         }
         if entry.size < self.min_size {
-            return Err(Rejected::TooSmall {
+            return Some(ScopeRefusal::TooSmall {
                 size: entry.size,
                 min: self.min_size,
             });
         }
         if let Some(max) = self.max_size {
             if entry.size > max {
-                return Err(Rejected::TooLarge {
+                return Some(ScopeRefusal::TooLarge {
                     size: entry.size,
                     max,
                 });
             }
         }
-        Ok(())
+        None
+    }
+
+    /// May the engine touch this entry? `Err` carries the reason it may not.
+    ///
+    /// Thin wrapper over [`Scope::refusal`] so the sweep and `explain` can never disagree
+    /// about order: there is one implementation of the gate, in one direction.
+    pub fn allows(&self, entry: &FileEntry) -> Result<(), Rejected> {
+        match self.refusal(entry) {
+            Some(refusal) => Err(refusal.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The configured `--include` pattern that let this entry through, if any. Used by
+    /// `explain` to name why a path *is* in scope, not only why it is not.
+    pub fn matched_include(&self, entry: &FileEntry) -> Option<String> {
+        let include = self.include.as_ref()?;
+        let index = matching_index(include, entry.relative.as_path())?;
+        self.include_sources.get(index).cloned()
+    }
+
+    pub fn include_patterns(&self) -> &[String] {
+        &self.include_patterns
     }
 
     pub fn min_size(&self) -> u64 {
@@ -124,8 +254,10 @@ impl Scope {
     }
 }
 
-fn build_set(patterns: &[String]) -> Result<GlobSet, ScopeError> {
+/// Build a set and remember which configured pattern each glob came from.
+fn build_set(patterns: &[String]) -> Result<(GlobSet, Vec<String>), ScopeError> {
     let mut builder = GlobSetBuilder::new();
+    let mut sources = Vec::new();
     for pattern in patterns {
         let mut variants = vec![pattern.clone()];
         // A bare name is meant "anywhere": expand it so `--exclude node_modules` and
@@ -140,26 +272,31 @@ fn build_set(patterns: &[String]) -> Result<GlobSet, ScopeError> {
                 source,
             })?;
             builder.add(glob);
+            sources.push(pattern.clone());
         }
     }
-    builder.build().map_err(|source| ScopeError::BadGlob {
-        pattern: patterns.join(", "),
-        source,
-    })
+    builder
+        .build()
+        .map(|set| (set, sources))
+        .map_err(|source| ScopeError::BadGlob {
+            pattern: patterns.join(", "),
+            source,
+        })
 }
 
-/// Match the path itself or any ancestor directory of it.
+/// Index of the first glob that matches the path or any ancestor directory of it.
 ///
 /// Ancestors matter for both directions: including a directory has to include what is
-/// inside it, and excluding a directory has to exclude its contents.
-fn matches_path_or_ancestor(set: &GlobSet, relative: &Path) -> bool {
+/// inside it, and excluding a directory has to exclude its contents. The index is what
+/// lets `explain` name the pattern rather than guess at it.
+fn matching_index(set: &GlobSet, relative: &Path) -> Option<usize> {
     if set.is_empty() {
-        return false;
+        return None;
     }
     relative
         .ancestors()
         .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .any(|ancestor| set.is_match(ancestor))
+        .find_map(|ancestor| set.matches(ancestor).into_iter().next())
 }
 
 /// Parse a size like `512`, `64KiB`, `1.5G`, `2TiB`.

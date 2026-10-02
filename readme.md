@@ -17,9 +17,14 @@ just_cache \
 ```
 
 That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
-entries keep working); `just_cache sweep ...` is the explicit form, and
+entries keep working); `just_cache sweep ...` is the explicit form,
 [`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
-still agree.
+<<<<<<< HEAD
+still agree, and [`just_cache explain ...`](#explaining-one-path) answers why one path is
+where it is.
+still agree, and [`just_cache restore ...`](#restoring-a-file) brings an offloaded file
+back.
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 
 ## Why
 
@@ -217,6 +222,55 @@ excludes.
 `/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
 episode.
 
+## Explaining one path
+
+A sweep reports in aggregate, and `-v` buries each reason among every other file. When
+the question is "why is *this* file still here?", `explain` answers it for one path, in
+the order the mover evaluates — and it is read-only:
+
+```sh
+just_cache explain /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --min-idle-days 30
+```
+
+```
+explain: /mnt/cache/media/shows/s1/ep1.mkv
+  scope:   managed: no --include set, so every path under the watched tree is fair game; 1.2 GiB is within the [0 B, unlimited) size window
+  guards:  clear: not open by another process; 1 link(s), hardlinks refused; size unchanged since this scan
+  policy:  last use 1735689600 (2025-01-01T00:00:00Z) via atime; idle 154.0 d against --min-idle-days 30.0; not a symlink; 0 witnessed access(es) in this run (pin 1)
+  verdict: would move now -> /mnt/disk-slow/media/shows/s1/ep1.mkv (tier 0)
+```
+
+The four sections are the mover's own gates, in its own order, and the **outermost**
+decisive reason wins: a file that is both out of scope and too warm answers with the
+`--exclude` that excluded it and marks the later stages `not evaluated`, because that is
+the gate a sweep never reaches.
+
+- **scope** names the rule — `excluded by --exclude 'node_modules'`, `below the 1.0 MiB
+  size floor (5 B)`, `not under any --include pattern (...)`.
+- **guards** reports the pid holding a file open (when the `/proc` scan could see it), the
+  link count, and whether the size moved since the scan.
+- **policy** prints the last-use stamp and its *source* (atime, or the mtime fallback),
+  the idle duration against `--min-idle-days`, and the access pin.
+- **verdict** is `would move now`, `would move in N days`, or `would never move: <reason>`.
+
+Already-migrated paths answer with the cold location and the tier the symlink resolves
+into; a path that does not exist says so. `--json` prints the same content as a stable
+document, for a UI or a test.
+
+The exit code is the script contract: **`0` when the engine manages the path** (a sweep
+would move it now, or it is already a symlink into a configured tier), **`1` when it
+would not be moved** — out of scope, guarded, too warm, outside every tier, or absent —
+and **`2` on a bad invocation. `1` is an answer, not an error: a warm in-scope file is
+exit `1` on purpose.
+
+```sh
+# act only on files that are actually about to move
+just_cache explain "$path" --watch /mnt/cache/media --dest /mnt/disk-slow/media && reclaim "$path"
+```
+
 ## Auditing consistency
 
 The mover leaves one of a few states behind, and they can drift apart: a crash between
@@ -263,6 +317,92 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
+<<<<<<< HEAD
+## The catalog
+
+`audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
+tree and every cold tier and ingests their current state into a SQLite file whose id for
+each object is the BLAKE3 hash of its bytes — so identity survives a rename, dedup falls
+out, and "does this file exist?" is a question the catalog can answer even for a tier that
+is not mounted.
+
+```sh
+just_cache catalog sync \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media
+```
+
+The catalog defaults to `.just_cache-catalog.sqlite` beside the watch root (the walk
+skips the `.just_cache` prefix, so it can never be moved onto a cold tier); `--catalog
+<FILE>` puts it anywhere else. A file the mover already offloaded is picked up by the
+first sync exactly like one offloaded afterwards — the migration story is ingest, not
+migrate.
+
+Each row records where the bytes are (a tier plus a storage key), their size, and the
+BLAKE3 checksum computed at ingest. An object moves through `present` -> `offloaded` ->
+`restoring`, and a location is only removed when another location still holds the object
+or when no name references it. Cache residency is never written to `location` (§2.1 of the
+design): a copy in a RAM or SSD promotion target is re-derivable, so a restart can never
+turn a volatile copy into data of record.
+
+`sync` **ingests new facts and reports contradictions; it never rewrites the catalog to
+match a hand-edited tree**. If a name the catalog recorded is gone or now hashes to
+different bytes, or a location's file vanished or changed, the difference is printed and
+the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
+bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
+the tree is worse than none.
+## Restoring a file
+
+`restore` is the other half of the loop: it brings the bytes of an offloaded object back
+to its hot path, verified, and collapses the symlink into a real file.
+
+```sh
+just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media
+```
+
+The cold copy is found by *state*, because there is no catalog yet: if the path is a
+symlink that resolves, its target is the copy the mover left; otherwise — a broken link,
+or a name that vanished — the mirrored relative path under each `--dest`, in order. If
+several candidates hold **different** bytes for one name, restore refuses and names them
+rather than guessing which tier is right.
+
+What it guarantees:
+
+- **Verify before it goes live.** The bytes are copied into a `.just_cache-partial-*`
+  sibling *in the hot directory*, fsynced, read back and hashed (BLAKE3), and only then
+  renamed into place. The rename is same-directory and atomic, so a reader sees the old
+  state or the whole file — never a truncated one, and a crash cannot leave a torn file at
+  the path.
+- **The cold copy stays by default.** `--remove-copy` drops it — but only *after* the
+  restored copy has been verified (`docs/design.md` §6, verify-before-delete). A default
+  restore therefore leaves a regular file beside its cold copy, which `audit` reports as a
+  `duplicate`; that is the honest state of the tree, not a bug.
+- **It is idempotent.** Restoring a path that already holds the right bytes is a no-op
+  that exits `0`.
+- **It never clobbers data.** A regular file at the path is compared to the cold copy: if
+  the bytes are identical, nothing changes; if they differ — even at the same size, which a
+  length-only check would miss — restore **refuses** and leaves both copies untouched. The
+  hot file may be newer than the copy, and silently overwriting it is the one outcome this
+  command must never produce.
+
+Exit codes: `0` restored or already present, `1` refused or failed (no copy found,
+mismatch, unverifiable), `2` bad invocation (missing directory, path outside `--watch`).
+
+```sh
+# free the cold tier once the bytes are safely back home
+just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media --dest /mnt/disk-slow/media --remove-copy
+```
+
+A named gap: with no catalog there is no recorded digest to check a cold copy against
+*before* copying it, so a copy that was already corrupt would be restored faithfully. The
+read-back catches a torn copy; only the catalog (issue #16) can catch a corrupt one, and
+`docs/design.md` §9 says so.
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
+
 ## Running it continuously
 
 ```sh
@@ -287,8 +427,14 @@ directories, a source that changed since the scan), the policy (idle thresholds,
 oldest-first ordering, access pins, dry runs, full tiers), scope (include/exclude globs
 and the size window), the guards (a real second process holding a real descriptor, and
 hardlinked pairs), metadata and sparseness across a real mount point, journal recovery
-(each crash state, plus the CLI against a damaged journal), and audit (every
-classification, the checksum-guarded repair, and the exit-code contract cron sees).
+(each crash state, plus the CLI against a damaged journal), audit (every
+classification, the checksum-guarded repair, and the exit-code contract cron sees), and
+<<<<<<< HEAD
+explain (the four-stage ordering, a real holding process named by pid, the migrated and
+missing cases, and the exit-code contract through the binary — `--json` included).
+restore (the round trip, idempotence, repairing a broken symlink, refusing a same-size
+stranger, `--remove-copy`, and a genuine cross-device restore).
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 
 A few of these drive the actual binary rather than the library, because the promises that
 matter — exit codes, recovery messages, refusing to sweep with an unreadable journal —
@@ -340,16 +486,24 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
 | [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
 | [`src/journal.rs`](src/journal.rs) | What the mover was in the middle of: the intent record, and recovery from an interrupted move. |
+| [`src/catalog.rs`](src/catalog.rs) | The SQLite catalog — content-addressed locations, names, and the transactional `sync` that ingests the tree. |
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
+<<<<<<< HEAD
+| [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep` and `audit` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain` and `restore` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
+<<<<<<< HEAD
+| [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
+| [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
+| [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
 
 ## Design

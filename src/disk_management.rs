@@ -233,21 +233,80 @@ fn entry_for(
 /// Bytes a file occupies on disk. A sparse file's holes are not allocated, so this is
 /// below `len()`, and it is the amount a hole-preserving copy has to find room for.
 #[cfg(unix)]
-fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+pub fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks().saturating_mul(512)
 }
 
 #[cfg(not(unix))]
-fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+pub fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
     metadata.len()
 }
 
+/// Where the "when was this last used" stamp came from.
+///
+/// The mover's usage signal is atime, with mtime as the fallback when a filesystem does
+/// not report an access time (`docs/design.md` §9 names the `noatime` weakness). `explain`
+/// has to say *which* of the two it is looking at, because "idle for 90 days" reads very
+/// differently when the stamp is the last write rather than the last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessSource {
+    /// The filesystem reported a last-access time.
+    Atime,
+    /// No access time was available, so the last-modification time stands in for it.
+    MtimeFallback,
+}
+
+impl AccessSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessSource::Atime => "atime",
+            AccessSource::MtimeFallback => "mtime-fallback",
+        }
+    }
+}
+
+/// Best available last-use stamp for `metadata`, and where it came from.
+pub fn last_use(metadata: &fs::Metadata) -> (SystemTime, AccessSource) {
+    choose_access(metadata.accessed(), metadata.modified())
+}
+
+/// The choice behind [`last_use`], split out so the fallback branch can be exercised
+/// without a filesystem that refuses to report atime — which no mainstream Linux mount
+/// does, so the branch is otherwise unreachable in a test.
+fn choose_access(
+    accessed: io::Result<SystemTime>,
+    modified: io::Result<SystemTime>,
+) -> (SystemTime, AccessSource) {
+    match accessed {
+        Ok(accessed) => (accessed, AccessSource::Atime),
+        Err(_) => (
+            modified.unwrap_or(SystemTime::UNIX_EPOCH),
+            AccessSource::MtimeFallback,
+        ),
+    }
+}
+
 fn last_access(metadata: &fs::Metadata) -> SystemTime {
-    metadata
-        .accessed()
-        .or_else(|_| metadata.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
+    last_use(metadata).0
+}
+
+/// The destination to use for a file, or `None` when the tier has no room left.
+///
+/// Shared by the sweep and by `explain`, so "would this move?" and "does this move?" agree
+/// about what "room" means. `needed` is the file's *allocated* size, not its apparent
+/// length: the copy preserves holes, so a 1 GiB sparse file needs kilobytes of room, and
+/// measuring it by `len()` would refuse a move the tier can easily afford. The floor keeps
+/// a sweep from filling the disk it is moving onto.
+///
+/// `None` back from `available_space` (free space unknown on this filesystem) means "try
+/// the tier rather than stall".
+pub fn destination_with_room(dest: &Path, needed: u64, min_free: u64) -> Option<PathBuf> {
+    match available_space(dest) {
+        Some(free) if free >= min_free.saturating_add(needed) => Some(dest.to_path_buf()),
+        Some(_) => None,
+        None => Some(dest.to_path_buf()),
+    }
 }
 
 /// Move `entry` from the watched tree onto `dest_root`, leaving a symlink in the
@@ -411,11 +470,7 @@ fn is_cross_device(err: &io::Error) -> bool {
 /// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
 fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let partial = dir.join(format!(
-        "{PARTIAL_PREFIX}{}-{}.tmp",
-        std::process::id(),
-        nanos()
-    ));
+    let partial = partial_sibling(dir);
 
     // Anything that fails here is reported as a failed move against this pair, except
     // `SourceChanged`, which has already said precisely what went wrong.
@@ -512,7 +567,7 @@ fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskEr
 ///    `ftruncate`s the tail, which is what actually keeps a sparse image sparse;
 /// 3. a plain sequential copy, only when the filesystem does not implement
 ///    `SEEK_DATA` (some network and exotic filesystems return `EINVAL`).
-fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+pub(crate) fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
     #[cfg(all(
         target_os = "linux",
         not(any(target_arch = "sparc", target_arch = "sparc64"))
@@ -631,7 +686,11 @@ fn copy_all(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
 /// Copy mode, ownership, extended attributes and timestamps from a source file onto a
 /// destination that already holds its bytes.
 #[cfg(unix)]
-fn preserve_metadata(src: &Path, dest: &Path, src_metadata: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn preserve_metadata(
+    src: &Path,
+    dest: &Path,
+    src_metadata: &fs::Metadata,
+) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Ownership first: chown clears setuid/setgid bits, so the mode has to be applied
@@ -672,7 +731,11 @@ fn preserve_metadata(src: &Path, dest: &Path, src_metadata: &fs::Metadata) -> io
 }
 
 #[cfg(not(unix))]
-fn preserve_metadata(_src: &Path, _dest: &Path, _src_metadata: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn preserve_metadata(
+    _src: &Path,
+    _dest: &Path,
+    _src_metadata: &fs::Metadata,
+) -> io::Result<()> {
     // The Unix-only metadata model (mode, uid/gid, xattrs) has no equivalent here; on
     // Windows the symlink fallback is already best-effort.
     Ok(())
@@ -759,6 +822,19 @@ fn nanos() -> u128 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// A fresh, private temporary name in `dir` for an in-flight copy.
+///
+/// Shared by the mover's cross-device path and by `restore`, so both leave the same
+/// `.just_cache-partial-*` marker that the walk skips (invariant 8): a crash mid-restore
+/// can never leave a name the next sweep would try to move onto a cold tier.
+pub(crate) fn partial_sibling(dir: &Path) -> PathBuf {
+    dir.join(format!(
+        "{PARTIAL_PREFIX}{}-{}.tmp",
+        std::process::id(),
+        nanos()
+    ))
 }
 
 /// Free bytes available on the filesystem holding `path`.
@@ -1024,5 +1100,24 @@ mod tests {
         assert!(matches!(err, DiskError::DestinationContentMismatch { .. }));
         assert_eq!(fs::read(watch.join("clash.bin")).unwrap(), b"source bytes");
         assert_eq!(fs::read(cold.join("clash.bin")).unwrap(), b"other! bytes");
+    }
+
+    /// The atime→mtime fallback is the only branch a normal mount cannot reach: Linux
+    /// reports an access time even under `noatime` (it is simply not updated). So the
+    /// decision is exercised directly rather than pretended at with a mount option.
+    #[test]
+    fn a_missing_access_time_falls_back_to_mtime() {
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let (stamp, source) = choose_access(
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no atime")),
+            Ok(mtime),
+        );
+        assert_eq!(stamp, mtime);
+        assert_eq!(source, AccessSource::MtimeFallback);
+
+        let atime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let (stamp, source) = choose_access(Ok(atime), Ok(mtime));
+        assert_eq!(stamp, atime, "a reported atime always wins");
+        assert_eq!(source, AccessSource::Atime);
     }
 }

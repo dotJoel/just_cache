@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 filetime = "0.2"
 fs4 = "0.13"
 globset = "0.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 thiserror = "2"
 
 [dev-dependencies]
