@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::disk_management::{self, DiskError, FileEntry, MoveOutcome};
+use crate::scope::{Rejected, Scope};
 
 /// What we know about one tracked file.
 #[derive(Debug, Clone)]
@@ -114,15 +115,48 @@ impl Default for Policy {
 /// Why a file was left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
+    /// Outside the configured scope: not this tool's file to move.
+    OutOfScope,
+    TooSmall {
+        size: u64,
+        min: u64,
+    },
+    TooLarge {
+        size: u64,
+        max: u64,
+    },
     IdleFor(Duration),
     RecentlyAccessed(u64),
     BeyondLimit,
     EmptyFile,
 }
 
+impl From<Rejected> for SkipReason {
+    fn from(rejected: Rejected) -> Self {
+        match rejected {
+            Rejected::OutOfScope => SkipReason::OutOfScope,
+            Rejected::TooSmall { size, min } => SkipReason::TooSmall { size, min },
+            Rejected::TooLarge { size, max } => SkipReason::TooLarge { size, max },
+        }
+    }
+}
+
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SkipReason::OutOfScope => write!(f, "outside the configured scope"),
+            SkipReason::TooSmall { size, min } => write!(
+                f,
+                "below the {} size floor ({})",
+                crate::scope::human_bytes(*min),
+                crate::scope::human_bytes(*size)
+            ),
+            SkipReason::TooLarge { size, max } => write!(
+                f,
+                "above the {} size ceiling ({})",
+                crate::scope::human_bytes(*max),
+                crate::scope::human_bytes(*size)
+            ),
             SkipReason::IdleFor(d) => write!(f, "idle for only {}h", d.as_secs() / 3600),
             SkipReason::RecentlyAccessed(n) => write!(f, "accessed {n}x this run"),
             SkipReason::BeyondLimit => write!(f, "over this sweep's move limit"),
@@ -134,11 +168,14 @@ impl std::fmt::Display for SkipReason {
 /// The files a sweep would move, oldest use first, capped at [`Policy::limit`].
 ///
 /// Already-migrated symlinks and non-regular files are excluded; the reasons for the
-/// remaining exclusions are returned alongside so the run can explain itself.
+/// remaining exclusions are returned alongside so the run can explain itself. Scope
+/// (§[`crate::scope`]) is checked first, so a file this tool is not allowed to manage
+/// can never be picked up by a policy that later grows more eager.
 pub fn select_candidates<'a>(
     entries: &'a [FileEntry],
     tracker: &UsageTracker,
     policy: &Policy,
+    scope: &Scope,
     now: SystemTime,
 ) -> (Vec<&'a FileEntry>, Vec<(&'a FileEntry, SkipReason)>) {
     let mut eager: Vec<(&FileEntry, SystemTime)> = Vec::new();
@@ -146,6 +183,10 @@ pub fn select_candidates<'a>(
 
     for entry in entries {
         if entry.is_symlink {
+            continue;
+        }
+        if let Err(rejected) = scope.allows(entry) {
+            skipped.push((entry, SkipReason::from(rejected)));
             continue;
         }
         if entry.size == 0 {
@@ -247,6 +288,19 @@ impl MigrationReport {
         self.count(|outcome| matches!(outcome, FileOutcome::NoRoom))
     }
 
+    /// Files left alone because of scope or the size window — i.e. not this tool's to
+    /// move in the first place, as opposed to "not cold yet".
+    pub fn excluded(&self) -> usize {
+        self.count(|outcome| {
+            matches!(
+                outcome,
+                FileOutcome::Skipped(SkipReason::OutOfScope)
+                    | FileOutcome::Skipped(SkipReason::TooSmall { .. })
+                    | FileOutcome::Skipped(SkipReason::TooLarge { .. })
+            )
+        })
+    }
+
     pub fn bytes_moved(&self) -> u64 {
         self.records
             .iter()
@@ -305,17 +359,22 @@ impl MigrationReport {
 /// `choose_destination` picks the tier for each file, given the tier this call is
 /// filling; returning `Ok(None)` marks the file as waiting for room rather than
 /// failing it.
+///
+/// Scope is re-checked here, immediately before any bytes move, in addition to the
+/// check during candidate selection: belt and braces, so a policy that becomes dynamic
+/// later cannot move something the scope protects.
 pub fn migrate_least_used<F>(
     entries: &[FileEntry],
     tracker: &UsageTracker,
     policy: &Policy,
+    scope: &Scope,
     now: SystemTime,
     mut choose_destination: F,
 ) -> MigrationReport
 where
     F: FnMut(&FileEntry) -> Result<Option<PathBuf>, DiskError>,
 {
-    let (candidates, skipped) = select_candidates(entries, tracker, policy, now);
+    let (candidates, skipped) = select_candidates(entries, tracker, policy, scope, now);
     let mut report = MigrationReport::default();
 
     for (entry, reason) in skipped {
@@ -328,6 +387,16 @@ where
     }
 
     for entry in candidates {
+        if let Err(rejected) = scope.allows(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+            });
+            continue;
+        }
+
         let destination = match choose_destination(entry) {
             Ok(Some(destination)) => destination,
             Ok(None) => {
@@ -418,7 +487,13 @@ mod tests {
             ..Policy::default()
         };
 
-        let (candidates, skipped) = select_candidates(&entries, &UsageTracker::new(), &policy, now);
+        let (candidates, skipped) = select_candidates(
+            &entries,
+            &UsageTracker::new(),
+            &policy,
+            &Scope::everything(),
+            now,
+        );
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, Path::new("/watch/cold.bin"));
@@ -440,7 +515,13 @@ mod tests {
             ..Policy::default()
         };
 
-        let (candidates, skipped) = select_candidates(&entries, &UsageTracker::new(), &policy, now);
+        let (candidates, skipped) = select_candidates(
+            &entries,
+            &UsageTracker::new(),
+            &policy,
+            &Scope::everything(),
+            now,
+        );
 
         let picked: Vec<_> = candidates.iter().map(|e| e.path.clone()).collect();
         assert_eq!(
@@ -471,7 +552,8 @@ mod tests {
             ..Policy::default()
         };
 
-        let (candidates, skipped) = select_candidates(&entries, &tracker, &policy, now);
+        let (candidates, skipped) =
+            select_candidates(&entries, &tracker, &policy, &Scope::everything(), now);
         assert!(candidates.is_empty());
         assert_eq!(skipped[0].1, SkipReason::RecentlyAccessed(1));
         assert_eq!(tracker.observed_accesses(Path::new("/watch/used.bin")), 1);
@@ -512,6 +594,7 @@ mod tests {
             &entries,
             &UsageTracker::new(),
             &policy,
+            &Scope::everything(),
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
         );

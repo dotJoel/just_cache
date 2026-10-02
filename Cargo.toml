@@ -1,6 +1,6 @@
 [package]
 name = "just_cache"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Move cold, rarely used files onto slower disks, leaving symlinks behind"
 license = "MIT"
@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 fs4 = "0.13"
+globset = "0.4"
 thiserror = "2"
 
 [dev-dependencies]

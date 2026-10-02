@@ -331,10 +331,10 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
 ## 8. Phases
 
 - **P0 — harden what exists** (symlink provider): journal + startup repair;
-  preserve mode/owner/xattrs/sparse; scope controls — `--include`/`--exclude` globs and
-  `--min-size`/`--max-size` (§5.1); do-not-move if the file is open or hardlinked
+  preserve mode/owner/xattrs/sparse; do-not-move if the file is open or hardlinked
   elsewhere; `audit` command (cold copies without a symlink, symlinks without a target);
-  CI test that exercises the EXDEV path.
+  CI test that exercises the EXDEV path. *(Scope controls — `--include`/`--exclude` and
+  `--min-size`/`--max-size` per §5.1 — are done.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
   within a tier; scrubbing.
@@ -356,8 +356,6 @@ part nothing else does.
   adoption compares size only.
 - Crash window between source removal and symlink creation (P0's journal fixes it).
 - No open-file/hardlink guard before moving a file.
-- No scope controls: everything under `--watch` is a candidate, with no include/exclude
-  globs and no size bounds (§5.1).
 - CI never exercises the EXDEV path the mover actually takes in production.
 - Access tracking depends on atime semantics of the host mounts.
 

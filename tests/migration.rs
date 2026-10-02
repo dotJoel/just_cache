@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use just_cache::disk_management::{self, DiskError, FileEntry, MoveOutcome};
 use just_cache::file_movement::{self, FileOutcome, Policy, UsageTracker};
+use just_cache::scope::Scope;
 
 fn scan(root: &Path) -> Vec<FileEntry> {
     disk_management::list_files_recursive(root).expect("walk should succeed")
@@ -90,10 +91,14 @@ fn a_second_run_is_a_no_op() {
         limit: 10,
         dry_run: false,
     };
-    let report =
-        file_movement::migrate_least_used(&rescan, &tracker, &policy, SystemTime::now(), |_| {
-            Ok(Some(cold.clone()))
-        });
+    let report = file_movement::migrate_least_used(
+        &rescan,
+        &tracker,
+        &policy,
+        &Scope::everything(),
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
 
     assert_eq!(
         report.records.len(),
@@ -203,6 +208,117 @@ fn interleaved_moves_of_two_files_keep_their_own_contents() {
 }
 
 #[test]
+fn a_sweep_skips_everything_outside_the_include_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("media")).unwrap();
+    fs::create_dir_all(watch.join("scratch")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("media/cold.bin"), b"media payload").unwrap();
+    fs::write(watch.join("scratch/cold.bin"), b"scratch payload").unwrap();
+
+    let entries = scan(&watch);
+    let scope = Scope::build(&["media/**".to_string()], &[], 0, None).unwrap();
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &scope,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.moved(), 1);
+    assert_eq!(report.excluded(), 1);
+    assert!(cold.join("media/cold.bin").is_file());
+    assert_eq!(
+        fs::read(watch.join("scratch/cold.bin")).unwrap(),
+        b"scratch payload",
+        "a file outside the include set must not be touched"
+    );
+    assert!(!cold.join("scratch/cold.bin").exists());
+}
+
+#[test]
+fn an_excluded_directory_survives_a_sweep_even_when_it_is_the_coldest_thing_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("app/node_modules/react")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("app/node_modules/react/index.js"), b"{}").unwrap();
+    fs::write(watch.join("app/index.js"), b"console.log(1)").unwrap();
+
+    let entries = scan(&watch);
+    let scope = Scope::build(&[], &["node_modules".to_string()], 0, None).unwrap();
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &scope,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.moved(), 1);
+    assert!(fs::read(watch.join("app/node_modules/react/index.js")).is_ok());
+    assert_eq!(
+        fs::read(watch.join("app/index.js")).unwrap(),
+        b"console.log(1)",
+        "the unexcluded file was moved out and replaced by a symlink"
+    );
+    assert!(!cold.join("app/node_modules").exists());
+}
+
+#[test]
+fn the_size_window_skips_tiny_and_enormous_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("tiny.txt"), b"hi").unwrap();
+    fs::write(watch.join("just-right.bin"), vec![0u8; 4096]).unwrap();
+    fs::write(watch.join("huge.img"), vec![0u8; 64 * 1024]).unwrap();
+
+    let entries = scan(&watch);
+    let scope = Scope::build(&[], &[], 1024, Some(8192)).unwrap();
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &scope,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.moved(), 1);
+    assert_eq!(report.excluded(), 2);
+    assert!(cold.join("just-right.bin").is_file());
+    assert!(watch.join("tiny.txt").is_file());
+    assert!(watch.join("huge.img").is_file());
+}
+
+#[test]
 fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
     let tmp = tempfile::tempdir().unwrap();
     let watch = tmp.path().join("hot");
@@ -222,6 +338,7 @@ fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
         &entries,
         &UsageTracker::new(),
         &policy,
+        &Scope::everything(),
         SystemTime::now(),
         |_| Ok(None), // the tier says it is out of space
     );
@@ -253,6 +370,7 @@ fn a_sweep_reports_failures_without_stopping_the_rest() {
         &entries,
         &UsageTracker::new(),
         &policy,
+        &Scope::everything(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
