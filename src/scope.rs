@@ -228,6 +228,7 @@ mod tests {
             path: PathBuf::from("/watch").join(relative),
             relative: PathBuf::from(relative),
             size,
+            allocated: size,
             last_access: SystemTime::now(),
             is_symlink: false,
         }

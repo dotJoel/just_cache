@@ -5,9 +5,34 @@
 //! string concatenation — and the destination mirrors the file's path *relative to
 //! the watched root*, so nested trees keep their shape and same-named files in
 //! different directories cannot collide.
+//!
+//! # The cross-device copy is the path that matters
+//!
+//! A "slower disk" is a different filesystem, so `rename` fails with `EXDEV` and
+//! [`copy_then_remove`] does the work. A plain `io::copy` there would silently drop
+//! everything that is not file content, so the copy is deliberate about metadata:
+//!
+//! * **mode, ownership and timestamps** are copied onto the destination before it is
+//!   put in place, so no reader ever sees the process umask's guess at a mode;
+//! * **extended attributes are copied best-effort, and this is the documented
+//!   default**: an attribute that cannot be set — because the destination filesystem
+//!   has no xattr support (`ENOTSUP`), or because setting a `security.*`/`trusted.*`
+//!   label needs privileges the process does not have — produces a warning and the
+//!   move still completes. SELinux labels are the important case: losing one makes a
+//!   file unreadable on an enforcing host, so the warning names the attribute rather
+//!   than failing silently. The alternative, refusing the move, would make the tool
+//!   unusable on any xattr-less destination, so it is not the default;
+//! * **holes stay holes**: a `SEEK_DATA`/`SEEK_HOLE` copy writes only real extents and
+//!   `ftruncate`s the tail, with a reflink/clone attempt in front of it, so a sparse
+//!   40 GB image does not become 40 GB of allocated blocks on the tier that was meant
+//!   to save the space.
+//!
+//! Ownership can only be set by root; when it cannot be, that is a warning rather than
+//! an error, because a file that moved with the wrong owner is recoverable and a file
+//! that refused to move is not.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -49,6 +74,16 @@ pub enum DiskError {
         dest_size: u64,
         src_size: u64,
     },
+    #[error(
+        "refusing to adopt {path}: destination has the source's length ({src_size} bytes) but \
+         different content (BLAKE3 mismatch); source is {src_size} bytes and destination is \
+         {dest_size} bytes"
+    )]
+    DestinationContentMismatch {
+        path: PathBuf,
+        dest_size: u64,
+        src_size: u64,
+    },
     #[error("copy of {path} onto {dest} left {actual} bytes, expected {expected}")]
     ShortCopy {
         path: PathBuf,
@@ -66,6 +101,10 @@ pub struct FileEntry {
     /// Path of the file relative to the watched root.
     pub relative: PathBuf,
     pub size: u64,
+    /// Bytes the file actually occupies on disk (`st_blocks`). Below `size` for a sparse
+    /// file, and the number that matters when asking whether a tier has room: a copy that
+    /// preserves holes writes these bytes, not `size` of them.
+    pub allocated: u64,
     /// Best available "when was this last used" stamp: atime, falling back to mtime.
     pub last_access: SystemTime,
     /// True when this entry is itself a symlink (i.e. already migrated).
@@ -77,7 +116,7 @@ pub struct FileEntry {
 pub enum MoveOutcome {
     /// The file was transferred to the destination disk and symlinked back.
     Moved,
-    /// The destination already held an identical copy; only the symlink was (re)made.
+    /// The destination already held a byte-identical copy; only the symlink was (re)made.
     LinkedExisting,
     /// The path was already a symlink — nothing to do.
     AlreadyLinked,
@@ -117,7 +156,7 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
             };
 
             if metadata.is_symlink() {
-                found.push(entry_for(root, path, 0, last_access(&metadata), true));
+                found.push(entry_for(root, path, 0, 0, last_access(&metadata), true));
                 continue;
             }
             if metadata.is_dir() {
@@ -137,6 +176,7 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
                 root,
                 path,
                 metadata.len(),
+                allocated_bytes(&metadata),
                 last_access(&metadata),
                 false,
             ));
@@ -150,6 +190,7 @@ fn entry_for(
     root: &Path,
     path: PathBuf,
     size: u64,
+    allocated: u64,
     last_access: SystemTime,
     is_symlink: bool,
 ) -> FileEntry {
@@ -161,9 +202,23 @@ fn entry_for(
         path,
         relative,
         size,
+        allocated,
         last_access,
         is_symlink,
     }
+}
+
+/// Bytes a file occupies on disk. A sparse file's holes are not allocated, so this is
+/// below `len()`, and it is the amount a hole-preserving copy has to find room for.
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn last_access(metadata: &fs::Metadata) -> SystemTime {
@@ -177,9 +232,11 @@ fn last_access(metadata: &fs::Metadata) -> SystemTime {
 /// original location that points at the new home.
 ///
 /// This is idempotent: an entry that is already a symlink is left alone, and when the
-/// destination already holds a byte-identical copy the source file is dropped in
-/// favour of the symlink instead of being moved again. It refuses to overwrite a
-/// destination of a different size.
+/// destination already holds a *byte-identical* copy the source file is dropped in
+/// favour of the symlink instead of being moved again. A destination of a different
+/// size, or of the same size but different content, is refused rather than clobbered:
+/// the resumed state of an interrupted move is only a destination whose checksum
+/// matches, which is stronger than the length-only check this used to trust.
 pub fn move_file_with_symlink(
     dest_root: &Path,
     entry: &FileEntry,
@@ -216,6 +273,21 @@ pub fn move_file_with_symlink(
                     src_size: entry.size,
                 });
             }
+            // Same length is not the same file. An interrupted move leaves the
+            // destination identical, so a checksum is the honest way to tell the
+            // resumed state from a same-size stranger that must not be adopted —
+            // adopting it would delete the source and lose the data.
+            let identical = same_contents(src, &dest).map_err(|source| DiskError::StatError {
+                path: src.clone(),
+                source,
+            })?;
+            if !identical {
+                return Err(DiskError::DestinationContentMismatch {
+                    path: dest,
+                    dest_size,
+                    src_size: entry.size,
+                });
+            }
             true
         }
         Err(_) => false,
@@ -228,7 +300,7 @@ pub fn move_file_with_symlink(
             source,
         })?;
     } else {
-        transfer(src, &dest, entry.size)?;
+        transfer(src, &dest)?;
     }
 
     create_symlink(&link_target, src).map_err(|source| DiskError::SymlinkError {
@@ -244,10 +316,23 @@ pub fn move_file_with_symlink(
     })
 }
 
+/// Whether two files hold the same bytes, compared with BLAKE3 (the content identity
+/// the design's catalog is built on, §3), not by length.
+fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    Ok(file_digest(a)? == file_digest(b)?)
+}
+
+fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize())
+}
+
 /// Move `src` to `dest`, falling back to copy-then-delete when the two paths live on
 /// different filesystems (`rename` cannot cross a mount point, and a "slower disk" is
 /// almost always a different mount).
-fn transfer(src: &Path, dest: &Path, expected_size: u64) -> Result<(), DiskError> {
+fn transfer(src: &Path, dest: &Path) -> Result<(), DiskError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|source| DiskError::MoveError {
             from: src.to_path_buf(),
@@ -258,7 +343,7 @@ fn transfer(src: &Path, dest: &Path, expected_size: u64) -> Result<(), DiskError
 
     match fs::rename(src, dest) {
         Ok(()) => Ok(()),
-        Err(err) if is_cross_device(&err) => copy_then_remove(src, dest, expected_size),
+        Err(err) if is_cross_device(&err) => copy_then_remove(src, dest),
         Err(source) => Err(DiskError::MoveError {
             from: src.to_path_buf(),
             to: dest.to_path_buf(),
@@ -282,7 +367,13 @@ fn is_cross_device(err: &io::Error) -> bool {
     }
 }
 
-fn copy_then_remove(src: &Path, dest: &Path, expected_size: u64) -> Result<(), DiskError> {
+/// The cross-device fallback: copy the bytes *and* the metadata into a temporary file
+/// next to the destination, then make it visible with an atomic rename, then drop the
+/// source.
+///
+/// The temporary lives in the destination directory so the final rename stays on one
+/// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
+fn copy_then_remove(src: &Path, dest: &Path) -> Result<(), DiskError> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let partial = dir.join(format!(
         "{PARTIAL_PREFIX}{}-{}.tmp",
@@ -290,24 +381,46 @@ fn copy_then_remove(src: &Path, dest: &Path, expected_size: u64) -> Result<(), D
         nanos()
     ));
 
-    let written = (|| -> io::Result<u64> {
-        let mut reader = File::open(src)?;
-        let mut writer = File::create(&partial)?;
-        let copied = io::copy(&mut reader, &mut writer)?;
-        writer.flush()?;
-        writer.sync_all()?;
-        Ok(copied)
+    let copied = (|| -> io::Result<u64> {
+        let src_file = File::open(src)?;
+        let src_metadata = src_file.metadata()?;
+        let mut dest_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+
+        copy_contents(&src_file, &mut dest_file, src_metadata.len())?;
+        // Metadata is applied while the file is still private, so the mode/owner never
+        // briefly differ from the source for anything that can see the destination.
+        preserve_metadata(src, &partial, &src_metadata)?;
+        dest_file.sync_all()?;
+        Ok(src_metadata.len())
     })();
 
-    match written {
-        Ok(copied) if copied == expected_size => {}
-        Ok(actual) => {
+    let expected = match copied {
+        Ok(expected) => expected,
+        Err(source) => {
+            let _ = fs::remove_file(&partial);
+            return Err(DiskError::MoveError {
+                from: src.to_path_buf(),
+                to: dest.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    // The source could have been truncated while we copied; a short destination must
+    // never replace the original.
+    match fs::symlink_metadata(&partial) {
+        Ok(metadata) if metadata.len() == expected => {}
+        Ok(metadata) => {
+            let actual = metadata.len();
             let _ = fs::remove_file(&partial);
             return Err(DiskError::ShortCopy {
                 path: src.to_path_buf(),
                 dest: dest.to_path_buf(),
                 actual,
-                expected: expected_size,
+                expected,
             });
         }
         Err(source) => {
@@ -331,6 +444,258 @@ fn copy_then_remove(src: &Path, dest: &Path, expected_size: u64) -> Result<(), D
         to: dest.to_path_buf(),
         source,
     })?;
+    Ok(())
+}
+
+/// Copy the logical contents of `src` into `dest`, with holes kept as holes.
+///
+/// Three strategies, best first:
+///
+/// 1. a reflink/clone (`FICLONE`), which shares extents and so is both instant and
+///    perfectly faithful — holes, inline data and compression all come along;
+/// 2. an explicit `SEEK_DATA`/`SEEK_HOLE` walk that copies only real extents and
+///    `ftruncate`s the tail, which is what actually keeps a sparse image sparse;
+/// 3. a plain sequential copy, only when the filesystem does not implement
+///    `SEEK_DATA` (some network and exotic filesystems return `EINVAL`).
+fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    {
+        // The kernel only allows a clone within one filesystem; across devices this
+        // fails with EXDEV and we fall through, which is the expected case here.
+        if rustix::fs::ioctl_ficlone(&*dest, src).is_ok() {
+            return Ok(());
+        }
+    }
+
+    if copy_extents(src, dest, size)? {
+        return Ok(());
+    }
+    copy_all(src, dest, size)
+}
+
+/// Walk the source's real extents with `SEEK_DATA`/`SEEK_HOLE`, writing only those and
+/// leaving the gaps untouched, so the destination allocates only what the source did.
+///
+/// Returns `Ok(false)` when the filesystem does not support the seeks, having left the
+/// destination empty so the caller can fall back.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn copy_extents(src: &File, dest: &mut File, size: u64) -> io::Result<bool> {
+    use rustix::fs::SeekFrom as RustixSeekFrom;
+
+    let mut position = 0u64;
+    while position < size {
+        let data_start = match rustix::fs::seek(src, RustixSeekFrom::Data(position)) {
+            Ok(offset) => offset,
+            // There is no data at or after `position`: the rest of the file is a hole,
+            // which `set_len` at the end turns back into an implicitly-zero tail.
+            Err(err) if err == rustix::io::Errno::NXIO => break,
+            // Not every filesystem implements SEEK_DATA/SEEK_HOLE.
+            Err(err) if err == rustix::io::Errno::INVAL || err == rustix::io::Errno::NOTSUP => {
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let hole_start = {
+            let offset = rustix::fs::seek(src, RustixSeekFrom::Hole(data_start))?;
+            offset.min(size)
+        };
+        if hole_start <= data_start {
+            // A malformed answer; treat it as "no extent support" and fall back rather
+            // than loop forever.
+            return Ok(false);
+        }
+
+        // Position both files at the extent and copy it. The destination's offset never
+        // advances over a hole, so nothing is written there and the gap stays sparse.
+        rustix::fs::seek(src, RustixSeekFrom::Start(data_start))?;
+        dest.seek(SeekFrom::Start(data_start))?;
+        let length = hole_start - data_start;
+        let mut extent = io::Read::take(src, length);
+        let copied = io::copy(&mut extent, &mut *dest)?;
+        if copied != length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source shrank while its extents were being copied",
+            ));
+        }
+        position = hole_start;
+    }
+
+    // The final extend is what gives the file its apparent size even though the tail
+    // was never written; on a sparse-capable filesystem this allocates nothing.
+    dest.set_len(size)?;
+    Ok(true)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn copy_extents(_src: &File, _dest: &mut File, _size: u64) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// The honest fallback for filesystems that cannot walk holes: read and write every
+/// byte. The result is correct but fully materialized, which is exactly the cost this
+/// module exists to avoid where it can.
+fn copy_all(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+    let mut source = src;
+    source.seek(SeekFrom::Start(0))?;
+    dest.seek(SeekFrom::Start(0))?;
+    dest.set_len(0)?;
+    let copied = io::copy(&mut source, &mut *dest)?;
+    if copied != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "source shrank while it was being copied",
+        ));
+    }
+    Ok(())
+}
+
+/// Copy mode, ownership, extended attributes and timestamps from a source file onto a
+/// destination that already holds its bytes.
+#[cfg(unix)]
+fn preserve_metadata(src: &Path, dest: &Path, src_metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // Ownership first: chown clears setuid/setgid bits, so the mode has to be applied
+    // after it. Changing owner needs root, so a failure is a warning and not a reason
+    // to abandon the move — a file with the wrong owner is recoverable, a move that
+    // refuses to happen leaves the tier unwritten.
+    let want = (src_metadata.uid(), src_metadata.gid());
+    if let Ok(dest_metadata) = fs::metadata(dest) {
+        if (dest_metadata.uid(), dest_metadata.gid()) != want {
+            match rustix::fs::chown(
+                dest,
+                Some(rustix::fs::Uid::from_raw(want.0)),
+                Some(rustix::fs::Gid::from_raw(want.1)),
+            ) {
+                Ok(()) => {}
+                Err(err) => eprintln!(
+                    "warning: {}: cannot preserve ownership {}:{} on {}: {err}",
+                    src.display(),
+                    want.0,
+                    want.1,
+                    dest.display()
+                ),
+            }
+        }
+    }
+
+    fs::set_permissions(dest, fs::Permissions::from_mode(src_metadata.mode()))?;
+    copy_xattrs(src, dest);
+
+    // Timestamps last: writing and chmoding the file both move mtime, so this is the
+    // only order in which the recorded times survive.
+    filetime::set_file_times(
+        dest,
+        filetime::FileTime::from_last_access_time(src_metadata),
+        filetime::FileTime::from_last_modification_time(src_metadata),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn preserve_metadata(_src: &Path, _dest: &Path, _src_metadata: &fs::Metadata) -> io::Result<()> {
+    // The Unix-only metadata model (mode, uid/gid, xattrs) has no equivalent here; on
+    // Windows the symlink fallback is already best-effort.
+    Ok(())
+}
+
+/// Copy every extended attribute from `src` to `dest`, best-effort.
+///
+/// Attributes that cannot be read or set are reported and skipped rather than failing
+/// the move; see the module docs for why that is the default. POSIX ACLs are skipped
+/// explicitly: they live in `system.posix_acl_*` xattrs, copying them is out of scope,
+/// and the mode bits set just above are the ACL's access mask in the common case.
+#[cfg(unix)]
+fn copy_xattrs(src: &Path, dest: &Path) {
+    let names = match list_xattr_names(src) {
+        Ok(names) => names,
+        Err(err) => {
+            eprintln!(
+                "warning: {}: cannot list extended attributes: {err}",
+                src.display()
+            );
+            return;
+        }
+    };
+
+    for name in names {
+        if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
+            continue;
+        }
+        match get_xattr(src, &name).and_then(|value| set_xattr(dest, &name, &value)) {
+            Ok(()) => {}
+            Err(err) => eprintln!(
+                "warning: cannot copy extended attribute {name} from {} to {}: {err}",
+                src.display(),
+                dest.display()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn list_xattr_names(path: &Path) -> io::Result<Vec<String>> {
+    let mut capacity = 4096usize;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        match rustix::fs::listxattr(path, &mut buffer) {
+            Ok(len) => {
+                buffer.truncate(len);
+                return Ok(buffer
+                    .split(|byte| *byte == 0)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect());
+            }
+            // The list outgrew the buffer; ERANGE is the kernel telling us the real
+            // size is larger, and the size is not otherwise queryable.
+            Err(err) if err == rustix::io::Errno::RANGE && capacity < (1 << 20) => {
+                capacity *= 4;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn get_xattr(path: &Path, name: &str) -> io::Result<Vec<u8>> {
+    // A zero-length buffer makes the kernel return the value's length without
+    // copying it, which is the only way to size the read precisely.
+    let mut empty = [0u8; 0];
+    let size = rustix::fs::getxattr(path, name, &mut empty)?;
+    let mut value = vec![0u8; size];
+    let len = rustix::fs::getxattr(path, name, &mut value)?;
+    value.truncate(len);
+    Ok(value)
+}
+
+#[cfg(unix)]
+fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    rustix::fs::setxattr(path, name, value, rustix::fs::XattrFlags::empty())?;
     Ok(())
 }
 
@@ -408,6 +773,8 @@ pub fn symlink_target(src: &Path, dest: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn walks_nested_directories_and_skips_symlinks() {
@@ -454,5 +821,133 @@ mod tests {
     fn symlink_target_falls_back_to_absolute_without_common_ancestor() {
         let target = symlink_target(Path::new("relative/a.mkv"), Path::new("/pool/cold/a.mkv"));
         assert_eq!(target, Path::new("/pool/cold/a.mkv"));
+    }
+
+    /// The copy path, exercised directly so it does not depend on a second filesystem
+    /// existing. This is the same code `EXDEV` reaches in production.
+    #[test]
+    fn cross_device_copy_preserves_mode_ownership_xattrs_and_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dest = tmp.path().join("dest.bin");
+        fs::write(&src, b"payload with metadata").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let src_metadata = fs::metadata(&src).unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let times = fs::FileTimes::new().set_accessed(mtime).set_modified(mtime);
+        File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        // Extended attributes are not guaranteed to be representable; the assertion
+        // below is skipped rather than failed when this filesystem cannot hold one.
+        let xattr_supported = rustix::fs::setxattr(
+            &src,
+            "user.just_cache_test",
+            b"kept",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_ok();
+
+        copy_then_remove(&src, &dest).expect("copy path should succeed");
+        assert!(
+            !src.exists(),
+            "the source is deleted after a successful copy"
+        );
+
+        let dest_metadata = fs::metadata(&dest).unwrap();
+        assert_eq!(
+            dest_metadata.mode() & 0o7777,
+            0o640,
+            "mode must survive the copy"
+        );
+        assert_eq!(
+            (dest_metadata.uid(), dest_metadata.gid()),
+            (src_metadata.uid(), src_metadata.gid()),
+            "ownership is preserved when it can be set"
+        );
+        assert_eq!(
+            dest_metadata.modified().unwrap(),
+            mtime,
+            "mtime must be copied"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"payload with metadata");
+
+        if xattr_supported {
+            let mut value = [0u8; 16];
+            let len = rustix::fs::getxattr(&dest, "user.just_cache_test", &mut value).unwrap();
+            assert_eq!(&value[..len], b"kept", "xattrs must be copied");
+        }
+    }
+
+    #[test]
+    fn extent_copy_keeps_holes_and_reports_allocated_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_path = tmp.path().join("sparse.img");
+        let dest_path = tmp.path().join("sparse-copy.img");
+        let apparent: u64 = 256 * 1024 * 1024;
+        let marker = vec![0x5au8; 16 * 1024];
+
+        {
+            let mut file = File::create(&src_path).unwrap();
+            file.write_all(&marker).unwrap();
+            file.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+            file.write_all(&marker).unwrap();
+            file.set_len(apparent).unwrap();
+        }
+
+        let src_metadata = fs::metadata(&src_path).unwrap();
+        if src_metadata.blocks() == 0 || src_metadata.blocks() * 512 >= apparent / 2 {
+            eprintln!("skipping: filesystem does not represent holes sparsely");
+            return;
+        }
+
+        let src_file = File::open(&src_path).unwrap();
+        let mut dest_file = File::create(&dest_path).unwrap();
+        // Call the hole walker directly rather than the whole copy, so a reflink of an
+        // unrelated test machine cannot mask whether SEEK_DATA did the work.
+        let used_extents = copy_extents(&src_file, &mut dest_file, apparent).unwrap();
+        dest_file.sync_all().unwrap();
+        assert!(used_extents, "this filesystem should support SEEK_DATA");
+
+        let dest_metadata = fs::metadata(&dest_path).unwrap();
+        assert_eq!(dest_metadata.len(), apparent, "apparent size is preserved");
+        let src_allocated = src_metadata.blocks() * 512;
+        let dest_allocated = dest_metadata.blocks() * 512;
+        assert!(
+            dest_allocated < apparent / 2,
+            "holes must not be materialized: {dest_allocated} allocated of {apparent} apparent"
+        );
+        assert!(
+            dest_allocated <= src_allocated + 1024 * 1024,
+            "the copy allocated {dest_allocated} bytes against the source's {src_allocated}"
+        );
+        assert_eq!(
+            fs::read(&dest_path).unwrap()[..marker.len()],
+            marker[..],
+            "the first extent must survive"
+        );
+    }
+
+    #[test]
+    fn same_length_different_content_is_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold = tmp.path().join("cold");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold).unwrap();
+        fs::write(watch.join("clash.bin"), b"source bytes").unwrap();
+        fs::write(cold.join("clash.bin"), b"other! bytes").unwrap();
+
+        let entry = list_files_recursive(&watch).unwrap().pop().unwrap();
+        let err = move_file_with_symlink(&cold, &entry)
+            .expect_err("a same-size stranger must not be adopted");
+        assert!(matches!(err, DiskError::DestinationContentMismatch { .. }));
+        assert_eq!(fs::read(watch.join("clash.bin")).unwrap(), b"source bytes");
+        assert_eq!(fs::read(cold.join("clash.bin")).unwrap(), b"other! bytes");
     }
 }
