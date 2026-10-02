@@ -23,10 +23,10 @@ still agree.
 
 ## Why
 
-Caches, media libraries and build directories fill up with files nobody has opened in
-months. Deleting them loses data; leaving them wastes expensive flash. `just_cache`
-buys back the fast tier while every script, playlist and application path keeps
-resolving, because the file is still there — it is just a symlink now.
+Trees like caches, media libraries and build directories accumulate files that have not
+been read in months. Deleting them loses data; leaving them on a fast disk wastes it.
+`just_cache` moves those files to slower storage and leaves a symlink at the original
+path, so the fast disk is freed and every existing path still opens the same bytes.
 
 ## Configuration
 
@@ -140,12 +140,16 @@ describe bytes already on a cold tier, and there is no safe way to guess. The jo
 itself is never a move candidate, and after a clean pass it is empty — a finished move
 is cleared rather than recorded, since the symlink is better evidence that it finished.
 
-**Destinations are never created.** A missing `--dest` is a startup error, not a
+### Destinations
+
+**A destination is never created.** A missing `--dest` is a startup error, not a
 `mkdir`: if a slow disk is unmounted, silently creating its mount point would have the
 tool write terabytes into a directory on the wrong filesystem.
 
 With several destinations, sweeps fill the fastest tier first and only spill onto the
-next when a tier is out of room (or has hit `--limit`).
+next when a tier is out of room (or has hit `--limit`). A file too large for what a tier
+can spare is reported as *waiting for room* rather than failed — it will be picked up on
+a later sweep, and the source is left untouched until then.
 
 ## How a file is chosen
 
@@ -203,8 +207,12 @@ A destination below its free-space floor is not a failure: those files are repor
 $ just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --min-idle-days 30 --once -v
   skipped: idle for only 0h /mnt/cache/media/recent.txt
   moved /mnt/cache/media/shows/s1/ep1.mkv -> /mnt/disk-slow/media/shows/s1/ep1.mkv
-pass 1: 3 files scanned, 3 tracked, 1 moved, 0 linked, 0 waiting for room, 1 skipped, 0 failed, 21 B onto the cold tiers
+pass 1: 3 files scanned, 3 tracked, 1 moved, 0 linked, 0 waiting for room, 0 in use (71 open files seen), 1 skipped (0 outside scope or size), 0 failed, 21 B onto the cold tiers
 ```
+
+The counters are separate on purpose: a file someone is holding open is not the same
+thing as a file that is merely too warm, and neither is the same as a file the scope
+excludes.
 
 `/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
 episode.
@@ -243,9 +251,9 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 
 `--repair` fixes what can be fixed without guessing:
 
-- **duplicate** — the two copies are hashed (SHA-256); only on a match is the source
-  file removed and replaced by the symlink the mover intended. A mismatch is refused
-  and both copies are left untouched.
+- **duplicate** — the two copies are hashed (BLAKE3, the same digest the mover compares
+  destinations with); only on a match is the source file removed and replaced by the
+  symlink the mover intended. A mismatch is refused and both copies are left untouched.
 - **dangling-symlink** — the link is re-pointed at the cold copy at the mirrored path,
   if one exists. No bytes are deleted.
 - **unexpected-target** and **orphaned-copy** are reported, never silently changed:
@@ -275,9 +283,16 @@ cargo clippy --all-targets -- -D warnings
 
 Tests cover the walk (nested directories, symlink loops), the move (nested layout,
 existing symlinks, resumed moves, size conflicts, same-named files in sibling
-directories), the policy (idle thresholds, oldest-first ordering, access pins, dry
-runs, full tiers), and audit (every classification, the checksum-guarded repair, and
-the exit-code contract the CLI exposes to cron).
+directories, a source that changed since the scan), the policy (idle thresholds,
+oldest-first ordering, access pins, dry runs, full tiers), scope (include/exclude globs
+and the size window), the guards (a real second process holding a real descriptor, and
+hardlinked pairs), metadata and sparseness across a real mount point, journal recovery
+(each crash state, plus the CLI against a damaged journal), and audit (every
+classification, the checksum-guarded repair, and the exit-code contract cron sees).
+
+A few of these drive the actual binary rather than the library, because the promises that
+matter — exit codes, recovery messages, refusing to sweep with an unreadable journal —
+are promises the command line makes.
 
 ### Testing the cross-device move
 
@@ -305,10 +320,15 @@ have a spare mount. CI does have one — the workflow mounts a tmpfs — so it a
 `JUST_CACHE_REQUIRE_SECOND_FS=1`, which turns that skip into a hard failure. That way a
 broken mount in CI can never leave the job green while the coverage quietly disappears.
 
-They check byte-for-byte equality of the copied file, that reading through the
-symlink still works and resolves to the cold copy, that a failed copy (a source that
-shrinks after the scan) leaves the source untouched and both the destination and its
-`.just_cache-partial-*` temporary file cleaned up.
+They check byte-for-byte equality of the copied file, that reading through the symlink
+still works and resolves to the cold copy, and that a source changing under the mover is
+refused before any bytes are written — leaving the source untouched with nothing at the
+destination and no `.just_cache-partial-*` temporary to clean up.
+
+One gap is admitted rather than papered over: a source that changes *during* a long copy
+has no automated test, because arranging that means racing a thread against the copy, and
+a test that passes only when the race is lost is worse than no test. That path's cleanup
+is a single `remove_file` beside the copy loop, and its comment says so.
 
 A sibling set of tests for metadata preservation and interruption/repair uses the same
 `tests/support` helpers and the same two environment variables.
@@ -323,12 +343,14 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
-| [`src/checksum.rs`](src/checksum.rs) | SHA-256, in-tree, so nothing is deleted without a content match. |
+| [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
 | [`src/main.rs`](src/main.rs) | The CLI (`sweep` and `audit` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
+| [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
+| [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
 
 ## Design
 
