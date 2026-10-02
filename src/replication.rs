@@ -38,6 +38,7 @@
 //! still marks them unknown.
 
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -161,6 +162,71 @@ impl ReplicationOutcome {
     }
 }
 
+/// # Test-only fault injection: `JUST_CACHE_FAULT`
+///
+/// The window the durability rule exists for — a destination that becomes unavailable
+/// *between* the copies of one sweep, or during the read-back of a copy that was just
+/// written — cannot be timed from a test process that drives the binary: no arrangement
+/// of the filesystem before `sweep` starts removes a disk in the middle of the loop, and
+/// a polling test would be a race, not a proof. This hook is the deterministic seam for
+/// exactly that window, and nothing else.
+///
+/// It is **off by default and inert in production**: it fires only when `JUST_CACHE_FAULT`
+/// is set in the environment of the process, which no production invocation sets, and an
+/// unset variable is read once per `replicate` call and changes no code path. It is not
+/// `#[cfg(test)]` because integration tests drive the *binary*, which is compiled without
+/// test cfg — that is the whole point: the failure must reach the real binary.
+///
+/// The value is `mechanism=N` where `N` is the 1-based ordinal of the copy:
+///
+/// * `unavailable-after=N` — once `N` copies have verified, every further destination
+///   root is reported as `Unavailable`, exactly as a root whose mount went away looks to
+///   [`replicate`]'s own `is_dir` check. This lands the fault *between* copy `N` and copy
+///   `N+1`, which is where the source-kept rule earns its keep.
+/// * `vanish-readback=N` — the `N`th freshly written copy is removed just before its
+///   read-back hash, so verification fails on bytes that were there a moment ago: the
+///   state "the copy was written but I cannot prove it" (#20), not a verified copy.
+/// * `corrupt-readback=N` — one byte of the `N`th fresh copy is flipped before the
+///   read-back, so verification fails on a same-length stranger of our own making.
+///
+/// A *set but unparseable* value panics rather than being ignored: a fault switch that
+/// silently no-ops would let a mistyped test pass green with no fault injected, which is
+/// precisely the fake coverage AGENTS.md forbids. Panic-on-garbage is safe in production
+/// because the variable is never set there (the same trade `JUST_CACHE_REQUIRE_SECOND_FS`
+/// makes for skipped tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultMode {
+    DestinationUnavailableAfter,
+    VanishReadback,
+    CorruptReadback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fault {
+    mode: FaultMode,
+    at: usize,
+}
+
+impl Fault {
+    fn from_env() -> Option<Fault> {
+        let spec = env::var("JUST_CACHE_FAULT").ok()?;
+        let (mechanism, ordinal) = spec
+            .split_once('=')
+            .unwrap_or_else(|| panic!("JUST_CACHE_FAULT `{spec}`: expected `mechanism=N`"));
+        let mode = match mechanism {
+            "unavailable-after" => FaultMode::DestinationUnavailableAfter,
+            "vanish-readback" => FaultMode::VanishReadback,
+            "corrupt-readback" => FaultMode::CorruptReadback,
+            other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
+        };
+        let at = ordinal
+            .parse()
+            .unwrap_or_else(|_| panic!("JUST_CACHE_FAULT `{spec}`: N must be an integer >= 1"));
+        assert!(at >= 1, "JUST_CACHE_FAULT `{spec}`: N is 1-based, so >= 1");
+        Some(Fault { mode, at })
+    }
+}
+
 /// Place a verified copy of `entry` on up to `floor` distinct destination roots.
 ///
 /// The source is never removed here — that is the caller's step, and it may only take it
@@ -201,10 +267,33 @@ pub fn replicate(
     };
     outcome.digest = Some(expected.to_hex().to_string());
 
+    // Read once per replication. When unset this is `None` and every check below is a
+    // branch on `None` — the hook is inert, not merely quiet.
+    let fault = Fault::from_env();
+    // Fresh copies attempted so far, in order — the ordinal `vanish-readback` and
+    // `corrupt-readback` count.
+    let mut fresh_copies = 0usize;
+
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for root in dest_roots {
         if outcome.verified >= floor {
             break;
+        }
+        // Fault seam, "between copy N and copy N+1": once the ordinal's copies have
+        // verified, the next root is treated exactly as one whose mount went away. The
+        // check sits *before* the real `is_dir`, so the injected failure is the same
+        // branch the real failure takes, just reached at a moment the filesystem cannot
+        // be arranged into from outside the process.
+        let injected_gone = fault.is_some_and(|fault| {
+            fault.mode == FaultMode::DestinationUnavailableAfter && outcome.verified >= fault.at
+        });
+        if injected_gone {
+            outcome.replicas.push(ReplicaPlacement {
+                dest_root: root.clone(),
+                path: root.join(&entry.relative),
+                status: ReplicaStatus::Unavailable,
+            });
+            continue;
         }
         // Distinct destinations only, keyed on the canonical root so `--dest /a --dest /a/`
         // cannot be mistaken for two disks.
@@ -236,7 +325,7 @@ pub fn replicate(
             continue;
         }
 
-        let status = place(entry, &dest, &expected);
+        let status = place(entry, &dest, &expected, fault.as_ref(), &mut fresh_copies);
         if status.is_valid() {
             outcome.verified += 1;
         }
@@ -251,7 +340,18 @@ pub fn replicate(
 }
 
 /// Copy or adopt one destination, then verify what is there.
-fn place(entry: &FileEntry, dest: &Path, expected: &blake3::Hash) -> ReplicaStatus {
+///
+/// `fresh_copies` counts the freshly-written copies this replication has attempted, so
+/// the read-back fault ordinals can name "the Nth copy I just wrote". It is bumped only
+/// on the write branch: an adopted pre-existing copy is not a copy this sweep made and
+/// there is no read-back of our own output to fault.
+fn place(
+    entry: &FileEntry,
+    dest: &Path,
+    expected: &blake3::Hash,
+    fault: Option<&Fault>,
+    fresh_copies: &mut usize,
+) -> ReplicaStatus {
     match fs::symlink_metadata(dest) {
         Ok(metadata) => {
             if metadata.is_dir() {
@@ -283,6 +383,29 @@ fn place(entry: &FileEntry, dest: &Path, expected: &blake3::Hash) -> ReplicaStat
             if let Err(err) = disk_management::copy_into_place(&entry.path, dest, entry.size) {
                 return ReplicaStatus::Failed(err.to_string());
             }
+            *fresh_copies += 1;
+            // Fault seam, "during the read-back of copy N": the copy has been renamed
+            // into place (it *is* the destination file the hash would read) and is then
+            // made unreadable-as-the-object, exactly the window between "bytes written"
+            // and "bytes vouched for" that no test can otherwise enter. The verification
+            // below runs unchanged and fails on its own: a vanished file is a read error
+            // (unknown, bytes left as-is by the mover's rules), a flipped byte is a
+            // digest mismatch (dropped, since the source is still present).
+            match fault {
+                Some(Fault {
+                    mode: FaultMode::VanishReadback,
+                    at,
+                }) if *at == *fresh_copies => {
+                    let _ = fs::remove_file(dest);
+                }
+                Some(Fault {
+                    mode: FaultMode::CorruptReadback,
+                    at,
+                }) if *at == *fresh_copies => {
+                    inject_single_byte_flip(dest);
+                }
+                _ => {}
+            }
             // A copy that merely *returned* is not a copy we can vouch for. Read it back
             // and compare digests before it is allowed to count toward the floor.
             match digest::file_digest(dest) {
@@ -307,6 +430,22 @@ fn place(entry: &FileEntry, dest: &Path, expected: &blake3::Hash) -> ReplicaStat
                 }
             }
         }
+    }
+}
+
+/// Flip one byte of the file at `dest` in place, for the `corrupt-readback` fault.
+///
+/// One byte, not the whole file: the point is a same-length stranger, which is the case
+/// a size check would wave through, and flipping the last byte leaves the length intact
+/// even when the copy is interrupted. A zero-byte copy has no byte to flip — but a
+/// zero-byte source would have failed the size comparison long before here, so that is
+/// unreachable for a file the mover would touch.
+fn inject_single_byte_flip(dest: &Path) {
+    if let Ok(mut bytes) = fs::read(dest) {
+        if let Some(last) = bytes.last_mut() {
+            *last ^= 0xff;
+        }
+        let _ = fs::write(dest, &bytes);
     }
 }
 

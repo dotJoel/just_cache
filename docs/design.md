@@ -425,6 +425,30 @@ unchanged (`0` clean / `1` findings / `2` usage).
 
 Still open, and honestly so:
 
+- **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears
+  mid-sweep is now deterministically testable.** A destination that becomes unavailable
+  *between* two copies of one sweep, or while a freshly written copy is being read back,
+  cannot be timed from a test process that only drives the binary — the old library tests
+  had to remove the root before the call, an arrangement production never produces. The
+  hook is the narrow seam for exactly that window, in `src/replication.rs`: with
+  `JUST_CACHE_FAULT=unavailable-after=N` in the child process's environment, once N copies
+  have verified every further destination root is reported exactly as an unmounted mount
+  is (`Unavailable`); `vanish-readback=N` removes the Nth freshly written copy just before
+  its read-back hash, so verification fails on bytes that were there a moment ago; and
+  `corrupt-readback=N` flips one byte of the Nth fresh copy, so verification fails on a
+  same-length stranger of the sweep's own making. It is test-only by construction: unset —
+  as production always leaves it — the variable is read once per `replicate` and every
+  check is a branch on `None`, and `tests/fault_injection.rs` asserts the inert case
+  against the hook-carrying binary itself. A value that is set but unparseable panics,
+  deliberately: a fault switch that silently no-ops would let a mistyped test pass green
+  with nothing injected. What the tests prove through the real binary: the source is kept
+  below the floor, the report names the disk, no `.just_cache-partial-*` file survives,
+  the catalog is never told the unverifiable copy is good (`locate` lists only the copy
+  that verified), and a later sweep heals what a sweep can heal. One failure mode remains
+  untestable end-to-end and is said so rather than faked: a destination *root* that is
+  gone makes `audit`/`catalog sync` a usage error by design (invariant 1 — a root is never
+  recreated), so a truly unmounted tier is verified by restoring the mount, not by a
+  command that invents a directory.
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
   N distinct `--dest` roots before it retires the source, and `catalog sync --copies N`
   records the floor per tier and reports objects below it as `under-replicated` (a lost
