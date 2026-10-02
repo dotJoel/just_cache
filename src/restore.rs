@@ -106,6 +106,11 @@ pub enum RestoreError {
     Stat { path: PathBuf, error: io::Error },
 
     #[error(
+        "refusing to write {path}: something is already there, and whether it is the object is the catalog's answer, not this function's"
+    )]
+    DestinationExists { path: PathBuf },
+
+    #[error(
         "restored {path} but did NOT remove the cold copy {copy}: re-checking the restored \
          file failed ({detail})"
     )]
@@ -522,6 +527,82 @@ pub fn replace_from_verified(
         let _ = fs::remove_file(&partial);
         RestoreError::Copy {
             path: corrupt.to_path_buf(),
+            from: partial.clone(),
+            error,
+        }
+    })?;
+
+    Ok(good_metadata.len())
+}
+
+/// Build a verified copy of `good` at a destination that is currently *absent*.
+///
+/// This is the create half of [`replace_from_verified`]'s machinery, and it is what the
+/// reconcile pass (`crate::reconcile`) uses to rebuild a replica a re-added disk is
+/// missing. The bytes are written to a private `.just_cache-partial-*` sibling of the
+/// destination, hashed against `expected` (the object's recorded checksum) *there*, and
+/// only a verified copy is renamed into place — so a failure leaves the location absent
+/// rather than holding bytes nobody can vouch for. That is deliberately stronger than
+/// "write then check then remove a bad copy": nothing unverified ever gets a published
+/// name, so the reconcile pass never has to delete even its own output.
+///
+/// It refuses a destination that already exists, of any kind. Whether an existing file
+/// there is the object (adopt it) or a stranger (refuse it) is a catalog question the
+/// caller answers by hashing it; this function must not clobber either way. The caller
+/// also owns creating the nested directories under an existing destination root
+/// (invariant 1 keeps this away from creating the root itself).
+pub fn build_verified_copy(
+    good: &Path,
+    dest: &Path,
+    expected: &blake3::Hash,
+) -> Result<u64, RestoreError> {
+    if fs::symlink_metadata(dest).is_ok() {
+        return Err(RestoreError::DestinationExists {
+            path: dest.to_path_buf(),
+        });
+    }
+
+    let good_metadata = fs::metadata(good).map_err(|error| RestoreError::Stat {
+        path: good.to_path_buf(),
+        error,
+    })?;
+    if !good_metadata.is_file() {
+        return Err(RestoreError::Stat {
+            path: good.to_path_buf(),
+            error: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the rebuild source is not a regular file",
+            ),
+        });
+    }
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let partial = disk_management::partial_sibling(parent);
+    copy_to_partial(dest, good, &partial, good_metadata.len())?;
+
+    let found_digest = digest::file_digest(&partial).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        RestoreError::Stat {
+            path: partial.clone(),
+            error,
+        }
+    })?;
+    if found_digest != *expected {
+        let _ = fs::remove_file(&partial);
+        return Err(RestoreError::VerifyMismatch {
+            path: dest.to_path_buf(),
+            expected_digest: expected.to_hex().to_string(),
+            found_digest: found_digest.to_hex().to_string(),
+        });
+    }
+
+    // The partial has a private name, so this rename is what first publishes the bytes —
+    // and only now, after the read-back, does that happen. Same directory, so it stays on
+    // one filesystem and cannot become a half-file.
+    fs::rename(&partial, dest).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        RestoreError::Copy {
+            path: dest.to_path_buf(),
             from: partial.clone(),
             error,
         }

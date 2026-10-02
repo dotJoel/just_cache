@@ -11,6 +11,7 @@ pub mod file_movement;
 pub mod journal;
 pub mod locate;
 pub mod opened;
+pub mod reconcile;
 pub mod replication;
 pub mod restore;
 pub mod scope;
@@ -40,7 +41,12 @@ pub use file_movement::{
 };
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
+pub use reconcile::{
+    reconcile, ReconcileError, ReconcileOutcome, ReconcileRecord, ReconcileReport, ReconcileRequest,
+};
 pub use replication::{replicate, ReplicaPlacement, ReplicaStatus, ReplicationOutcome};
-pub use restore::{replace_from_verified, RestoreError, RestoreOutcome, RestoreRequest};
+pub use restore::{
+    build_verified_copy, replace_from_verified, RestoreError, RestoreOutcome, RestoreRequest,
+};
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
 pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};

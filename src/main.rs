@@ -23,6 +23,7 @@ use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, Usag
 use just_cache::journal::{self, Journal};
 use just_cache::locate::{self, LocateRequest};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
+use just_cache::reconcile;
 use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
 use just_cache::scrub::{self, ScrubRequest};
@@ -76,6 +77,9 @@ enum Command {
     Restore(RestoreArgs),
     /// Read every stored copy back and verify it against the catalog, repairing rot.
     Scrub(ScrubArgs),
+    /// Rebuild copies that are missing from a destination root (a disk re-added after a
+    /// sweep), from a surviving sibling that verifies against the recorded checksum.
+    Reconcile(ReconcileArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -420,6 +424,27 @@ struct ScrubArgs {
     quiet: bool,
 }
 
+/// Everything `reconcile` needs. Like `scrub` it names no `--watch`/`--dest`: the catalog
+/// holds every tier root and the floor recorded per tier, which is the whole point of
+/// having made the catalog the source of truth.
+#[derive(Debug, Args)]
+struct ReconcileArgs {
+    /// The catalog file to reconcile. It must already exist: the object identity — the
+    /// recorded checksum a rebuilt copy is proved against — lives there, and a catalog
+    /// conjured empty at rebuild time would have nothing to rebuild *from*.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+
+    /// Report what would be rebuilt, changing nothing: no copy is written and no row is
+    /// recorded (or damage-marked), so a dry run is safe to repeat.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print only problems.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -431,6 +456,7 @@ fn main() -> ExitCode {
         Some(Command::Locate(args)) => run_locate(args),
         Some(Command::Restore(args)) => run_restore(args),
         Some(Command::Scrub(args)) => run_scrub(args),
+        Some(Command::Reconcile(args)) => run_reconcile(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -955,6 +981,58 @@ fn run_scrub(args: ScrubArgs) -> ExitCode {
         dry_run: args.dry_run,
     };
     let report = match scrub::scrub(&request) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if args.quiet {
+        for line in report.finding_lines() {
+            println!("{line}");
+        }
+    } else {
+        for line in report.summary_lines() {
+            println!("{line}");
+        }
+    }
+
+    if report.has_findings() {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Rebuild the copies a re-added disk is missing, from a sibling that verifies.
+///
+/// Exit contract: `0` when every recorded floor was already met (nothing to rebuild),
+/// `1` when anything was rebuilt/adopted or could not be (a disk being out is evidence the
+/// operator has to see, exactly as a scrub that repaired something still exits `1`), `2`
+/// on a bad invocation — a missing catalog file is a usage error, because the recorded
+/// checksum a rebuild is proved against has to come from somewhere.
+fn run_reconcile(args: ReconcileArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let request = reconcile::ReconcileRequest {
+        catalog: &catalog,
+        dry_run: args.dry_run,
+    };
+    let report = match reconcile::reconcile(&request) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("just_cache: {err}");
