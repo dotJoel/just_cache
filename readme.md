@@ -342,8 +342,6 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
-<<<<<<< HEAD
-=======
 ### When a catalog exists
 
 If a catalog is present — `--catalog <FILE>`, or the default
@@ -370,8 +368,6 @@ resync and touches neither the tree nor the rows — the catalog may record a mo
 sees as unfinished, and guessing is how a repair deletes the wrong thing. Exit codes are
 unchanged (`0` clean, `1` findings, `2` bad invocation).
 
-<<<<<<< HEAD
->>>>>>> f847712 (docs: record the catalog-backed audit and its named gaps)
 ## The catalog
 
 `audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched

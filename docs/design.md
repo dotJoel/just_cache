@@ -377,7 +377,6 @@ only removed when another location still holds the object (a normal offload, whe
 stale hot row is replaced by the cold one) or when no name references the object: a name
 is never stranded pointing at an object with nowhere to live.
 
-<<<<<<< HEAD
 Closed in P1 by `just_cache locate` (#18): finding an object is now a catalog query, not a
 walk. `locate <QUERY> --catalog <FILE>` reads the `name` table for a namespace path and
 searches `object` by hex-id prefix for a content digest (a query of at least eight hex
