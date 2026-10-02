@@ -31,6 +31,10 @@ Every option is a flag; there is no config file and nothing is hardcoded.
 |---|---|---|
 | `--watch <DIR>` | *required* | Tree to watch. Walked recursively. |
 | `--dest <DIR>` | *required* | Cold root, fastest tier first. Repeat for each slower disk. Must already exist. |
+| `--include <GLOB>` | *(whole tree)* | Only manage paths matching this glob. Repeatable. |
+| `--exclude <GLOB>` | *(nothing)* | Never manage paths matching this glob. Repeatable; wins over `--include`. |
+| `--min-size <SIZE>` | `0` | Ignore files smaller than this (e.g. `1MiB`). |
+| `--max-size <SIZE>` | *(no limit)* | Ignore files larger than this (e.g. `500GiB`). |
 | `--min-idle-days <DAYS>` | `30` | Only touch files last used at least this long ago. |
 | `--min-observed-accesses <N>` | `1` | Pin a file once it has been read `N` times *during this run*; `0` disables the pin. |
 | `--limit <N>` | `10` | Most files moved per destination per sweep. |
@@ -40,6 +44,40 @@ Every option is a flag; there is no config file and nothing is hardcoded.
 | `--dry-run` | | Report the plan, touch nothing. |
 | `-v` / `--verbose` | | Show every file considered, including why it was left alone. |
 | `-q` / `--quiet` | | Only problems. |
+
+### Scope: what this tool is allowed to touch
+
+Nothing is moved unless the scope allows it. Scope is the outermost gate — checked
+before usage, size or any policy consideration — so a file that is out of scope can
+never be moved by a rule that later grows more eager. It is also checked twice: once
+when candidates are chosen, and again immediately before any bytes move.
+
+```sh
+just_cache \
+  --watch /mnt/cache \
+  --dest /mnt/cold \
+  --include 'media/**' \
+  --include 'scratch/**' \
+  --exclude 'node_modules' \
+  --exclude '*.part' \
+  --min-size 1MiB \
+  --max-size 500GiB
+```
+
+Patterns match a file's path **relative to `--watch`**, and also match its ancestor
+directories — so including a directory includes everything under it, and excluding one
+drops its contents:
+
+- `--include 'media/**'` — the subtree, nothing else.
+- `--exclude 'node_modules'` — a bare name with no separator or wildcard is expanded to
+  match at any depth, because that is what it reads as. Same for `--exclude '*.part'`.
+- `--exclude 'media/.git/**'` — fully explicit when you want to be.
+
+Size units are binary, with or without the trailing `B`: `4K`, `1MiB`, `2G`, `1TiB`.
+Bounds are inclusive — a file exactly at `--min-size` or `--max-size` qualifies. A file
+that is both out of scope and too small reports the outermost reason (out of scope).
+Out-of-scope files are not even tracked, so a long-running sweep does not carry them in
+memory.
 
 **Destinations are never created.** A missing `--dest` is a startup error, not a
 `mkdir`: if a slow disk is unmounted, silently creating its mount point would have the
@@ -52,6 +90,7 @@ next when a tier is out of room (or has hit `--limit`).
 
 A file is moved when **all** of these hold:
 
+0. it is in scope (§above): inside `--include`, not `--exclude`, within the size window;
 1. it is not already a symlink (already migrated);
 2. it is not empty;
 3. nothing has read it during this run (the `--min-observed-accesses` pin);
@@ -136,6 +175,7 @@ runs, full tiers).
 | Path | Contents |
 |---|---|
 | [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
+| [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
