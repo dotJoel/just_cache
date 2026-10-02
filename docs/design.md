@@ -405,6 +405,22 @@ Still open, and honestly so:
 - **No read-back verification of freshly copied bytes.** A torn copy is caught by the
   short-copy and source-changed guards, not by re-reading what was written: hashing a
   sparse file means materializing its holes, and re-reading a 40 GB copy doubles I/O.
+- **Restore has no catalog digest to check a cold copy against.** `restore` reads its own
+  write back and hashes it before the atomic swap, so a torn copy cannot reach the path,
+  but with no recorded digest there is nothing independent to compare a *pre-existing*
+  cold copy to: a copy that was already corrupt would be restored faithfully. The catalog
+  (issue #16) is what closes this; until then `restore` also refuses to overwrite a hot
+  regular file whose content differs from the cold copy (checked by digest, not size), so
+  the one thing it can compare is never ignored.
+- **`locate` is not built.** Finding an object by path or digest across tiers is a catalog
+  question (§3), and it is issue #16's to answer; `restore` finds a copy by filesystem
+  state alone (the symlink, or the mirrored relative path under each `--dest`) and refuses
+  when the candidates disagree rather than guessing a schema the catalog has not defined.
+- **A default restore leaves a `duplicate` for `audit`.** Because the cold copy stays
+  unless `--remove-copy` is given, the tree ends with a regular file *and* its cold copy —
+  the exact state `audit` calls `duplicate`. That is the requested behavior (the copy stays
+  by default), but a user restoring many files without `--remove-copy` should expect the
+  duplicates, not be surprised by them.
 - **The journal is one file per watched root**, not part of the catalog. Two sweeps of
   different trees cannot see each other's in-flight moves, which is correct today and
   a thing to revisit when the catalog exists.

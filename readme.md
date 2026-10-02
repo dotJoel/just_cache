@@ -19,8 +19,12 @@ just_cache \
 That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
 entries keep working); `just_cache sweep ...` is the explicit form,
 [`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
+<<<<<<< HEAD
 still agree, and [`just_cache explain ...`](#explaining-one-path) answers why one path is
 where it is.
+still agree, and [`just_cache restore ...`](#restoring-a-file) brings an offloaded file
+back.
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 
 ## Why
 
@@ -313,6 +317,7 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
+<<<<<<< HEAD
 ## The catalog
 
 `audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
@@ -347,6 +352,56 @@ different bytes, or a location's file vanished or changed, the difference is pri
 the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
 bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
 the tree is worse than none.
+## Restoring a file
+
+`restore` is the other half of the loop: it brings the bytes of an offloaded object back
+to its hot path, verified, and collapses the symlink into a real file.
+
+```sh
+just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media
+```
+
+The cold copy is found by *state*, because there is no catalog yet: if the path is a
+symlink that resolves, its target is the copy the mover left; otherwise — a broken link,
+or a name that vanished — the mirrored relative path under each `--dest`, in order. If
+several candidates hold **different** bytes for one name, restore refuses and names them
+rather than guessing which tier is right.
+
+What it guarantees:
+
+- **Verify before it goes live.** The bytes are copied into a `.just_cache-partial-*`
+  sibling *in the hot directory*, fsynced, read back and hashed (BLAKE3), and only then
+  renamed into place. The rename is same-directory and atomic, so a reader sees the old
+  state or the whole file — never a truncated one, and a crash cannot leave a torn file at
+  the path.
+- **The cold copy stays by default.** `--remove-copy` drops it — but only *after* the
+  restored copy has been verified (`docs/design.md` §6, verify-before-delete). A default
+  restore therefore leaves a regular file beside its cold copy, which `audit` reports as a
+  `duplicate`; that is the honest state of the tree, not a bug.
+- **It is idempotent.** Restoring a path that already holds the right bytes is a no-op
+  that exits `0`.
+- **It never clobbers data.** A regular file at the path is compared to the cold copy: if
+  the bytes are identical, nothing changes; if they differ — even at the same size, which a
+  length-only check would miss — restore **refuses** and leaves both copies untouched. The
+  hot file may be newer than the copy, and silently overwriting it is the one outcome this
+  command must never produce.
+
+Exit codes: `0` restored or already present, `1` refused or failed (no copy found,
+mismatch, unverifiable), `2` bad invocation (missing directory, path outside `--watch`).
+
+```sh
+# free the cold tier once the bytes are safely back home
+just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
+  --watch /mnt/cache/media --dest /mnt/disk-slow/media --remove-copy
+```
+
+A named gap: with no catalog there is no recorded digest to check a cold copy against
+*before* copying it, so a copy that was already corrupt would be restored faithfully. The
+read-back catches a torn copy; only the catalog (issue #16) can catch a corrupt one, and
+`docs/design.md` §9 says so.
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 
 ## Running it continuously
 
@@ -374,8 +429,12 @@ and the size window), the guards (a real second process holding a real descripto
 hardlinked pairs), metadata and sparseness across a real mount point, journal recovery
 (each crash state, plus the CLI against a damaged journal), audit (every
 classification, the checksum-guarded repair, and the exit-code contract cron sees), and
+<<<<<<< HEAD
 explain (the four-stage ordering, a real holding process named by pid, the migrated and
 missing cases, and the exit-code contract through the binary — `--json` included).
+restore (the round trip, idempotence, repairing a broken symlink, refusing a same-size
+stranger, `--remove-copy`, and a genuine cross-device restore).
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 
 A few of these drive the actual binary rather than the library, because the promises that
 matter — exit codes, recovery messages, refusing to sweep with an unreadable journal —
@@ -431,14 +490,18 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
+<<<<<<< HEAD
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog` and `explain` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain` and `restore` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
+<<<<<<< HEAD
 | [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
+| [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
+>>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
