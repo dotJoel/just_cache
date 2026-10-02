@@ -6,10 +6,20 @@ description = "Move cold, rarely used files onto slower disks, leaving symlinks 
 license = "MIT"
 
 [dependencies]
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+filetime = "0.2"
 fs4 = "0.13"
 globset = "0.4"
 thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The Unix metadata work (ownership, xattrs, SEEK_DATA/SEEK_HOLE) goes through
+# rustix rather than raw libc, so the move layer stays free of `unsafe`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1", features = ["fs"] }
