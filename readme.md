@@ -16,6 +16,11 @@ just_cache \
   --limit 25
 ```
 
+That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
+entries keep working); `just_cache sweep ...` is the explicit form, and
+[`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
+still agree.
+
 ## Why
 
 Caches, media libraries and build directories fill up with files nobody has opened in
@@ -172,6 +177,52 @@ pass 1: 3 files scanned, 3 tracked, 1 moved, 0 linked, 0 waiting for room, 1 ski
 `/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
 episode.
 
+## Auditing consistency
+
+The mover leaves one of a few states behind, and they can drift apart: a crash between
+"copy landed" and "source removed" leaves a duplicate, a deleted cold disk leaves a
+dangling symlink, and so on. `audit` walks both the watched tree and every cold tier
+(read-only) and classifies each relative path:
+
+```sh
+just_cache audit \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media
+```
+
+| Classification | The two sides of the path |
+|---|---|
+| `healthy` | a plain file with no cold copy, or a symlink resolving under a `--dest` |
+| `duplicate` | a real file at the source path **and** a copy on a cold tier |
+| `orphaned-copy` | cold bytes exist but the name at the source path is gone |
+| `dangling-symlink` | the symlink at the source path points at nothing |
+| `unexpected-target` | the symlink resolves, but outside every `--dest` |
+
+The readable run prints counts plus the first `--examples` findings; `--json` prints a
+stable machine-readable document with every finding. **The exit code is `1` whenever
+findings exist**, so cron can alert without parsing text (`0` clean, `2` bad invocation
+or unreadable tree).
+
+```sh
+# alert on any drift, without parsing anything
+just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
+```
+
+`--repair` fixes what can be fixed without guessing:
+
+- **duplicate** — the two copies are hashed (SHA-256); only on a match is the source
+  file removed and replaced by the symlink the mover intended. A mismatch is refused
+  and both copies are left untouched.
+- **dangling-symlink** — the link is re-pointed at the cold copy at the mirrored path,
+  if one exists. No bytes are deleted.
+- **unexpected-target** and **orphaned-copy** are reported, never silently changed:
+  the target of the first still resolves, and the second needs a human to decide
+  between restoring the name and reclaiming the cold bytes.
+
+With `--repair` the exit code is `0` only when every finding was resolved, so a cron
+job that keeps the tree healthy stays quiet.
+
 ## Running it continuously
 
 ```sh
@@ -192,8 +243,9 @@ cargo clippy --all-targets -- -D warnings
 
 Tests cover the walk (nested directories, symlink loops), the move (nested layout,
 existing symlinks, resumed moves, size conflicts, same-named files in sibling
-directories), and the policy (idle thresholds, oldest-first ordering, access pins, dry
-runs, full tiers).
+directories), the policy (idle thresholds, oldest-first ordering, access pins, dry
+runs, full tiers), and audit (every classification, the checksum-guarded repair, and
+the exit-code contract the CLI exposes to cron).
 
 ### Testing the cross-device move
 
@@ -237,10 +289,13 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
-| [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
+| [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
+| [`src/checksum.rs`](src/checksum.rs) | SHA-256, in-tree, so nothing is deleted without a content match. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep` and `audit` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
+| [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
 
 ## Design
 
