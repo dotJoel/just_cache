@@ -2,15 +2,21 @@
 //! checksum-based adoption, exercised against a real second filesystem so the
 //! `EXDEV` path the mover takes in production actually runs.
 //!
-//! The sparse and xattr checks skip cleanly when the host offers no second
-//! filesystem, or offers one that cannot represent holes/attributes — but on any
-//! Linux box with `/tmp` on a different mount than `$TMPDIR` they run for real.
+//! The second filesystem comes from the shared `tests/support` helper, so there is one
+//! definition of what counts as one: `JUST_CACHE_TEST_SECOND_FS`, verified to be on a
+//! different device than the test temp dir. Unset means these tests skip with a note;
+//! `JUST_CACHE_REQUIRE_SECOND_FS=1` — which CI sets after mounting a tmpfs — means they
+//! are *required*, so a mount that silently stopped working fails the job instead of
+//! quietly testing nothing. The sparse and xattr checks still skip on a host whose
+//! filesystems cannot represent holes or attributes.
 #![cfg(unix)]
+
+mod support;
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use just_cache::disk_management::{self, DiskError, MoveOutcome};
@@ -18,32 +24,16 @@ use just_cache::disk_management::{self, DiskError, MoveOutcome};
 /// Two temporary directories that are guaranteed to be on *different* filesystems,
 /// or `None` when the host only has one. A pair is required to force `fs::rename` to
 /// fail with `EXDEV` and so reach the copy path at all.
+///
+/// Delegates to `tests/support` rather than guessing: the helper honours
+/// `JUST_CACHE_REQUIRE_SECOND_FS`, so these tests stop being optional the moment CI is
+/// what runs them. (This file used to scan `$TMPDIR`/`/tmp`/`/dev/shm` itself, which
+/// meant a broken CI mount would have skipped these assertions in silence.)
 fn cross_device_pair() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
-    let candidates: Vec<PathBuf> = vec![
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/dev/shm"),
-    ];
-
-    for from in &candidates {
-        for to in &candidates {
-            if from == to {
-                continue;
-            }
-            let Ok(first) = tempfile::Builder::new().prefix("jc-a-").tempdir_in(from) else {
-                continue;
-            };
-            let Ok(second) = tempfile::Builder::new().prefix("jc-b-").tempdir_in(to) else {
-                continue;
-            };
-            let first_dev = fs::metadata(first.path()).map(|m| m.dev()).ok();
-            let second_dev = fs::metadata(second.path()).map(|m| m.dev()).ok();
-            if first_dev.is_some() && first_dev != second_dev {
-                return Some((first, second));
-            }
-        }
-    }
-    None
+    let second = support::second_fs()?;
+    let hot = tempfile::Builder::new().prefix("jc-hot-").tempdir().ok()?;
+    let cold = support::work_dir(&second, "jc-cold-");
+    Some((hot, cold))
 }
 
 fn write_sparse(path: &Path, apparent: u64, marker: &[u8]) -> std::io::Result<()> {
