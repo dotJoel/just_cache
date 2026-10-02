@@ -140,6 +140,15 @@ runs, full tiers).
 | [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 
+## Design
+
+This tool is one piece of a larger idea. [`docs/design.md`](docs/design.md) sketches it:
+one namespace over every storage tier you own — SSD, spinning disks, a LAN peer, cloud
+object storage, an offline disk in a drawer — with a fast cache overlay (RAM) in front
+of them, placement driven by observed use, and promotion on re-access, in the spirit of
+S3 storage classes. The mover in `src/` is the symlink namespace provider and the
+hot→warm driver of that design, not the whole of it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
