@@ -96,6 +96,7 @@ worth reading before editing the code around them.
 |---|---|
 | `src/main.rs` | CLI (clap subcommands), the sweep loop, exit codes. |
 | `src/disk_management.rs` | The walk, the move, symlink creation, metadata/sparseness, free space. |
+| `src/faults.rs` | The test-only `JUST_CACHE_FAULT` seam: parsing, and the one-shot mid-copy claim. Inert unless the variable is set. |
 | `src/file_movement.rs` | `UsageTracker`, the policy that selects candidates, the report types. |
 | `src/scope.rs` | Eligibility: include/exclude globs, size window, size parsing. |
 | `src/opened.rs` | Live state: open descriptors (one `/proc` snapshot per sweep) and hard links. |
