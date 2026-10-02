@@ -377,6 +377,19 @@ only removed when another location still holds the object (a normal offload, whe
 stale hot row is replaced by the cold one) or when no name references the object: a name
 is never stranded pointing at an object with nowhere to live.
 
+Closed in P1 by `just_cache locate` (#18): finding an object is now a catalog query, not a
+walk. `locate <QUERY> --catalog <FILE>` reads the `name` table for a namespace path and
+searches `object` by hex-id prefix for a content digest (a query of at least eight hex
+characters is read as a digest; anything else is a path, and the reading chosen is reported
+in `--json` as `kind`). The answer names every copy and its tier, which copy is the tier of
+record, and the object's state (`present` / `offloaded` / `restoring`), and it stays
+answerable when a tier is not mounted because no byte is read. Exit codes are the contract:
+`0` found, `1` nothing found, `2` a missing or unreadable catalog. Multiple prefix matches
+are all listed, never guessed down to one. Alongside it, `explain` now consults a catalog
+when one exists (the default beside the watch root, or `--catalog`) through the single
+`catalog_answer` seam and reports a catalog/filesystem disagreement instead of resolving it
+silently; with no catalog its answers are exactly what they were before.
+
 Still open, and honestly so:
 
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
@@ -438,10 +451,24 @@ Still open, and honestly so:
   (issue #16) is what closes this; until then `restore` also refuses to overwrite a hot
   regular file whose content differs from the cold copy (checked by digest, not size), so
   the one thing it can compare is never ignored.
-- **`locate` is not built.** Finding an object by path or digest across tiers is a catalog
-  question (§3), and it is issue #16's to answer; `restore` finds a copy by filesystem
-  state alone (the symlink, or the mirrored relative path under each `--dest`) and refuses
-  when the candidates disagree rather than guessing a schema the catalog has not defined.
+- **A >8-character prefix collision is unit-tested, not end-to-end.** `locate` lists every
+  match (a library test writes two objects sharing a prefix), but forcing two real BLAKE3
+  hashes to share eight hex characters needs an impossible amount of data, so the
+  through-the-binary test exercises a unique prefix only.
+- **A path that is also eight hex characters is read as a digest.** Namespace paths and
+  digest prefixes are disjoint in practice, but not provably so; `locate` reports which
+  reading it chose (`kind` in `--json`) rather than hiding the ambiguity. A future flag
+  could force the reading.
+- **`locate` reports an offline copy's state; it cannot mount a volume.** State is
+  `offloaded`/`restoring` and the summary says the tier must be mounted to read, but
+  mounting and streaming recall are the FUSE provider's job (P2/P3), so the `volume` table
+  stays the only place a drawer ID could live and `locate` never prints one.
+- **`explain`'s verdict still comes from the filesystem.** The catalog is consulted for
+  existence, state, primary location, and lifecycle (through the one `catalog_answer` seam),
+  and a disagreement is reported, but the would-move answer is the one the mover would
+  compute from the tree. That is deliberate — the explanation cannot drift from the mover —
+  so a catalog-only fact (an offline tier the filesystem cannot see) informs the report but
+  not the verdict.
 - **A default restore leaves a `duplicate` for `audit`.** Because the cold copy stays
   unless `--remove-copy` is given, the tree ends with a regular file *and* its cold copy —
   the exact state `audit` calls `duplicate`. That is the requested behavior (the copy stays
@@ -456,16 +483,14 @@ Still open, and honestly so:
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
 - Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
-- **`explain` never moved files and reads the filesystem, not the catalog.** The command
-  is the first half of the P1 item: it evaluates scope, guards and policy in the mover's
-  order and reports the outermost reason, but its "where does this live / when was it last
-  accessed" answers come from the filesystem. `src/explain.rs` carries a single commented
-  seam (`catalog_answer`) that returns `None` until the catalog exists; it names the one
-  query the catalog must provide (existence, `state`, primary `location`, `last_access`
-  and its provenance, `accesses`, `pinned_until`, `rule`). A disagreement between the two
-  sources is reported, not resolved silently — the branch exists and is tested through an
-  injected answer, but no catalog is read yet, because its schema belongs to the catalog
-  issue and guessing it would collide with the build happening in parallel.
+- **`explain` never moved files, and now reads the catalog when one exists.** The command
+  evaluates scope, guards and policy in the mover's order and reports the outermost reason,
+  and its "where does this live / when was it last accessed" answers are cross-checked
+  against the catalog (`catalog_answer`). The catalog is consulted, not obeyed: the verdict
+  is still the filesystem's, because that is the source the mover acts on. A disagreement
+  between the two sources is reported, not resolved silently — the disagreement path is
+  tested both through an injected answer and end to end (a tree hand-edited after `catalog
+  sync`).
 - **`explain` answers for one path, so it cannot account for the per-sweep `--limit`.**
   A file can be in scope, unguarded and cold and still miss its slot to older files in a
   real sweep over the tree. The command says what the policy decides for the path, not
@@ -486,6 +511,9 @@ Still open, and honestly so:
   is out of scope (§6.1 of the issue).
 - Block-level tiering (dm-cache/bcache/L2ARC): different layer, no per-file policy;
   out of scope but composes (a block cache in front of this is fine).
+- Mounting an offline volume or streaming recall from an object store: `locate` reports the
+  state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
+  volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
 - Multi-user quotas/permissions: single-trust-domain system.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.
