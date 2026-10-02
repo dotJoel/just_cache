@@ -102,6 +102,7 @@ worth reading before editing the code around them.
 | `src/journal.rs` | The intent record and recovery from an interrupted move. |
 | `src/catalog.rs` | The SQLite catalog: content-addressed locations, names, and the transactional `sync`. |
 | `src/scrub.rs` | Reading every stored copy back, repairing rot from a verified sibling, and marking what cannot be repaired. |
+| `src/reconcile.rs` | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
 | `src/audit.rs` | Audit from the catalog (one namespace pass) or, without one, the walk-based fallback; the guarded `--repair`. |
 | `src/digest.rs` | BLAKE3, streamed. One digest for the whole tool. |
 | `tests/` | Integration tests against real temporary trees; `tests/support/` for the shared second-filesystem helpers. |

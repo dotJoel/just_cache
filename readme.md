@@ -181,6 +181,41 @@ destinations. With a floor of 2 and one other disk, the second copy lands on tha
 disk **on the same host** — this survives a disk failure, not the loss of the machine.
 Off-host copies are a later phase.
 
+## Reconciling a re-added disk
+
+A disk that is unmounted while a sweep runs misses its copies: the sweep places the file
+only on the disks that are present, and the object stays below its floor (`catalog sync`
+reports it as `under-replicated`, `audit --copies N` as `replica-lost`). When the disk
+comes back, `reconcile` is what fills it in:
+
+```sh
+# see what would be rebuilt before anything is written
+just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite --dry-run
+
+# rebuild every missing copy a surviving sibling can supply
+just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+What it guarantees:
+
+- **The source is proved, not assumed.** A sibling is used only after its bytes are hashed
+  and compared to the object's recorded checksum — a copy that merely matches on size is
+  not a source, and one that hashes to something else is marked damaged and skipped.
+- **The rebuilt copy is verified before it is recorded.** The bytes go to a private
+  `.just_cache-partial-*` sibling, are read back and hashed there, and only a verified
+  copy is renamed into place; only then is the location recorded, with the real checksum.
+  A failed rebuild leaves the location absent, never holding unknown bytes.
+- **Nothing is deleted.** Not the source of a rebuild, not a copy restored by hand that
+  already sits where the copy belongs (that one is hashed and *adopted* instead), not a
+  file reconcile cannot vouch for.
+- **A destination root is never created.** A disk that is still unmounted is reported
+  (`tier not mounted`), not silently turned into a directory on the wrong filesystem.
+
+Exit codes: `0` every recorded floor already met, `1` something was rebuilt/adopted or
+could not be (a disk being out is evidence cron should see once), `2` bad invocation — a
+missing catalog file, since the recorded checksum a rebuild is proved against lives there.
+Like `scrub`, it runs on demand; deciding *when* to reconcile is P2.
+
 ## How a file is chosen
 
 A file is moved when **all** of these hold:
@@ -646,9 +681,10 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
 | [`src/scrub.rs`](src/scrub.rs) | Reading every stored copy back, repairing rot from a verified sibling, marking what cannot be repaired. |
+| [`src/reconcile.rs`](src/reconcile.rs) | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `restore` and `scrub` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub` and `reconcile` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
@@ -656,6 +692,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
 | [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
 | [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
+| [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |

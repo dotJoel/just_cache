@@ -375,6 +375,33 @@ impl ScrubSummary {
     }
 }
 
+/// One object a reconcile pass (`just_cache reconcile`, issue #24) considers, with every
+/// location recorded for it and which of those carry a damage mark.
+///
+/// This is not [`ScrubTarget`]'s job: a reconcile decides *where a missing copy should
+/// go* — which needs the object's recorded checksum, every location row, and which
+/// siblings a scrub has already given up on — and it never reads bytes, so it carries no
+/// scrub-state either. The checksum is what makes a rebuild safe at all: without it there
+/// is no way to tell a valid sibling from a same-size stranger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileObject {
+    /// The object id, raw BLAKE3 bytes.
+    pub object: Vec<u8>,
+    /// The recorded checksum a rebuilt copy must hash to. Equal to `object` today
+    /// (identity *is* the hash at ingest), kept separate so a rebuild proves the bytes
+    /// against what the catalog *recorded*, not against a tautology.
+    pub checksum: Vec<u8>,
+    pub size: u64,
+    /// `present` | `offloaded` | `restoring`.
+    pub state: String,
+    /// Every location row, primary first.
+    pub locations: Vec<LocationRecord>,
+    /// Locations a scrub marked damaged: `(tier, storage_key)`. A rebuild may still use
+    /// such a sibling, but only after re-reading it — which the pass always does — and a
+    /// sibling that fails that re-read must never be copied from.
+    pub damaged: BTreeSet<(String, String)>,
+}
+
 /// The result of one sync.
 #[derive(Debug)]
 pub struct SyncReport {
@@ -1031,6 +1058,84 @@ impl Catalog {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Every object with the state, checksum, locations and damage marks a reconcile pass
+    /// needs, in id order.
+    ///
+    /// One query each for objects, locations and damage, joined in Rust: the whole point
+    /// of a rebuild is that a missing copy has no row of its own to read, so everything
+    /// the pass can know must come from the objects that *do* have rows.
+    pub fn reconcile_objects(&self) -> Result<Vec<ReconcileObject>, CatalogError> {
+        let mut objects: BTreeMap<ObjectId, ReconcileObject> = BTreeMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, size, checksum, state FROM object ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, size, checksum, state) = row?;
+            objects.insert(
+                id.clone(),
+                ReconcileObject {
+                    object: id,
+                    checksum,
+                    size,
+                    state,
+                    locations: Vec::new(),
+                    damaged: BTreeSet::new(),
+                },
+            );
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT object_id, tier, storage_key, is_primary, verified, checksum
+             FROM location ORDER BY is_primary DESC, tier, storage_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                LocationRecord {
+                    tier: row.get(1)?,
+                    storage_key: row.get(2)?,
+                    is_primary: row.get::<_, i64>(3)? != 0,
+                    verified: row.get::<_, i64>(4)? != 0,
+                    checksum: row.get::<_, Option<Vec<u8>>>(5)?.map(|bytes| hex(&bytes)),
+                    object: String::new(),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, location) = row?;
+            if let Some(entry) = objects.get_mut(&id) {
+                entry.locations.push(location);
+            }
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT object_id, tier, storage_key FROM damage")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, tier, key) = row?;
+            if let Some(entry) = objects.get_mut(&id) {
+                entry.damaged.insert((tier, key));
+            }
+        }
+
+        Ok(objects.into_values().collect())
     }
 
     /// Every object row, in id order.

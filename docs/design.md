@@ -423,6 +423,32 @@ catalog/file disagreement is a finding, never a rewrite: catalog-mode `--repair`
 finding for resync and touches neither the tree nor the rows. The exit-code contract is
 unchanged (`0` clean / `1` findings / `2` usage).
 
+Closed in P1 by `just_cache reconcile` (#24): a disk that comes back after a sweep ran
+while it was out no longer has to wait for a human to re-run that sweep. The command reads
+the catalog — the `tier` table's recorded floors, every location row, the `damage` marks —
+and for every offloaded object below its floor it rebuilds the missing copy from a sibling
+*whose bytes are hashed and compared to the object's recorded checksum before anything is
+copied*: a sibling that only matches on size is not a source, and one that hashes to
+something else is marked damaged and skipped. The copy itself is written through
+`restore`'s build-private-copy-then-rename path — the bytes are read back and hashed while
+still private under the `.just_cache-partial-*` marker, so nothing unverified is ever
+published and the pass never has to delete even its own output — and only then is the
+location recorded via `record_replica` with the real checksum. A destination root is never
+created (a still-unmounted disk is reported, not turned into a directory), a file already
+at the destination is hashed and either adopted or left exactly as it was, and nothing is
+deleted: not the source of a rebuild, not a stranger, not the last copy. It is a new
+subcommand rather than a sweep phase or a scrub mode on purpose: a sweep's job is choosing
+what to offload next from the watched tree, a scrub's job is reading back every copy that
+is *present*, and a rebuild is a writer with its own contract — folding it into either
+would make a policy run or a rate-limited read pass quietly place copies. Its exit code
+follows the scrub precedent: anything rebuilt is still a finding (a disk was out, and cron
+has to see that once), so `0` means every recorded floor was already met, `1` means
+something was rebuilt/adopted or could not be, `2` a missing or unreadable catalog — which
+is a usage error here, because the recorded checksum a rebuild is proved against comes
+from it. What is deliberately out of scope is deciding *when* to reconcile (§10, like
+scrub scheduling) and verifying copies that are present — a stat per location answers
+"is this copy absent", and anything more is the scrubber's job.
+
 Still open, and honestly so:
 
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears
@@ -449,6 +475,20 @@ Still open, and honestly so:
   gone makes `audit`/`catalog sync` a usage error by design (invariant 1 — a root is never
   recreated), so a truly unmounted tier is verified by restoring the mount, not by a
   command that invents a directory.
+- **Reconcile is on demand and trusts the catalog's state.** Like `scrub`, nothing
+  schedules it; P2. It also decides "does this object have a hot copy" from the `state`
+  column, so a catalog left stale by a sweep (a sweep records replicas but does not
+  rewrite state) makes reconcile see a `present` object and skip it — the same `catalog
+  sync` that reports the under-replication brings the state current, and reconcile acts on
+  the catalog as recorded rather than re-deriving it.
+- **Reconcile hashes every sibling candidate it considers.** The `verified` flag is not
+  trusted as a source vouch (that is the whole point), so a rebuild reads its source once
+  to prove it and once to copy it. No read budget yet (`scrub` has `--rate`); a rebuild of
+  a large object on a busy tier is unthrottled.
+- **Reconcile has no free-space gate.** A replicated sweep refuses a destination below
+  `--min-free-gb`; a rebuild only fails when the copy itself fails, which is reported per
+  object. A pre-flight floor is a small, honest addition when someone needs it.
+
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
   N distinct `--dest` roots before it retires the source, and `catalog sync --copies N`
   records the floor per tier and reports objects below it as `under-replicated` (a lost
@@ -458,11 +498,6 @@ Still open, and honestly so:
   disk the second copy lands on that disk on the **same host** — this is replication
   across a disk failure, not off-host backup (§10); a machine-level loss still takes both
   copies. Off-host tiers are P3.
-- **A disk that was out is reported, not reconciled.** Re-adding a disk that was missing
-  during a sweep does not yet rebuild the copies that were never made from a surviving
-  sibling; `audit --copies N` reports `replica-lost` and `catalog sync --copies N` reports
-  `under-replicated`, and a human runs the sweep again. Nothing recreates a missing copy
-  automatically, and nothing is deleted to balance a floor.
 - **A copy the mover could not verify is unknown, never good.** The mover counts only a
   copy whose read-back digest matched, and it does not retire the source until the floor
   is met; the catalog's `location.verified` is 0 until a sync hashes the bytes, and rows
@@ -596,6 +631,14 @@ Still open, and honestly so:
 
 ## 10. Non-goals
 
+- **Deciding *when* to reconcile is not this feature's job.** `just_cache reconcile` is an
+  on-demand command, exactly like `scrub`: the operator (or a cron entry) decides when a
+  disk has come back and it is time to fill it. Scheduling re-scan and repair passes is
+  P2, the same phase that owns scrub scheduling.
+- **Ongoing verification of copies that are present is not reconcile's job either.** It
+  stats each recorded location — one stat answers "is this copy absent", which is all it
+  exists to ask — and leaves the read-back of present copies to `scrub`, the only place
+  with an I/O budget for it. A copy that is present but unverified is not touched here.
 - **Off-host replication is not what a floor of 2 buys.** The `--copies` floor replicates
   within (or across) the destinations on one host; it survives a disk failure, not the
   loss of the machine or a site. Remote/object/offline tiers are P3, and until they exist
