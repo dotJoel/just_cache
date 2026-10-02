@@ -87,7 +87,7 @@ pub enum SourceState {
     },
 }
 
-/// The five classifications this audit can produce.
+/// The classifications this audit can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictKind {
     Healthy,
@@ -95,6 +95,8 @@ pub enum VerdictKind {
     DanglingSymlink,
     UnexpectedTarget,
     Duplicate,
+    /// An offloaded object with fewer copies on disk than its floor requires.
+    ReplicaLost,
 }
 
 impl VerdictKind {
@@ -105,16 +107,18 @@ impl VerdictKind {
             VerdictKind::DanglingSymlink => "dangling-symlink",
             VerdictKind::UnexpectedTarget => "unexpected-target",
             VerdictKind::Duplicate => "duplicate",
+            VerdictKind::ReplicaLost => "replica-lost",
         }
     }
 
     /// The kinds that make `audit` exit non-zero, in report order.
-    pub fn problems() -> [VerdictKind; 4] {
+    pub fn problems() -> [VerdictKind; 5] {
         [
             VerdictKind::OrphanedCopy,
             VerdictKind::DanglingSymlink,
             VerdictKind::UnexpectedTarget,
             VerdictKind::Duplicate,
+            VerdictKind::ReplicaLost,
         ]
     }
 }
@@ -137,6 +141,12 @@ pub enum Verdict {
     /// A real file at the source path *and* a copy on the cold tier: the source was
     /// never removed after the copy landed.
     Duplicate,
+    /// An offloaded object whose copies on disk number fewer than the floor. `missing`
+    /// names the configured destinations a copy is absent from — the disks it is not on.
+    ReplicaLost {
+        present: Vec<PathBuf>,
+        missing: Vec<PathBuf>,
+    },
 }
 
 impl Verdict {
@@ -151,6 +161,7 @@ impl Verdict {
             Verdict::DanglingSymlink { .. } => VerdictKind::DanglingSymlink,
             Verdict::UnexpectedTarget { .. } => VerdictKind::UnexpectedTarget,
             Verdict::Duplicate => VerdictKind::Duplicate,
+            Verdict::ReplicaLost { .. } => VerdictKind::ReplicaLost,
         }
     }
 }
@@ -169,6 +180,21 @@ pub struct Finding {
 impl Finding {
     /// One line, with the cold copy when it is relevant.
     pub fn describe(&self) -> String {
+        if let Verdict::ReplicaLost { present, missing } = &self.verdict {
+            let list = |paths: &[PathBuf]| {
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return format!(
+                "replica-lost: {} (present on [{}]; missing on [{}])",
+                self.path.display(),
+                list(present),
+                list(missing)
+            );
+        }
         let cold = self
             .cold_copy
             .as_ref()
@@ -375,8 +401,21 @@ pub fn classify(source: &SourceState, cold_copies: &[PathBuf]) -> Verdict {
 }
 
 /// Walk `watch` and every `dest`, classify the union of their relative paths and return
-/// every path that is not healthy. Read-only.
+/// every path that is not healthy. Read-only. The single-copy audit: no floor beyond the
+/// one copy the mover's flat layout implies.
 pub fn audit(watch: &Path, dests: &[PathBuf]) -> Result<AuditReport, AuditError> {
+    audit_with_copies(watch, dests, 1)
+}
+
+/// As [`audit`], but with a copy floor: a resolving symlink into a cold tier whose object
+/// is present on fewer than `copies` configured destinations is a `replica-lost` finding,
+/// naming the disks it is missing from. The catalog reports the same state as
+/// `under-replicated`; this is the filesystem-only view of it.
+pub fn audit_with_copies(
+    watch: &Path,
+    dests: &[PathBuf],
+    copies: usize,
+) -> Result<AuditReport, AuditError> {
     let watch_side = scan(watch)?;
     let canonical_dests: Vec<PathBuf> = dests
         .iter()
@@ -420,7 +459,25 @@ pub fn audit(watch: &Path, dests: &[PathBuf]) -> Result<AuditReport, AuditError>
             .map(|(dest, _)| dest.join(relative))
             .collect();
 
-        let verdict = classify(&source, &cold_copies);
+        let verdict = match &source {
+            SourceState::Symlink {
+                resolves: true,
+                dest_index: Some(_),
+                ..
+            } if copies > 1 && cold_copies.len() < copies => {
+                let missing: Vec<PathBuf> = dests
+                    .iter()
+                    .zip(&dest_maps)
+                    .filter(|(_, side)| !side.contains_key(relative))
+                    .map(|(dest, _)| dest.join(relative))
+                    .collect();
+                Verdict::ReplicaLost {
+                    present: cold_copies.clone(),
+                    missing,
+                }
+            }
+            _ => classify(&source, &cold_copies),
+        };
         if verdict.is_healthy() {
             healthy += 1;
             continue;
@@ -631,6 +688,10 @@ pub fn repair(report: &AuditReport) -> Result<Vec<RepairOutcome>, AuditError> {
             },
             Verdict::OrphanedCopy => RepairAction::NotAttempted {
                 reason: "the name is gone; choosing between restoring it and reclaiming the cold bytes needs a human"
+                    .to_string(),
+            },
+            Verdict::ReplicaLost { .. } => RepairAction::NotAttempted {
+                reason: "replicating a lost copy from a surviving one is a mover pass, not audit repair"
                     .to_string(),
             },
         };

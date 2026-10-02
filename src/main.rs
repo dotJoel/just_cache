@@ -137,6 +137,12 @@ struct SweepArgs {
     #[arg(long, value_name = "N", default_value_t = 10)]
     limit: usize,
 
+    /// Durability floor: place this many copies, on this many distinct `--dest` roots,
+    /// before removing the source. Default 1 keeps the original single-copy behaviour;
+    /// N>1 opts into replication (same-host disk failure, not off-host backup).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    copies: usize,
+
     /// Leave a destination alone unless it has at least this much free space, on top of
     /// room for the file being moved.
     #[arg(long, value_name = "GB", default_value_t = 1.0)]
@@ -183,6 +189,12 @@ struct AuditArgs {
     #[arg(long)]
     repair: bool,
 
+    /// Copy floor to audit against: an offloaded object present on fewer than this many
+    /// distinct `--dest` roots is a `replica-lost` finding. Default 1 audits the flat
+    /// single-copy layout only.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    copies: usize,
+
     /// Print a machine-readable JSON document instead of the summary.
     #[arg(long)]
     json: bool,
@@ -225,6 +237,12 @@ struct CatalogSyncArgs {
     /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
     #[arg(long, value_name = "FILE")]
     catalog: Option<PathBuf>,
+
+    /// Record this as the copy floor for every `--dest` tier, and report objects that
+    /// hold fewer verified copies than it. Recorded once per tier, not guessed from how
+    /// many copies happen to exist. Default 1.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    copies: usize,
 }
 
 /// Everything `explain` needs to answer for one path. The flags deliberately mirror
@@ -351,6 +369,30 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         eprintln!("just_cache: --dest is required (repeat it for each slower disk)");
         return ExitCode::from(EXIT_USAGE);
     }
+    if args.copies == 0 {
+        eprintln!("just_cache: --copies must be at least 1");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // A floor the invocation cannot satisfy is refused up front rather than half-met:
+    // replicating onto fewer disks than asked, and then calling the object offloaded,
+    // would be the tool lying about durability. Distinctness is by canonical root, so
+    // `--dest /a --dest /a/` counts once.
+    let distinct_dests = distinct_paths(&args.dest);
+    if distinct_dests < args.copies {
+        eprintln!(
+            "just_cache: --copies {} needs {} distinct --dest roots, but only {} distinct \
+             {} given; refusing rather than placing fewer copies than the floor",
+            args.copies,
+            args.copies,
+            distinct_dests,
+            if distinct_dests == 1 {
+                "root is"
+            } else {
+                "roots are"
+            }
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = validate_sweep(&watch, &args) {
         eprintln!("just_cache: {message}");
         return ExitCode::FAILURE;
@@ -432,7 +474,7 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         // next start reads a file the size of the work actually outstanding.
         let _ = journal.compact();
         if args.once {
-            return if report.failed() > 0 {
+            return if report.failed() > 0 || report.under_replicated() > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -477,6 +519,18 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
         }
     };
 
+    // The copy floor is a per-tier property, recorded once, and this is the command that
+    // records it — not derived from how many locations happen to exist. Set before the
+    // sync so the same pass can report objects that fall below it.
+    if args.copies > 1 {
+        for dest in &args.dest {
+            if let Err(err) = catalog.set_tier_floor(&tier_key(dest), args.copies) {
+                eprintln!("just_cache: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let report = match catalog.sync(&args.watch, &args.dest) {
         Ok(report) => report,
         Err(err) => {
@@ -502,7 +556,7 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
 
-    let report = match audit::audit(&args.watch, &args.dest) {
+    let report = match audit::audit_with_copies(&args.watch, &args.dest, args.copies) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("just_cache: {err}");
@@ -677,6 +731,26 @@ fn validate_sweep(watch: &Path, args: &SweepArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Number of distinct destination roots, keyed on canonical path so two names for one
+/// disk do not masquerade as two disks.
+fn distinct_paths(dests: &[PathBuf]) -> usize {
+    let mut seen = HashSet::new();
+    for dest in dests {
+        let key = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+        seen.insert(key);
+    }
+    seen.len()
+}
+
+/// The tier key for a destination root: its canonical path, matching what the catalog's
+/// observe pass uses so a floor and a location name the same disk.
+fn tier_key(dest: &Path) -> String {
+    dest.canonicalize()
+        .unwrap_or_else(|_| dest.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Shared checks for both subcommands: the watched tree exists, and each destination is
 /// a real directory that is not the watched tree itself.
 fn validate_paths(watch: &Path, dests: &[PathBuf]) -> Result<(), String> {
@@ -772,57 +846,99 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     let min_free = args.min_free_bytes();
     let mut pending = entries.clone();
 
-    for dest in dests {
-        // Both sides matter: the guards are live state (a descriptor can open at any
-        // moment), and the room check measures allocated bytes, since the copy preserves
-        // holes and `size` would refuse moves the tier can afford.
+    if args.copies > 1 {
+        // Replication path: every candidate is tried against the destinations in order
+        // until `copies` copies have verified, rather than filling one tier before moving
+        // to the next. Nothing here can leave an object below its floor and still remove
+        // the source — `migrate_replicated` refuses to retire a file it could not copy.
         let mut context = file_movement::MoveContext {
             policy,
             scope,
             guards: &guards,
             journal,
         };
-        let tier = file_movement::migrate_least_used(
+        let replicated = file_movement::migrate_replicated(
             &pending,
             tracker,
             &mut context,
             now,
-            |entry: &FileEntry| {
-                Ok(disk_management::destination_with_room(
-                    dest,
-                    entry.allocated,
-                    min_free,
-                ))
-            },
+            dests,
+            args.copies,
+            min_free,
         );
-
-        // Whatever this tier took (or would take) is off the table for slower disks.
-        let handled: HashSet<PathBuf> = tier.migrated_paths().into_iter().collect();
-        let waiting = tier.waiting_for_room();
-        pending.retain(|entry| !handled.contains(&entry.path));
-        report.records.extend(tier.records);
-
-        if args.verbose > 0 && waiting > 0 {
-            let free = disk_management::available_space(dest)
-                .map(scope::human_bytes)
-                .unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "  {} is below the free-space floor ({} free); {} file(s) left waiting",
-                dest.display(),
-                free,
-                waiting
+        report.records.extend(replicated.records);
+        report.replication = replicated.replication;
+        pending.clear();
+    } else {
+        for dest in dests {
+            // Both sides matter: the guards are live state (a descriptor can open at any
+            // moment), and the room check measures allocated bytes, since the copy
+            // preserves holes and `size` would refuse moves the tier can afford.
+            let mut context = file_movement::MoveContext {
+                policy,
+                scope,
+                guards: &guards,
+                journal,
+            };
+            let tier = file_movement::migrate_least_used(
+                &pending,
+                tracker,
+                &mut context,
+                now,
+                |entry: &FileEntry| {
+                    Ok(disk_management::destination_with_room(
+                        dest,
+                        entry.allocated,
+                        min_free,
+                    ))
+                },
             );
-        }
 
-        if policy.dry_run {
-            // Nothing on disk changed, so a second tier would just re-report the plan.
-            break;
+            // Whatever this tier took (or would take) is off the table for slower disks.
+            let handled: HashSet<PathBuf> = tier.migrated_paths().into_iter().collect();
+            let waiting = tier.waiting_for_room();
+            pending.retain(|entry| !handled.contains(&entry.path));
+            report.records.extend(tier.records);
+            report.replication.extend(tier.replication);
+
+            if args.verbose > 0 && waiting > 0 {
+                let free = disk_management::available_space(dest)
+                    .map(scope::human_bytes)
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "  {} is below the free-space floor ({} free); {} file(s) left waiting",
+                    dest.display(),
+                    free,
+                    waiting
+                );
+            }
+
+            if policy.dry_run {
+                // Nothing on disk changed, so a second tier would just re-report the plan.
+                break;
+            }
+        }
+    }
+
+    // Record the replicas in the catalog, when one already exists. The sweep may not
+    // create one (invariant 9 — that is `catalog sync`'s job), so this is deliberately an
+    // open-if-present: with no catalog there is nothing to record into, and the copies
+    // are still real and still counted by the next sync. A copy is only recorded once a
+    // digest vouched for it, which is why `record_replicas` filters on `is_valid`.
+    if args.copies > 1 {
+        if let Ok(Some(existing_catalog)) =
+            catalog::Catalog::open_existing(catalog::Catalog::default_path(watch))
+        {
+            record_replicas(&existing_catalog, &report.replication);
         }
     }
 
     if args.quiet {
         for record in &report.records {
-            if matches!(record.outcome, FileOutcome::Failed(_)) {
+            if matches!(
+                record.outcome,
+                FileOutcome::Failed(_) | FileOutcome::UnderReplicated { .. }
+            ) {
                 file_movement::log_file_movement(record);
             }
         }
@@ -838,7 +954,7 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
 
     if !args.quiet {
         println!(
-            "pass {pass}: {} files scanned, {} tracked, {} moved, {} linked, {} waiting for room, {} in use ({} open files seen), {} skipped ({} outside scope or size), {} failed, {} onto the cold tiers",
+            "pass {pass}: {} files scanned, {} tracked, {} moved, {} linked, {} waiting for room, {} in use ({} open files seen), {} skipped ({} outside scope or size), {} under-replicated, {} failed, {} onto the cold tiers",
             entries.len(),
             tracker.tracked_paths(),
             report.moved(),
@@ -848,6 +964,7 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             guards.open_files().len(),
             report.excluded(),
             report.count(|outcome| matches!(outcome, FileOutcome::Skipped(_))),
+            report.under_replicated(),
             report.failed(),
             scope::human_bytes(report.bytes_moved()),
         );
@@ -857,4 +974,46 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     }
 
     report
+}
+
+/// Decode a hex object id back to the bytes the catalog's `object.id` column holds.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect()
+}
+
+/// Write the verified copies of one sweep into an existing catalog, if the objects are
+/// already known. A copy the mover could not verify (`is_valid` false) is not recorded:
+/// it is unknown, and the catalog must not be told it is good.
+fn record_replicas(catalog: &catalog::Catalog, details: &[file_movement::ReplicationDetail]) {
+    for detail in details {
+        let Some(object) = detail.object.as_deref().and_then(decode_hex) else {
+            continue;
+        };
+        for placement in &detail.placements {
+            if !placement.is_valid() {
+                continue;
+            }
+            let tier = placement
+                .dest_root
+                .canonicalize()
+                .unwrap_or_else(|_| placement.dest_root.clone());
+            let key = placement
+                .path
+                .strip_prefix(&placement.dest_root)
+                .unwrap_or(&placement.path);
+            let _ = catalog.record_replica(
+                &object,
+                &tier.to_string_lossy(),
+                &key.to_string_lossy(),
+                true,
+                Some(&object),
+            );
+        }
+    }
 }

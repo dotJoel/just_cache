@@ -469,6 +469,37 @@ fn is_cross_device(err: &io::Error) -> bool {
 /// The temporary lives in the destination directory so the final rename stays on one
 /// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
 fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
+    copy_into_place(src, dest, expected)?;
+    fs::remove_file(src).map_err(|source| DiskError::MoveError {
+        from: src.to_path_buf(),
+        to: dest.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Copy `src` into place at `dest`, preserving metadata and holes, and leave the source
+/// exactly where it is.
+///
+/// This is the half of a cross-device move that makes the bytes visible: a private
+/// `.just_cache-partial-*` sibling, metadata applied while it is still private, an
+/// fsync, the short-copy check, then an atomic rename onto `dest`. Removing the source
+/// is the caller's job, and it is deliberately *not* done here: the replicated offload
+/// must keep the source until every replica has independently verified (invariant 2,
+/// "nothing is deleted without a verified copy"). The digest check itself lives with
+/// the caller, because a copy that only *returned* from write is not yet a copy the
+/// tool can vouch for.
+pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
+    if let Some(parent) = dest.parent() {
+        // The destination root itself is never created (invariant 1): callers only reach
+        // here for a root they have already checked exists. This creates the *nested*
+        // directories a mirrored relative path needs on an existing root.
+        fs::create_dir_all(parent).map_err(|source| DiskError::MoveError {
+            from: src.to_path_buf(),
+            to: dest.to_path_buf(),
+            source,
+        })?;
+    }
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let partial = partial_sibling(dir);
 
@@ -546,11 +577,6 @@ fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskEr
     // Same directory, so this rename stays on one filesystem and is atomic.
     fs::rename(&partial, dest).map_err(|source| DiskError::MoveError {
         from: partial.clone(),
-        to: dest.to_path_buf(),
-        source,
-    })?;
-    fs::remove_file(src).map_err(|source| DiskError::MoveError {
-        from: src.to_path_buf(),
         to: dest.to_path_buf(),
         source,
     })?;

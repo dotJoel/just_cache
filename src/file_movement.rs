@@ -1,6 +1,7 @@
 //! Usage tracking and the policy that decides which files count as "cold".
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -280,6 +281,13 @@ pub enum FileOutcome {
     /// The destination tier is full. Routine on a disk you keep filled, so this is
     /// reported separately from a failure.
     NoRoom,
+    /// Fewer than the requested copies verified, so the source was deliberately kept.
+    /// This is not a failure of the mover — it is the floor doing its job — but it is
+    /// data that is not as durable as asked, so a sweep treats it as a finding.
+    UnderReplicated {
+        verified: usize,
+        floor: usize,
+    },
     Skipped(SkipReason),
     Failed(String),
 }
@@ -299,6 +307,20 @@ pub struct MigrationRecord {
 #[derive(Debug, Default, Clone)]
 pub struct MigrationReport {
     pub records: Vec<MigrationRecord>,
+    /// Per-file replication detail, for a caller that records copies in a catalog. Empty
+    /// on the single-copy path and in a dry run. The placements carry the digest each
+    /// copy verified to, which is what a catalog needs to store.
+    pub replication: Vec<ReplicationDetail>,
+}
+
+/// One candidate's replication placements, kept alongside the movement record so the CLI
+/// can write them into the catalog without the policy layer depending on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationDetail {
+    pub path: PathBuf,
+    /// Hex-encoded BLAKE3 of the object, when it could be computed.
+    pub object: Option<String>,
+    pub placements: Vec<crate::replication::ReplicaPlacement>,
 }
 
 impl MigrationReport {
@@ -328,6 +350,13 @@ impl MigrationReport {
     /// Files a full destination tier could not take this sweep.
     pub fn waiting_for_room(&self) -> usize {
         self.count(|outcome| matches!(outcome, FileOutcome::NoRoom))
+    }
+
+    /// Objects left below their copy floor this sweep: fewer copies verified than were
+    /// asked for, so the source was kept. Counted as a finding, because the whole point
+    /// of a floor is that silence about it means it was met.
+    pub fn under_replicated(&self) -> usize {
+        self.count(|outcome| matches!(outcome, FileOutcome::UnderReplicated { .. }))
     }
 
     /// Files left alone because something is using them: open, or hardlinked.
@@ -398,6 +427,9 @@ impl MigrationReport {
                     FileOutcome::LinkedExisting => "linked (already on disk)".to_string(),
                     FileOutcome::AlreadyLinked => "already a symlink".to_string(),
                     FileOutcome::NoRoom => "waiting for room".to_string(),
+                    FileOutcome::UnderReplicated { verified, floor } => {
+                        format!("UNDER-REPLICATED ({verified}/{floor} copies; source kept)")
+                    }
                     FileOutcome::Skipped(reason) => format!("skipped: {reason}"),
                     FileOutcome::Failed(err) => format!("FAILED: {err}"),
                 };
@@ -538,6 +570,158 @@ where
     report
 }
 
+/// Offload each candidate across `floor` distinct destinations, then retire the source.
+///
+/// This is the replication path behind `sweep --copies N` (N > 1). It differs from
+/// [`migrate_least_used`] in the one way that matters:
+///
+/// * every destination is tried for the *same* file, not the first that has room, until
+///   `floor` copies have their digest verified;
+/// * the source is removed **only** when the floor is met
+///   ([`crate::replication::ReplicationOutcome::meets_floor`]). Below the floor the file
+///   is left exactly where it was and reported as [`FileOutcome::UnderReplicated`] — the
+///   mover never trades the last copy away to satisfy a number.
+///
+/// With `floor == 1` this collapses to the old behaviour, which is why the default sweep
+/// still calls `migrate_least_used` and only an explicit `--copies N` reaches here.
+pub fn migrate_replicated(
+    entries: &[FileEntry],
+    tracker: &UsageTracker,
+    context: &mut MoveContext<'_>,
+    now: SystemTime,
+    dests: &[PathBuf],
+    floor: usize,
+    min_free: u64,
+) -> MigrationReport {
+    let (candidates, skipped) = select_candidates(entries, tracker, context, now);
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let journal: &mut Journal = context.journal;
+    let mut report = MigrationReport::default();
+
+    for (entry, reason) in skipped {
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: None,
+            outcome: FileOutcome::Skipped(reason),
+            size: entry.size,
+        });
+    }
+
+    for entry in candidates {
+        // Same belt-and-braces re-check as the single-copy path: a descriptor can open
+        // between selection and the copy, and on a busy box that window is real.
+        if let Err(rejected) = scope.allows(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+            });
+            continue;
+        }
+        if let Err(in_use) = guards.check(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+            });
+            continue;
+        }
+
+        let primary = dests.first().map(|dest| dest.join(&entry.relative));
+
+        if policy.dry_run {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: primary,
+                outcome: FileOutcome::Planned,
+                size: entry.size,
+            });
+            continue;
+        }
+
+        // The intent names the primary destination, which is the copy recovery would
+        // link to if the machine dies between here and the symlink. The size in the
+        // record is what recovery checks the cold copy against.
+        let journalled = match &primary {
+            Some(target) => journal.intent(&entry.relative, target, entry.size).is_ok(),
+            None => false,
+        };
+        if !journalled {
+            eprintln!(
+                "just_cache: cannot record the replicated move of {} in the journal; a \
+                 crash during this move would not be recoverable",
+                entry.path.display()
+            );
+        }
+
+        let outcome = crate::replication::replicate(entry, dests, floor, min_free);
+
+        let result = if outcome.meets_floor() {
+            // The floor is met, so the source may now be retired. Removing it first and
+            // linking second follows the single-copy mover's order: if the link step
+            // fails, the bytes are safe on every verified replica and the journal record
+            // still describes the move, so the next run's recovery creates the link.
+            let primary_path = outcome
+                .primary()
+                .expect("a met floor always has at least one verified replica");
+            match retire_source(&entry.path, primary_path) {
+                Ok(()) => {
+                    journal.forget(&entry.relative);
+                    FileOutcome::Moved
+                }
+                Err(err) => FileOutcome::Failed(err.to_string()),
+            }
+        } else {
+            // Belt and braces in the other direction: the source is not touched. This is
+            // the branch that keeps the mover from deleting the last copy.
+            FileOutcome::UnderReplicated {
+                verified: outcome.verified,
+                floor,
+            }
+        };
+
+        if let FileOutcome::UnderReplicated { verified, floor } = &result {
+            eprintln!(
+                "just_cache: {} is under-replicated ({verified}/{floor} copies verified); \
+                 the source is kept. {}",
+                entry.path.display(),
+                outcome.unmet_detail()
+            );
+        }
+
+        report.replication.push(ReplicationDetail {
+            path: entry.path.clone(),
+            object: outcome.digest.clone(),
+            placements: outcome.replicas.clone(),
+        });
+
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: primary,
+            outcome: result,
+            size: entry.size,
+        });
+    }
+
+    report
+}
+
+/// Replace a source file with a symlink to a verified replica.
+///
+/// The removal happens second-to-last and the link last, exactly as
+/// [`disk_management::move_file_with_symlink`] does it, so journal recovery sees the same
+/// shape it already knows how to repair.
+fn retire_source(source: &Path, primary: &Path) -> Result<(), DiskError> {
+    fs::remove_file(source).map_err(|err| DiskError::MoveError {
+        from: source.to_path_buf(),
+        to: primary.to_path_buf(),
+        source: err,
+    })?;
+    disk_management::link_into_place(primary, source)
+}
+
 /// Keep the movement log in one place so the wording stays consistent across runs.
 pub fn log_file_movement(record: &MigrationRecord) {
     match &record.outcome {
@@ -548,6 +732,15 @@ pub fn log_file_movement(record: &MigrationRecord) {
         }
         FileOutcome::Failed(err) => {
             eprintln!("error: {}: {err}", record.path.display());
+        }
+        // A file kept because its copies did not verify is something the user has to
+        // see, even without -v: it is the difference between "offloaded" and "offloaded
+        // to as many disks as you asked for".
+        FileOutcome::UnderReplicated { verified, floor } => {
+            eprintln!(
+                "under-replicated: {} ({verified}/{floor} copies verified; source kept)",
+                record.path.display()
+            );
         }
         _ => {}
     }
