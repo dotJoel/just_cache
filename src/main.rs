@@ -10,6 +10,7 @@ use clap::Parser;
 
 use just_cache::disk_management;
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
+use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::scope::{self, Scope};
 
 fn parse_size_arg(text: &str) -> Result<u64, String> {
@@ -73,6 +74,11 @@ struct Cli {
     /// reclaim. Binary units, as above.
     #[arg(long, value_name = "SIZE", value_parser = parse_size_arg)]
     max_size: Option<u64>,
+
+    /// Move files that have more than one hard link. Off by default: a hardlinked pair
+    /// cannot be moved across filesystems without silently breaking the link.
+    #[arg(long)]
+    allow_hardlinked: bool,
 
     /// Maximum files moved per destination per sweep.
     #[arg(long, value_name = "N", default_value_t = 10)]
@@ -193,6 +199,29 @@ fn sweep(
 ) -> MigrationReport {
     let now = SystemTime::now();
 
+    // One snapshot per sweep, not one per candidate: a process-table scan per file would
+    // cost more than the copy it is protecting. The guard is deliberately taken *before*
+    // the walk so that a file opened mid-sweep is caught by the re-check in the mover.
+    let open_files = OpenFiles::snapshot();
+    let coverage_note = open_files.coverage_note();
+    let guards = Guards::new(open_files, !cli.allow_hardlinked);
+    match guards.open_files().coverage() {
+        // Cannot check at all: say so rather than pretending the guard exists.
+        Coverage::Unsupported => {
+            if let Some(note) = &coverage_note {
+                eprintln!("just_cache: {note}");
+            }
+        }
+        Coverage::OwnProcessesOnly => {
+            if cli.verbose > 0 {
+                if let Some(note) = &coverage_note {
+                    println!("  {note}");
+                }
+            }
+        }
+        Coverage::Complete => {}
+    }
+
     let entries = match disk_management::list_files_recursive(&cli.watch) {
         Ok(entries) => entries,
         Err(err) => {
@@ -215,10 +244,18 @@ fn sweep(
     let mut pending = entries.clone();
 
     for dest in &cli.dest {
-        let tier =
-            file_movement::migrate_least_used(&pending, tracker, policy, scope, now, |entry| {
-                Ok(destination_with_room(dest, entry.allocated, min_free))
-            });
+        // Both sides matter: the guards are live state (a descriptor can open at any
+        // moment), and the room check measures allocated bytes, since the copy preserves
+        // holes and `size` would refuse moves the tier can afford.
+        let tier = file_movement::migrate_least_used(
+            &pending,
+            tracker,
+            policy,
+            scope,
+            &guards,
+            now,
+            |entry| Ok(destination_with_room(dest, entry.allocated, min_free)),
+        );
 
         // Whatever this tier took (or would take) is off the table for slower disks.
         let handled: HashSet<PathBuf> = tier.migrated_paths().into_iter().collect();
@@ -262,12 +299,14 @@ fn sweep(
 
     if !cli.quiet {
         println!(
-            "pass {pass}: {} files scanned, {} tracked, {} moved, {} linked, {} waiting for room, {} skipped ({} outside scope or size), {} failed, {} onto the cold tiers",
+            "pass {pass}: {} files scanned, {} tracked, {} moved, {} linked, {} waiting for room, {} in use ({} open files seen), {} skipped ({} outside scope or size), {} failed, {} onto the cold tiers",
             entries.len(),
             tracker.tracked_paths(),
             report.moved(),
             report.linked_existing(),
             report.waiting_for_room(),
+            report.in_use(),
+            guards.open_files().len(),
             report.excluded(),
             report.count(|outcome| matches!(outcome, FileOutcome::Skipped(_))),
             report.failed(),
