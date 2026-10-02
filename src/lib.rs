@@ -7,6 +7,10 @@ pub mod digest;
 
 pub mod disk_management;
 pub mod explain;
+// Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
+// built without test cfg, so the fault seam has to be compiled into production and stay
+// inert there. It is private because nothing outside the crate may set a fault.
+mod faults;
 pub mod file_movement;
 pub mod journal;
 pub mod locate;

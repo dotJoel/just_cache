@@ -300,6 +300,138 @@ fn the_hook_is_inert_when_unset() {
         .is_symlink());
     assert_eq!(fs::read(dest_a.join("clip.bin")).unwrap(), bytes);
     assert_eq!(fs::read(dest_b.join("clip.bin")).unwrap(), bytes);
+    // The copy seam in `disk_management` is `None` when the variable is unset, so it can
+    // neither fire nor print; if a future change arms it unconditionally this fails.
+    assert!(
+        !text_of(&output).contains("unlink-mid-copy"),
+        "an unset hook must not touch the copy path:\n{}",
+        text_of(&output)
+    );
+}
+
+/// The destination goes away **while the copy is in flight**: the private partial has
+/// been created and the write loop is mid-stream when it is unlinked and the nested
+/// directory removed. The open descriptor keeps the unlinked inode alive, so the bytes
+/// keep being written to a file that no longer has a name; every step after that —
+/// metadata, the length re-check, the rename, the caller's read-back — is path-based and
+/// fails, which is the whole claim under test.
+///
+/// This can only be proved on a *different* mount: a same-filesystem copy is a reflink
+/// (`FICLONE`) and never enters the chunked reader/writer the seam reports through. The
+/// fault therefore fires for real only here, with the destination on the second
+/// filesystem, and the assertion above it makes sure that is the case.
+#[test]
+fn a_destination_unlinked_mid_copy_keeps_the_source_and_later_sweeps_heal() {
+    let Some(second) = support::second_fs() else {
+        return;
+    };
+    let work = support::work_dir(&second, "fi-midcopy");
+    let dest_a = work.path().join("cold-a");
+    let dest_b = work.path().join("cold-b");
+    fs::create_dir_all(&dest_a).unwrap();
+    fs::create_dir_all(&dest_b).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    fs::create_dir_all(watch.join("sub")).unwrap();
+    // Comfortably larger than one observed chunk, so the fault point genuinely lands
+    // before the end of the copy rather than at it.
+    let bytes = payload(512 * 1024);
+    fs::write(watch.join("sub/clip.bin"), &bytes).unwrap();
+
+    support::assert_cross_device(&watch, &dest_a);
+
+    // A catalog first, so the sweep has somewhere to (not) record the faulted copy and
+    // `locate` can be asked what it believes afterwards.
+    let catalog = watch.join(".just_cache-catalog.sqlite");
+    let baseline = catalog_sync(&watch, &[&dest_a, &dest_b], 2);
+    assert_exit(&baseline, 0);
+
+    let output = fault_sweep(&watch, &[&dest_a, &dest_b], "unlink-mid-copy=8192");
+    assert_exit(&output, 1);
+    let text = text_of(&output);
+    assert!(
+        text.contains("under-replicated"),
+        "the unmet floor must be reported:\n{text}"
+    );
+
+    // The seam fired mid-copy and said where: the unlink lands after a byte count that is
+    // strictly smaller than the copy, which is what "while bytes are in flight" means.
+    let marker = "JUST_CACHE_FAULT=unlink-mid-copy removed ";
+    let found = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("the mid-copy fault must have fired:\n{text}"));
+    let written: u64 = text[found + marker.len()..]
+        .split(" after ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("the fault marker must carry a byte position:\n{text}"));
+    assert!(
+        written > 0 && written < bytes.len() as u64,
+        "the unlink must land mid-copy, not at the end: wrote {written} of {}\n{text}",
+        bytes.len()
+    );
+
+    // The failure names the disk the copy was going to, not just an errno.
+    assert!(
+        text.contains(&dest_a.display().to_string()),
+        "the failed destination must be named in the report:\n{text}"
+    );
+
+    // Invariant 2: the source is the last copy, so it stays a real file with its bytes.
+    let source = watch.join("sub/clip.bin");
+    assert!(
+        !fs::symlink_metadata(&source).unwrap().is_symlink(),
+        "a below-floor object must keep its source as a real file"
+    );
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+
+    // The copy on the vanished disk is gone, nested directory and all; the other disk
+    // verified normally, which is what gives the invariants something to compare against.
+    assert!(
+        !dest_a.join("sub").exists(),
+        "the faulted destination's nested directory must be gone"
+    );
+    assert_eq!(fs::read(dest_b.join("sub/clip.bin")).unwrap(), bytes);
+
+    // Invariant 8: no `.just_cache-partial-*` survives on either side. The unlink removed
+    // it, but assert it with the test's own eyes — the production walker deliberately
+    // hides partial files and would never report a leftover.
+    assert!(
+        support::partial_files(&dest_a).is_empty() && support::partial_files(&dest_b).is_empty(),
+        "a mid-copy unlink must not leave a partial behind"
+    );
+
+    // Nothing is recorded as verified for the vanished tier: `locate` answers from the
+    // catalog alone and lists the disk that verified, never the one that did not. The
+    // object's namespace path is its path under the watched root, which is nested here.
+    let located = locate(&catalog, "sub/clip.bin");
+    assert_exit(&located, 0);
+    let locate_text = text_of(&located);
+    assert!(
+        locate_text.contains(&dest_b.canonicalize().unwrap().display().to_string()),
+        "the verified copy must be in the catalog:\n{locate_text}"
+    );
+    assert!(
+        !locate_text.contains(&dest_a.canonicalize().unwrap().display().to_string()),
+        "a copy the mover could not place must not be recorded as good:\n{locate_text}"
+    );
+
+    // Recovery: the fault is unset, and the same sweep finishes the offload from the
+    // intact source and the surviving copy.
+    let healed = clean_sweep(&watch, &[&dest_a, &dest_b]);
+    assert_exit(&healed, 0);
+    assert!(
+        fs::symlink_metadata(&source).unwrap().is_symlink(),
+        "the source is retired once the floor is met:\n{}",
+        text_of(&healed)
+    );
+    assert_eq!(fs::read(dest_a.join("sub/clip.bin")).unwrap(), bytes);
+    assert_eq!(fs::read(dest_b.join("sub/clip.bin")).unwrap(), bytes);
+    assert!(
+        support::partial_files(&dest_a).is_empty() && support::partial_files(&dest_b).is_empty()
+    );
 }
 
 /// The copy is recorded only *after* the source is retired, and it is gone before that

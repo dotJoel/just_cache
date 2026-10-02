@@ -32,7 +32,7 @@
 //! that refused to move is not.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -490,25 +490,67 @@ fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskEr
 /// the caller, because a copy that only *returned* from write is not yet a copy the
 /// tool can vouch for.
 pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
-    if let Some(parent) = dest.parent() {
-        // The destination root itself is never created (invariant 1): callers only reach
-        // here for a root they have already checked exists. This creates the *nested*
-        // directories a mirrored relative path needs on an existing root.
-        fs::create_dir_all(parent).map_err(|source| DiskError::MoveError {
-            from: src.to_path_buf(),
-            to: dest.to_path_buf(),
-            source,
-        })?;
-    }
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let partial = partial_sibling(dir);
-
-    // Anything that fails here is reported as a failed move against this pair, except
-    // `SourceChanged`, which has already said precisely what went wrong.
+    // Anything that fails from here on is reported as a failed move against this pair,
+    // except `SourceChanged`, which has already said precisely what went wrong. Defined
+    // before the first fallible step so creating the nested directories can use it too.
     let failed_move = |source: io::Error| DiskError::MoveError {
         from: src.to_path_buf(),
         to: dest.to_path_buf(),
         source,
+    };
+
+    let mut created_nested = false;
+    if let Some(parent) = dest.parent() {
+        // The destination root itself is never created (invariant 1): callers only reach
+        // here for a root they have already checked exists. This creates the *nested*
+        // directories a mirrored relative path needs on an existing root. Whether *this*
+        // call made them matters only to the mid-copy fault seam below: it is the one
+        // directory the seam may remove, because the tool created it in this call and
+        // nothing else can be inside it.
+        created_nested = !parent.as_os_str().is_empty() && !parent.exists();
+        fs::create_dir_all(parent).map_err(failed_move)?;
+    }
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let partial = partial_sibling(dir);
+
+    // The mid-copy seam, armed only when the test-only `unlink-mid-copy` fault is set.
+    // `copy_contents` below sees only `File` handles, so it cannot unlink a name; the
+    // callback it invokes every chunk carries the byte position back out here, where the
+    // paths live, and `seam` takes the destination away at that deterministic point. The
+    // open descriptor keeps the now-unlinked inode alive, so the write loop itself can
+    // keep succeeding while every *path-based* step after it — metadata, the length
+    // re-check, the rename, and the caller's read-back — sees `ENOENT`, exactly as it
+    // would against a mount that vanished mid-write.
+    let fault = crate::faults::Fault::from_env();
+    let mut seam_fired = false;
+    let mut seam = |written: u64| {
+        if seam_fired {
+            return;
+        }
+        seam_fired = true;
+        // One copy only: a single destination went away, and for the invariants to be
+        // checked against something the sweep must still place the next copy on a healthy
+        // disk. See `faults::claim_unlink_mid_copy`.
+        if !crate::faults::claim_unlink_mid_copy() {
+            return;
+        }
+        let _ = fs::remove_file(&partial);
+        if created_nested {
+            let _ = fs::remove_dir_all(dir);
+        }
+        eprintln!(
+            "just_cache: JUST_CACHE_FAULT=unlink-mid-copy removed {} after {written} bytes of \
+             {expected}; the destination path no longer resolves",
+            partial.display()
+        );
+    };
+    // `None` in production, so the copy below is byte-for-byte the code it always was.
+    let observer: Option<&mut dyn FnMut(u64)> = match fault {
+        Some(crate::faults::Fault {
+            mode: crate::faults::FaultMode::UnlinkMidCopy,
+            ..
+        }) => Some(&mut seam),
+        _ => None,
     };
 
     let copied = (|| -> Result<u64, DiskError> {
@@ -531,7 +573,8 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
             .open(&partial)
             .map_err(failed_move)?;
 
-        copy_contents(&src_file, &mut dest_file, src_metadata.len()).map_err(failed_move)?;
+        copy_contents_observed(&src_file, &mut dest_file, src_metadata.len(), observer)
+            .map_err(failed_move)?;
         // Metadata is applied while the file is still private, so the mode/owner never
         // briefly differ from the source for anything that can see the destination.
         preserve_metadata(src, &partial, &src_metadata).map_err(failed_move)?;
@@ -594,6 +637,55 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
 /// 3. a plain sequential copy, only when the filesystem does not implement
 ///    `SEEK_DATA` (some network and exotic filesystems return `EINVAL`).
 pub(crate) fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+    // Production entry point: no observer, so every branch below is the copy it always
+    // was. Only the fault seam in `copy_into_place` passes an observer.
+    copy_contents_observed(src, dest, size, None)
+}
+
+/// Bytes copied between progress reports when a seam observer is installed.
+///
+/// Deliberately not `io::copy`'s own buffer size: the observed path is a plain chunked
+/// loop so that "the fault lands mid-copy" is a property of the code, not of whichever
+/// kernel copy strategy the host happens to use. Production never takes this path.
+const OBSERVED_CHUNK: usize = 64 * 1024;
+
+/// The test-only progress seam threaded through the copy helpers.
+///
+/// `observer` is `None` for every production call, and [`copy_observed`] checks that
+/// *before* choosing how to move bytes, so an unobserved copy is the same `io::copy` it
+/// always was — the seam costs production nothing and changes no byte. When an observer
+/// is present it is invoked with the cumulative bytes written after each chunk, which is
+/// how the mid-copy fault learns the byte position it needs while the copy is in flight.
+struct Progress<'a> {
+    observer: Option<&'a mut dyn FnMut(u64)>,
+    written: u64,
+}
+
+impl Progress<'_> {
+    fn advance(&mut self, bytes: u64) {
+        self.written += bytes;
+        if let Some(callback) = self.observer.as_deref_mut() {
+            callback(self.written);
+        }
+    }
+}
+
+/// [`copy_contents`] with an optional per-chunk observer.
+///
+/// The seam point is deliberately at this level, not at `copy_into_place`'s: the bytes
+/// move in the chunked paths below, so the only way to fire *while* they move is for the
+/// loop itself to report. The body is otherwise the copy it always was.
+fn copy_contents_observed(
+    src: &File,
+    dest: &mut File,
+    size: u64,
+    observer: Option<&mut dyn FnMut(u64)>,
+) -> io::Result<()> {
+    let mut progress = Progress {
+        observer,
+        written: 0,
+    };
+
     #[cfg(all(
         target_os = "linux",
         not(any(target_arch = "sparc", target_arch = "sparc64"))
@@ -602,14 +694,47 @@ pub(crate) fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Resul
         // The kernel only allows a clone within one filesystem; across devices this
         // fails with EXDEV and we fall through, which is the expected case here.
         if rustix::fs::ioctl_ficlone(&*dest, src).is_ok() {
+            // A clone is one syscall with no in-flight bytes, but the partial still exists
+            // and every step after this one is path-based, so the seam gets its one chance
+            // here — after the bytes are all present, before any name is needed. A fault
+            // that truly lands *mid-write* only reaches the chunked paths below; that is
+            // what the cross-device tests force by cloning across a mount.
+            progress.advance(size);
             return Ok(());
         }
     }
 
-    if copy_extents(src, dest, size)? {
+    if copy_extents(src, dest, size, &mut progress)? {
         return Ok(());
     }
-    copy_all(src, dest, size)
+    copy_all(src, dest, size, &mut progress)
+}
+
+/// Move `reader` into `dest`, reporting progress after each chunk when an observer is
+/// installed.
+///
+/// With no observer this is exactly `io::copy`, which is what production runs — the
+/// chunked loop exists only so a test can name a byte position inside the copy.
+fn copy_observed(
+    reader: &mut impl Read,
+    dest: &mut File,
+    progress: &mut Progress<'_>,
+) -> io::Result<u64> {
+    if progress.observer.is_none() {
+        return io::copy(reader, dest);
+    }
+    let mut buffer = vec![0u8; OBSERVED_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        dest.write_all(&buffer[..read])?;
+        total += read as u64;
+        progress.advance(read as u64);
+    }
+    Ok(total)
 }
 
 /// Walk the source's real extents with `SEEK_DATA`/`SEEK_HOLE`, writing only those and
@@ -628,7 +753,12 @@ pub(crate) fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Resul
     target_os = "solaris",
     target_os = "illumos"
 ))]
-fn copy_extents(src: &File, dest: &mut File, size: u64) -> io::Result<bool> {
+fn copy_extents(
+    src: &File,
+    dest: &mut File,
+    size: u64,
+    progress: &mut Progress<'_>,
+) -> io::Result<bool> {
     use rustix::fs::SeekFrom as RustixSeekFrom;
 
     let mut position = 0u64;
@@ -660,7 +790,7 @@ fn copy_extents(src: &File, dest: &mut File, size: u64) -> io::Result<bool> {
         dest.seek(SeekFrom::Start(data_start))?;
         let length = hole_start - data_start;
         let mut extent = io::Read::take(src, length);
-        let copied = io::copy(&mut extent, &mut *dest)?;
+        let copied = copy_observed(&mut extent, &mut *dest, progress)?;
         if copied != length {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -687,19 +817,24 @@ fn copy_extents(src: &File, dest: &mut File, size: u64) -> io::Result<bool> {
     target_os = "solaris",
     target_os = "illumos"
 )))]
-fn copy_extents(_src: &File, _dest: &mut File, _size: u64) -> io::Result<bool> {
+fn copy_extents(
+    _src: &File,
+    _dest: &mut File,
+    _size: u64,
+    _progress: &mut Progress<'_>,
+) -> io::Result<bool> {
     Ok(false)
 }
 
 /// The honest fallback for filesystems that cannot walk holes: read and write every
 /// byte. The result is correct but fully materialized, which is exactly the cost this
 /// module exists to avoid where it can.
-fn copy_all(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+fn copy_all(src: &File, dest: &mut File, size: u64, progress: &mut Progress<'_>) -> io::Result<()> {
     let mut source = src;
     source.seek(SeekFrom::Start(0))?;
     dest.seek(SeekFrom::Start(0))?;
     dest.set_len(0)?;
-    let copied = io::copy(&mut source, &mut *dest)?;
+    let copied = copy_observed(&mut source, &mut *dest, progress)?;
     if copied != size {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1087,7 +1222,16 @@ mod tests {
         let mut dest_file = File::create(&dest_path).unwrap();
         // Call the hole walker directly rather than the whole copy, so a reflink of an
         // unrelated test machine cannot mask whether SEEK_DATA did the work.
-        let used_extents = copy_extents(&src_file, &mut dest_file, apparent).unwrap();
+        let used_extents = copy_extents(
+            &src_file,
+            &mut dest_file,
+            apparent,
+            &mut Progress {
+                observer: None,
+                written: 0,
+            },
+        )
+        .unwrap();
         dest_file.sync_all().unwrap();
         assert!(used_extents, "this filesystem should support SEEK_DATA");
 
@@ -1145,5 +1289,57 @@ mod tests {
         let (stamp, source) = choose_access(Ok(atime), Ok(mtime));
         assert_eq!(stamp, atime, "a reported atime always wins");
         assert_eq!(source, AccessSource::Atime);
+    }
+
+    /// The mid-copy seam reports *while* the bytes move — the property the integration
+    /// test cannot see from outside the process. The copy is larger than the point a fault
+    /// would name, so the first report must land before the last chunk. Exercised through
+    /// the hole walker directly: that is the path a cross-device copy really takes, and a
+    /// same-filesystem clone would collapse the copy to a single report and prove nothing.
+    #[test]
+    fn the_copy_seam_reports_progress_while_bytes_are_still_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_path = tmp.path().join("src.bin");
+        let dest_path = tmp.path().join("dest.bin");
+        let size: u64 = 300 * 1024;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251 + 1) as u8).collect();
+        fs::write(&src_path, &payload).unwrap();
+
+        let src_file = File::open(&src_path).unwrap();
+        let mut dest_file = File::create(&dest_path).unwrap();
+
+        let mut reports: Vec<u64> = Vec::new();
+        {
+            let mut observer = |written: u64| reports.push(written);
+            let mut progress = Progress {
+                observer: Some(&mut observer),
+                written: 0,
+            };
+            // The sequential fallback only runs where the filesystem refuses SEEK_DATA,
+            // and it reports progress the same way, so either branch satisfies the test.
+            if !copy_extents(&src_file, &mut dest_file, size, &mut progress).unwrap() {
+                copy_all(&src_file, &mut dest_file, size, &mut progress).unwrap();
+            }
+        }
+        dest_file.sync_all().unwrap();
+
+        assert_eq!(
+            fs::read(&dest_path).unwrap(),
+            payload,
+            "the observed copy must still be a correct copy"
+        );
+        assert!(
+            reports.len() >= 2,
+            "a copy larger than one chunk must report more than once: {reports:?}"
+        );
+        assert!(
+            reports[0] < size,
+            "the first report must land mid-copy, not at the end: {reports:?}"
+        );
+        assert_eq!(
+            *reports.last().unwrap(),
+            size,
+            "the last report is the completed copy: {reports:?}"
+        );
     }
 }

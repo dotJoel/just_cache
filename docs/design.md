@@ -492,6 +492,36 @@ Still open, and honestly so:
   gone makes `audit`/`catalog sync` a usage error by design (invariant 1 — a root is never
   recreated), so a truly unmounted tier is verified by restoring the mount, not by a
   command that invents a directory.
+- **The same hook now covers the copy itself: a destination that disappears *while bytes
+  are in flight* is deterministically testable (#36).** The #25 mechanisms above land
+  *between* copies and during a read-back; the narrowest window — after the private
+  `.just_cache-partial-*` file exists and while the write loop is still filling it — could
+  not be reached at all, because the loop sees only `File` handles and the unlink needs a
+  path. `disk_management::copy_contents` therefore takes a test-only progress seam: an
+  `Option` callback invoked after each copied chunk, `None` in production, so an unobserved
+  copy is the same `io::copy` it always was. `copy_into_place`, which owns the paths, arms it
+  only under `JUST_CACHE_FAULT=unlink-mid-copy=N`, and only for the **first** copy in the
+  process: once `N` bytes have been written it unlinks the partial and removes the nested
+  directory the copy created, modelling a mount going away mid-write. The open descriptor
+  keeps the unlinked inode alive, so the write loop itself can keep succeeding while every
+  path-based step after it — `preserve_metadata`, the length re-check, the rename, and the
+  caller's read-back — gets `ENOENT`, which is exactly what the test asserts. Through the
+  real binary: the source is kept below the floor (invariant 2), the report names the vanished
+  disk, no `.just_cache-partial-*` survives on either side (invariant 8), the catalog is never
+  told the faulted tier holds the object (`locate` lists only the copy that verified), and a
+  later clean sweep heals from the intact source and the surviving copy.
+  `tests/fault_injection.rs` drives it; a `disk_management` unit test proves the seam reports
+  mid-copy (several chunks, the first strictly before the end), and disabling the seam fails
+  both.
+- **What the mid-copy seam does not cover, named rather than implied.** It reproduces the
+  *effect* of an unmount — bytes and name gone, path no longer resolving — at a byte position
+  a test can name; it is not the `umount` syscall, which a test has no privilege to make, and
+  not a thread racing a multi-megabyte copy, which would pass only when it won the race, and
+  so is not written. It cannot cover a *remount* of a different filesystem at the same path,
+  nor a failure the kernel reports as `ESTALE` rather than `ENOENT`. It also reaches only the
+  chunked copy paths: on one filesystem a copy is a `FICLONE` reflink with no in-flight bytes,
+  which is why the through-the-binary test puts the destination on the second filesystem and
+  asserts the cross-device pair before it starts.
 - **Reconcile is on demand and trusts the catalog's state.** Like `scrub`, nothing
   schedules it; P2. It also decides "does this object have a hot copy" from the `state`
   column, so a catalog left stale by a sweep (a sweep records replicas but does not
