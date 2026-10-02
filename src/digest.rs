@@ -21,6 +21,21 @@ const CHUNK: usize = 128 * 1024;
 
 /// BLAKE3 digest of a file's contents.
 pub fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
+    file_digest_reading(path, |_| {})
+}
+
+/// The same digest, with a callback after every chunk that was read.
+///
+/// `scrub` needs to stay inside an I/O budget while it hashes a whole tier, and the
+/// honest way to do that is to throttle the one read loop rather than to grow a second
+/// hasher beside it: two read loops is how the tool ends up with two answers to "is
+/// this the same file" (`disk_management::same_contents` already had to be folded back
+/// onto this module for exactly that reason). The callback gets the number of bytes
+/// just read and is expected to return promptly; a rate limiter turns that into a sleep.
+pub fn file_digest_reading<F>(path: &Path, mut on_read: F) -> io::Result<blake3::Hash>
+where
+    F: FnMut(usize),
+{
     let mut file = File::open(path)?;
     let mut hasher = Hasher::new();
     let mut buffer = vec![0u8; CHUNK];
@@ -29,6 +44,7 @@ pub fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
             0 => break,
             read => {
                 hasher.update(&buffer[..read]);
+                on_read(read);
             }
         }
     }
