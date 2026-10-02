@@ -159,10 +159,16 @@ fn an_identical_copy_across_the_mount_point_is_adopted_not_refused() {
     assert!(support::partial_files(cold.path()).is_empty());
 }
 
-/// The failure that the partial-file cleanup exists for: the source shrinks between the
-/// scan and the copy, so the copied byte count no longer matches what the scan promised.
-/// The move must fail, the half-copied temporary file must be removed, and the source
-/// must be left untouched — the destination gets neither the bytes nor a stray partial.
+/// A source that shrank between the scan and the move must not cross the boundary. The
+/// mover now notices before it copies anything (`SourceChanged`, checked against the size
+/// the scan promised), so the destination gets neither the bytes nor a stray partial.
+///
+/// The separate `ShortCopy` path — a source that changes *during* a long copy, where a
+/// partial has already been written and must be cleaned up — has **no automated test**:
+/// arranging a mid-copy change means racing a thread against the copy, and a test that
+/// passes only when the race is lost is worse than an admitted gap. The pre-check makes
+/// that path rare by design (it only triggers for a file changing under a copy already
+/// running), and its cleanup is a single `remove_file` beside the copy loop.
 #[test]
 fn a_failed_cross_device_copy_leaves_no_partial_file_behind() {
     let Some(second) = support::second_fs() else {
@@ -180,20 +186,19 @@ fn a_failed_cross_device_copy_leaves_no_partial_file_behind() {
     support::assert_cross_device(&watch, cold.path());
     support::assert_rename_is_cross_device(&watch, cold.path());
 
-    // Shrink behind the scan's back: the copy now moves fewer bytes than `entry.size`,
-    // which is exactly the short-copy guard in `copy_then_remove`.
+    // Shrink behind the scan's back: the file is no longer the one the policy chose.
     fs::write(&src, payload(512)).unwrap();
 
     let err = disk_management::move_file_with_symlink(cold.path(), entry)
-        .expect_err("a short copy must be reported, not accepted");
+        .expect_err("a changed source must not be moved");
     match err {
-        DiskError::ShortCopy {
+        DiskError::SourceChanged {
             actual, expected, ..
         } => {
-            assert_eq!(actual, 512, "the copy moved what the source still had");
+            assert_eq!(actual, 512, "actual size is what the source has now");
             assert_eq!(expected, 4096, "expected size came from the scan");
         }
-        other => panic!("expected ShortCopy, got {other:?}"),
+        other => panic!("expected SourceChanged, got {other:?}"),
     }
 
     assert!(
@@ -202,7 +207,7 @@ fn a_failed_cross_device_copy_leaves_no_partial_file_behind() {
     );
     assert!(
         support::partial_files(cold.path()).is_empty(),
-        "a failed copy must clean up its .just_cache-partial-* file: {:?}",
+        "a refused move must leave no .just_cache-partial-* file: {:?}",
         support::partial_files(cold.path())
     );
     assert!(
