@@ -2,6 +2,7 @@
 //! exercised from integration tests and reused as a crate.
 
 pub mod audit;
+pub mod catalog;
 pub mod digest;
 
 pub mod disk_management;
@@ -13,6 +14,9 @@ pub mod scope;
 pub use audit::{
     audit, classify, repair, AuditError, AuditReport, Finding, RepairAction, RepairOutcome,
     SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
+};
+pub use catalog::{
+    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, SyncReport, CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{

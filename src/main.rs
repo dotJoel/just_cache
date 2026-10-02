@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 use clap::{Args, Parser, Subcommand};
 
 use just_cache::audit::{self, RepairAction};
+use just_cache::catalog;
 use just_cache::disk_management::{self, FileEntry};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::journal::{self, Journal};
@@ -57,6 +58,8 @@ enum Command {
     Sweep(SweepArgs),
     /// Report structural inconsistency between the watched tree and the cold tiers.
     Audit(AuditArgs),
+    /// Manage the catalog: the source of truth for where files live.
+    Catalog(CatalogArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -180,11 +183,46 @@ struct AuditArgs {
     examples: usize,
 }
 
+/// The `catalog` subcommand and its own subcommands.
+#[derive(Debug, Args)]
+struct CatalogArgs {
+    #[command(subcommand)]
+    command: CatalogCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogCommand {
+    /// Ingest the current state of a tree the mover has already been running against.
+    ///
+    /// Files moved before the catalog existed are ingested exactly like ones moved
+    /// after. Anything that contradicts what the catalog already recorded is reported,
+    /// and the catalog is left as it was rather than rewritten to match the tree.
+    Sync(CatalogSyncArgs),
+}
+
+#[derive(Debug, Args)]
+struct CatalogSyncArgs {
+    /// Directory to watch. The same tree a sweep moves files out of.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk. Every
+    /// destination must already exist and is used both to resolve migrated symlinks and
+    /// to find orphaned copies.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Sweep(args)) => run_sweep(args),
         Some(Command::Audit(args)) => run_audit(args),
+        Some(Command::Catalog(args)) => run_catalog(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -289,6 +327,60 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             };
         }
         std::thread::sleep(Duration::from_secs(args.interval.max(1)));
+    }
+}
+
+fn run_catalog(args: CatalogArgs) -> ExitCode {
+    match args.command {
+        CatalogCommand::Sync(sync) => run_catalog_sync(sync),
+    }
+}
+
+/// Ingest the current state of the tree into the catalog.
+///
+/// Exits non-zero when the tree and the catalog disagree: a difference is a thing a
+/// human has to look at, and cron can alert without parsing any text.
+fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
+    if !args.watch.is_dir() {
+        eprintln!(
+            "just_cache: --watch {} is not a directory",
+            args.watch.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
+    let mut catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = match catalog.sync(&args.watch, &args.dest) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for line in report.summary_lines() {
+        println!("{line}");
+    }
+
+    if report.has_differences() {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
