@@ -342,6 +342,36 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
+<<<<<<< HEAD
+=======
+### When a catalog exists
+
+If a catalog is present — `--catalog <FILE>`, or the default
+`.just_cache-catalog.sqlite` beside the watch root that `catalog sync` writes — `audit`
+answers **from it** instead of walking both sides. The catalog supplies every cold-side
+fact; one pass over the watched tree is still made, because a path the catalog does not
+know is exactly what the walk must find:
+
+| Classification | What the catalog says |
+|---|---|
+| `missing-copy` | a recorded location has no file (primary or replica) |
+| `checksum-mismatch` | a primary copy's bytes no longer match the recorded checksum |
+| `copy-floor` | an object has no surviving copy (`docs/design.md` §6) |
+| `name-vanished` | the catalog records a name the tree no longer has |
+| `unknown-version` | a symlink resolves to a version the catalog does not hold |
+| `unknown-path` | a path the catalog has never seen — reported, never adopted |
+
+`duplicate`, `orphaned-copy`, `dangling-symlink` and `unexpected-target` keep their meaning.
+The summary says which source answered (`from catalog …` or `walked; no catalog`), so a
+reader never has to guess. Without a catalog file the walk-based audit above is the
+fallback, unchanged, and its `--repair` still checksum-verifies duplicates and re-points
+dangling links. In catalog mode `--repair` **never rewrites**: it marks each finding for
+resync and touches neither the tree nor the rows — the catalog may record a move the walk
+sees as unfinished, and guessing is how a repair deletes the wrong thing. Exit codes are
+unchanged (`0` clean, `1` findings, `2` bad invocation).
+
+<<<<<<< HEAD
+>>>>>>> f847712 (docs: record the catalog-backed audit and its named gaps)
 ## The catalog
 
 `audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched

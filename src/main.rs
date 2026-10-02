@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
 
-use just_cache::audit::{self, RepairAction};
+use just_cache::audit::{self, AuditSource, RepairAction};
 use just_cache::catalog;
 use just_cache::disk_management::{self, FileEntry};
 use just_cache::explain::{self, ExplainContext};
@@ -191,8 +191,26 @@ struct AuditArgs {
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
     dest: Vec<PathBuf>,
 
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    ///
+    /// When a catalog exists, audit answers from it plus one filesystem pass over the
+    /// tree instead of walking both sides; without one it falls back to the walk-based
+    /// audit. Naming a file that does not exist is an error rather than a silent
+    /// fallback, because the operator asked for a specific source of truth and quietly
+    /// walking instead would answer from a different one.
+    ///
+    /// The same file also supplies the scrub-state section reported below the findings:
+    /// how many copies were verified, never scrubbed, or marked damaged. That section is
+    /// informational and changes neither the findings nor the exit code.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
     /// Repair what can be repaired without guessing. Nothing is ever deleted until its
     /// content has been hashed and matched against the copy that is kept.
+    ///
+    /// In catalog mode this never touches the tree or the rows: a catalog/file
+    /// disagreement is a finding a human has to interpret, so repair marks it for resync
+    /// instead.
     #[arg(long)]
     repair: bool,
 
@@ -209,13 +227,6 @@ struct AuditArgs {
     /// How many findings the readable summary lists (JSON always has them all).
     #[arg(long, value_name = "N", default_value_t = audit::DEFAULT_EXAMPLES)]
     examples: usize,
-
-    /// Read scrub state from this catalog and report it: how many copies have been
-    /// verified, how many were never scrubbed, and how many are marked damaged. Read-only;
-    /// it does not change the structural findings or the exit code. (The JSON document does
-    /// not carry this section yet — see `docs/design.md` §9.)
-    #[arg(long, value_name = "FILE")]
-    catalog: Option<PathBuf>,
 }
 
 /// The `catalog` subcommand and its own subcommands.
@@ -623,21 +634,61 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
 
-    let report = match audit::audit_with_copies(&args.watch, &args.dest, args.copies) {
-        Ok(report) => report,
-        Err(err) => {
-            eprintln!("just_cache: {err}");
-            return ExitCode::from(EXIT_USAGE);
-        }
-    };
+    // The catalog is the arbiter when it exists; the walk-based audit is the bootstrap and
+    // the fallback. The file is never created here (invariant 9: only `catalog sync`
+    // creates it), so `is_file` is checked before opening. An explicitly named catalog
+    // that is missing is an error rather than a silent switch to a different source of
+    // truth — the operator asked for one and quietly walking instead would answer from
+    // another.
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
 
-    let repairs = if args.repair {
-        match audit::repair(&report) {
-            Ok(repairs) => Some(repairs),
+    let report = if catalog_path.is_file() {
+        let catalog = match catalog::Catalog::open(&catalog_path) {
+            Ok(catalog) => catalog,
             Err(err) => {
                 eprintln!("just_cache: {err}");
                 return ExitCode::from(EXIT_USAGE);
             }
+        };
+        match audit::catalog_audit(&catalog, &args.watch, &args.dest) {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        }
+    } else if args.catalog.is_some() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            catalog_path.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    } else {
+        match audit::audit_with_copies(&args.watch, &args.dest, args.copies) {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        }
+    };
+
+    // Walk mode repairs (checksum-verify a duplicate, re-point a dangling link) are
+    // unchanged. Catalog mode never mutates: it marks each finding for resync, because a
+    // disagreement between the catalog and the tree is a human's call.
+    let repairs = if args.repair {
+        match &report.source {
+            AuditSource::Walk => match audit::repair(&report) {
+                Ok(repairs) => Some(repairs),
+                Err(err) => {
+                    eprintln!("just_cache: {err}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            },
+            AuditSource::Catalog { .. } => Some(audit::catalog_repair(&report)),
         }
     } else {
         None
@@ -663,10 +714,22 @@ fn run_audit(args: AuditArgs) -> ExitCode {
                 .iter()
                 .filter(|repair| matches!(repair.action, RepairAction::NotAttempted { .. }))
                 .count();
-            println!(
-                "repair: {repaired} of {} finding(s) resolved, {refused} refused, {not_attempted} not attempted",
-                repairs.len()
-            );
+            let marked = repairs
+                .iter()
+                .filter(|repair| matches!(repair.action, RepairAction::MarkedForResync { .. }))
+                .count();
+            if marked > 0 {
+                // Catalog mode: say plainly that nothing was changed, so the operator does
+                // not read a "repair" run as a fix.
+                println!(
+                    "repair: catalog mode marked {marked} finding(s) for resync; nothing on disk or in the catalog was changed"
+                );
+            } else {
+                println!(
+                    "repair: {repaired} of {} finding(s) resolved, {refused} refused, {not_attempted} not attempted",
+                    repairs.len()
+                );
+            }
             for repair in repairs.iter().filter(|repair| !repair.repaired()) {
                 println!(
                     "  not repaired: {} ({})",

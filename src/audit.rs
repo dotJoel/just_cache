@@ -1,23 +1,34 @@
-//! Audit: compare the watched tree with the cold tiers and name every structural
-//! inconsistency between them.
+//! Audit: name every structural inconsistency in a tree, read-only unless `--repair`.
 //!
-//! The mover leaves one of four states behind, and each is detectable by looking at the
-//! two sides of a path at the same time (the destination mirrors a file's path relative
-//! to the watched root, so a relative path is the join key):
+//! Two modes, chosen by whether a catalog exists (`--catalog <FILE>`, or the default
+//! `.just_cache-catalog.sqlite` beside the watch root):
 //!
-//! | source path | cold copy | meaning |
-//! |---|---|---|
-//! | regular file | absent | healthy: not migrated, or not cold yet |
-//! | regular file | present | **duplicate**: the source removal never happened |
-//! | symlink, resolves under a cold tier | present | healthy: the migrated state |
-//! | symlink, resolves outside every cold tier | any | **unexpected-target** |
-//! | symlink that does not resolve | any | **dangling-symlink** |
-//! | absent | present | **orphaned-copy** |
+//! * **Catalog mode** (issue #19). The catalog is the arbiter, so the audit reads it and
+//!   makes a *single* filesystem pass over the primary copies instead of walking both
+//!   sides and reasoning about both. It answers the §3 questions directly — a name whose
+//!   primary location is gone, a copy that fails its recorded checksum, an object below
+//!   its tier's copy floor, a symlink pointing at nothing or at a version the catalog does
+//!   not have — plus the one thing only a walk can see: a path the catalog does not know
+//!   about, which is reported and never silently adopted.
+//! * **Walk mode** (the P0 audit, unchanged). No catalog file: the walk-based audit is the
+//!   bootstrap and the fallback. It compares the same relative path on both sides:
 //!
-//! The walk is read-only; classification is a pure function of what the two sides look
-//! like, so it can be unit-tested without touching a filesystem. Repair is the only
-//! mutating path and is deliberately conservative — it never removes bytes whose
-//! content it has not hashed and matched against the copy that stays behind.
+//!   | source path | cold copy | meaning |
+//!   |---|---|---|
+//!   | regular file | absent | healthy: not migrated, or not cold yet |
+//!   | regular file | present | **duplicate**: the source removal never happened |
+//!   | symlink, resolves under a cold tier | present | healthy: the migrated state |
+//!   | symlink, resolves outside every cold tier | any | **unexpected-target** |
+//!   | symlink that does not resolve | any | **dangling-symlink** |
+//!   | absent | present | **orphaned-copy** |
+//!
+//! Both modes are read-only; classification is a pure function of what the sides look like,
+//! so it can be unit-tested without touching a filesystem. Repair is the only mutating
+//! path and is deliberately conservative. In walk mode it never removes bytes whose content
+//! it has not hashed and matched against the copy that stays behind. In catalog mode it
+//! does not touch the filesystem at all: a disagreement between the catalog and the tree is
+//! a thing a human has to interpret (the catalog may record a move the walk sees as
+//! unfinished), so `repair` *marks* the finding for resync rather than rewriting rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -27,11 +38,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
+use crate::catalog::{Catalog, CatalogError};
 use crate::digest;
 use crate::disk_management::{self, DiskError};
 
 /// How many examples the readable summary lists by default.
 pub const DEFAULT_EXAMPLES: usize = 10;
+
+/// The copy floor this audit enforces for every object.
+///
+/// `docs/design.md` §6 asks for a *per-tier* floor the scheduler maintains, but the schema
+/// the catalog shipped with has no floor column and adding one is more than a small, honest
+/// migration (it needs a versioning step, not an `ALTER TABLE` that existing catalogs never
+/// see). So this enforces the only floor the schema can express without inventing a column:
+/// **every object must keep at least one location that still exists**. An object whose every
+/// recorded copy is gone is below the floor and is reported as such — the "missing copy is a
+/// repair job, reported, not silent" case, made visible even when each individual copy was
+/// already reported missing. A configurable per-tier floor is named as a gap in §9.
+pub const COPY_FLOOR: usize = 1;
 
 #[derive(Debug, Error)]
 pub enum AuditError {
@@ -61,6 +85,8 @@ pub enum AuditError {
     },
     #[error("--dest {path} is not an existing directory")]
     MissingDest { path: PathBuf },
+    #[error("catalog query failed: {0}")]
+    Catalog(#[from] CatalogError),
 }
 
 /// What one side of a relative path contains.
@@ -88,6 +114,10 @@ pub enum SourceState {
 }
 
 /// The classifications this audit can produce.
+///
+/// The first group is what the walk-based audit (walk mode) emits. The second is what the
+/// catalog-backed audit (catalog mode) emits; several of them reuse the walk vocabulary
+/// where the meaning is identical, and the rest are the answers only a catalog can give.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictKind {
     Healthy,
@@ -95,8 +125,26 @@ pub enum VerdictKind {
     DanglingSymlink,
     UnexpectedTarget,
     Duplicate,
-    /// An offloaded object with fewer copies on disk than its floor requires.
+    /// An offloaded object whose copies on disk number fewer than the floor. `missing`
+    /// names the configured destinations a copy is absent from — the disks it is not on.
     ReplicaLost,
+    /// Catalog mode: a name the catalog recorded is not in the tree (moved or deleted by
+    /// hand, or a mover that never finished). The row is kept; the disagreement is the
+    /// finding.
+    NameVanished,
+    /// Catalog mode: a location the catalog recorded has no file. `primary` in the verdict
+    /// says whether it was the copy of record.
+    MissingCopy,
+    /// Catalog mode: a copy exists but its bytes do not match the recorded checksum.
+    ChecksumMismatch,
+    /// Catalog mode: an object has fewer than [`COPY_FLOOR`] surviving copies.
+    CopyFloor,
+    /// Catalog mode: a symlink resolves to a file the catalog has no location for — a
+    /// version the catalog does not have.
+    UnknownVersion,
+    /// Catalog mode: a path exists in the tree that the catalog does not know about. It is
+    /// reported and never adopted; ingesting it is `catalog sync`'s job, not an audit's.
+    UnknownPath,
 }
 
 impl VerdictKind {
@@ -108,12 +156,27 @@ impl VerdictKind {
             VerdictKind::UnexpectedTarget => "unexpected-target",
             VerdictKind::Duplicate => "duplicate",
             VerdictKind::ReplicaLost => "replica-lost",
+            VerdictKind::NameVanished => "name-vanished",
+            VerdictKind::MissingCopy => "missing-copy",
+            VerdictKind::ChecksumMismatch => "checksum-mismatch",
+            VerdictKind::CopyFloor => "copy-floor",
+            VerdictKind::UnknownVersion => "unknown-version",
+            VerdictKind::UnknownPath => "unknown-path",
         }
     }
 
     /// The kinds that make `audit` exit non-zero, in report order.
-    pub fn problems() -> [VerdictKind; 5] {
+    ///
+    /// Every problem kind is listed, in both modes, so a cron job's counts do not change
+    /// shape when the catalog appears — the catalog-only kinds simply read `0` in walk mode.
+    pub fn problems() -> [VerdictKind; 11] {
         [
+            VerdictKind::MissingCopy,
+            VerdictKind::ChecksumMismatch,
+            VerdictKind::CopyFloor,
+            VerdictKind::NameVanished,
+            VerdictKind::UnknownVersion,
+            VerdictKind::UnknownPath,
             VerdictKind::OrphanedCopy,
             VerdictKind::DanglingSymlink,
             VerdictKind::UnexpectedTarget,
@@ -139,7 +202,7 @@ pub enum Verdict {
         target: PathBuf,
     },
     /// A real file at the source path *and* a copy on the cold tier: the source was
-    /// never removed after the copy landed.
+    /// never removed after the copy landed (or a restore is in progress).
     Duplicate,
     /// An offloaded object whose copies on disk number fewer than the floor. `missing`
     /// names the configured destinations a copy is absent from — the disks it is not on.
@@ -147,6 +210,37 @@ pub enum Verdict {
         present: Vec<PathBuf>,
         missing: Vec<PathBuf>,
     },
+    /// Catalog mode: the catalog records a name here, but the tree has nothing at the
+    /// path. The object is named so the row can be found without guessing.
+    NameVanished {
+        object: String,
+    },
+    /// Catalog mode: a recorded location has no file. `tier` and `key` locate it; `primary`
+    /// distinguishes the copy of record from a replica.
+    MissingCopy {
+        tier: String,
+        key: String,
+        primary: bool,
+    },
+    /// Catalog mode: a copy's bytes differ from the recorded checksum.
+    ChecksumMismatch {
+        tier: String,
+        key: String,
+        expected: String,
+        found: String,
+    },
+    /// Catalog mode: an object has fewer surviving copies than [`COPY_FLOOR`].
+    CopyFloor {
+        object: String,
+        copies: usize,
+    },
+    /// Catalog mode: a symlink resolves to something the catalog does not hold as a
+    /// location of the object the name points at.
+    UnknownVersion {
+        target: PathBuf,
+    },
+    /// Catalog mode: the catalog has no row for this path at all.
+    UnknownPath,
 }
 
 impl Verdict {
@@ -162,6 +256,12 @@ impl Verdict {
             Verdict::UnexpectedTarget { .. } => VerdictKind::UnexpectedTarget,
             Verdict::Duplicate => VerdictKind::Duplicate,
             Verdict::ReplicaLost { .. } => VerdictKind::ReplicaLost,
+            Verdict::NameVanished { .. } => VerdictKind::NameVanished,
+            Verdict::MissingCopy { .. } => VerdictKind::MissingCopy,
+            Verdict::ChecksumMismatch { .. } => VerdictKind::ChecksumMismatch,
+            Verdict::CopyFloor { .. } => VerdictKind::CopyFloor,
+            Verdict::UnknownVersion { .. } => VerdictKind::UnknownVersion,
+            Verdict::UnknownPath => VerdictKind::UnknownPath,
         }
     }
 }
@@ -178,33 +278,87 @@ pub struct Finding {
 }
 
 impl Finding {
-    /// One line, with the cold copy when it is relevant.
+    /// One line, with the cold copy when it is relevant, and the extra detail the
+    /// catalog-backed verdicts carry (a tier/key, an expected digest) so a human can act
+    /// without opening a shell.
     pub fn describe(&self) -> String {
-        if let Verdict::ReplicaLost { present, missing } = &self.verdict {
-            let list = |paths: &[PathBuf]| {
-                paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            return format!(
-                "replica-lost: {} (present on [{}]; missing on [{}])",
-                self.path.display(),
-                list(present),
-                list(missing)
-            );
+        let mut line = format!("{}: {}", self.verdict.kind().as_str(), self.path.display());
+        match &self.verdict {
+            Verdict::DanglingSymlink { target }
+            | Verdict::UnexpectedTarget { target }
+            | Verdict::UnknownVersion { target } => {
+                line.push_str(&format!(" (points at {})", target.display()));
+            }
+            Verdict::NameVanished { object } => {
+                line.push_str(&format!(" (catalog records object {object} here)"));
+            }
+            Verdict::MissingCopy { tier, key, primary } => {
+                line.push_str(&format!(
+                    " ({} copy {key} on {tier} is gone)",
+                    if *primary { "primary" } else { "replica" }
+                ));
+            }
+            Verdict::ChecksumMismatch {
+                tier,
+                key,
+                expected,
+                found,
+            } => {
+                line.push_str(&format!(
+                    " (recorded {expected}, found {found} at {tier}/{key})"
+                ));
+            }
+            Verdict::CopyFloor { object, copies } => {
+                line.push_str(&format!(
+                    " (object {object} has {copies} surviving copy/copies, floor is {COPY_FLOOR})"
+                ));
+            }
+            Verdict::ReplicaLost { present, missing } => {
+                let list = |paths: &[PathBuf]| {
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                line.push_str(&format!(
+                    " (present on [{}]; missing on [{}])",
+                    list(present),
+                    list(missing)
+                ));
+            }
+            Verdict::UnknownPath => {
+                line.push_str(" (the catalog does not know this path)");
+            }
+            Verdict::Healthy => {}
+            // The walk-mode verdicts that carry a cold copy: keep the hint.
+            Verdict::Duplicate | Verdict::OrphanedCopy => {
+                if let Some(copy) = &self.cold_copy {
+                    line.push_str(&format!(" (cold copy {})", copy.display()));
+                }
+            }
         }
-        let cold = self
-            .cold_copy
-            .as_ref()
-            .map(|copy| format!(" (cold copy {})", copy.display()))
-            .unwrap_or_default();
-        format!(
-            "{}: {}{cold}",
-            self.verdict.kind().as_str(),
-            self.path.display()
-        )
+        line
+    }
+}
+
+/// Where an audit's answers came from. Carried in the report so the summary and the JSON
+/// say it out loud: two ways to know the truth is exactly the confusion this issue exists
+/// to remove, so a reader must never have to guess which one answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditSource {
+    /// No catalog file: the audit walked both sides and compared them.
+    Walk,
+    /// Answered from the catalog at this path, plus one pass over the watched tree.
+    Catalog { path: PathBuf },
+}
+
+impl AuditSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditSource::Walk => "walk",
+            AuditSource::Catalog { .. } => "catalog",
+        }
     }
 }
 
@@ -213,6 +367,8 @@ impl Finding {
 pub struct AuditReport {
     pub watch: PathBuf,
     pub dests: Vec<PathBuf>,
+    /// Which source answered (catalog or a walk), and the catalog path when there is one.
+    pub source: AuditSource,
     /// Paths that exist on at least one side.
     pub scanned: usize,
     pub healthy: usize,
@@ -232,16 +388,26 @@ impl AuditReport {
             .count()
     }
 
-    /// The readable summary: counts for every class, then the first `examples` findings
-    /// so a human gets the shape of the problem without the full dump (use `--json` for
-    /// everything).
+    /// The readable summary: which source answered, counts for every class, then the first
+    /// `examples` findings so a human gets the shape of the problem without the full dump
+    /// (use `--json` for everything).
     pub fn summary_lines(&self, examples: usize) -> Vec<String> {
-        let mut lines = vec![format!(
-            "audit: {} paths scanned under {} against {} cold tier(s)",
-            self.scanned,
-            self.watch.display(),
-            self.dests.len()
-        )];
+        let answered_from = match &self.source {
+            AuditSource::Walk => format!(
+                "{} paths scanned under {} against {} cold tier(s) (walked; no catalog)",
+                self.scanned,
+                self.watch.display(),
+                self.dests.len()
+            ),
+            AuditSource::Catalog { path } => format!(
+                "{} paths scanned under {} against {} cold tier(s) (from catalog {})",
+                self.scanned,
+                self.watch.display(),
+                self.dests.len(),
+                path.display()
+            ),
+        };
+        let mut lines = vec![format!("audit: {answered_from}")];
         lines.push(format!("  healthy: {}", self.healthy));
         for kind in VerdictKind::problems() {
             lines.push(format!("  {}: {}", kind.as_str(), self.count(kind)));
@@ -284,9 +450,9 @@ impl AuditReport {
                 .map(|copy| json_string(&copy.to_string_lossy()))
                 .unwrap_or_else(|| "null".to_string());
             let target = match &finding.verdict {
-                Verdict::DanglingSymlink { target } | Verdict::UnexpectedTarget { target } => {
-                    json_string(&target.to_string_lossy())
-                }
+                Verdict::DanglingSymlink { target }
+                | Verdict::UnexpectedTarget { target }
+                | Verdict::UnknownVersion { target } => json_string(&target.to_string_lossy()),
                 _ => "null".to_string(),
             };
             findings.push(format!(
@@ -331,7 +497,7 @@ impl AuditReport {
                     ));
                 }
                 format!(
-                    "{{\"enabled\":true,\"removed-duplicate\":{},\"restored-symlink\":{},\"refused\":{},\"not-attempted\":{},\"actions\":[{}]}}",
+                    "{{\"enabled\":true,\"removed-duplicate\":{},\"restored-symlink\":{},\"refused\":{},\"not-attempted\":{},\"marked-for-resync\":{},\"actions\":[{}]}}",
                     repairs
                         .iter()
                         .filter(|r| matches!(r.action, RepairAction::RemovedDuplicate { .. }))
@@ -348,15 +514,26 @@ impl AuditReport {
                         .iter()
                         .filter(|r| matches!(r.action, RepairAction::NotAttempted { .. }))
                         .count(),
+                    repairs
+                        .iter()
+                        .filter(|r| matches!(r.action, RepairAction::MarkedForResync { .. }))
+                        .count(),
                     actions.join(",")
                 )
             }
         };
 
+        let catalog_json = match &self.source {
+            AuditSource::Catalog { path } => json_string(&path.to_string_lossy()),
+            AuditSource::Walk => "null".to_string(),
+        };
+
         format!(
-            "{{\"watch\":{},\"dest\":[{}],\"scanned\":{},\"healthy\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
+            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"scanned\":{},\"healthy\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
             json_string(&self.watch.to_string_lossy()),
             dest_json.join(","),
+            json_string(self.source.as_str()),
+            catalog_json,
             self.scanned,
             self.healthy,
             findings.join(","),
@@ -499,10 +676,327 @@ pub fn audit_with_copies(
     Ok(AuditReport {
         watch: watch.to_path_buf(),
         dests: dests.to_vec(),
+        source: AuditSource::Walk,
         scanned: relatives.len(),
         healthy,
         findings,
     })
+}
+
+/// Where a symlink resolves, as the catalog sees tiers.
+enum LinkTarget {
+    /// Points at something that does not exist.
+    Dangling { target: PathBuf },
+    /// Resolves, but outside every configured `--dest`.
+    Outside { target: PathBuf },
+    /// Resolves to a regular file under a `--dest`, at this relative key.
+    Cold {
+        target: PathBuf,
+        tier: String,
+        key: String,
+    },
+}
+
+/// Resolve a symlink against the canonical destination tiers. A local version of
+/// `catalog::resolve_link` because the audit needs the resolved tier *and* the storage key
+/// together, and the catalog's copy is private to its sync pass.
+fn resolve_target(link: &Path, dests: &[(PathBuf, String)]) -> Result<LinkTarget, AuditError> {
+    let target = fs::read_link(link).map_err(|source| AuditError::ReadLink {
+        path: link.to_path_buf(),
+        source,
+    })?;
+    let resolved = if target.is_absolute() {
+        target.clone()
+    } else {
+        // A relative link is relative to the directory holding the link.
+        link.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&target)
+    };
+    let Ok(canonical_target) = fs::canonicalize(&resolved) else {
+        return Ok(LinkTarget::Dangling { target });
+    };
+    if !fs::metadata(&canonical_target).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(LinkTarget::Outside { target });
+    }
+    for (root, tier) in dests {
+        let Ok(relative) = canonical_target.strip_prefix(root) else {
+            continue;
+        };
+        let key = relative.to_string_lossy().into_owned();
+        return Ok(LinkTarget::Cold {
+            target: canonical_target,
+            tier: tier.clone(),
+            key,
+        });
+    }
+    Ok(LinkTarget::Outside { target })
+}
+
+/// Answer from the catalog, plus one filesystem pass over the watched tree.
+///
+/// This is issue #19: the catalog is the arbiter, so the audit does not walk both sides and
+/// compare. It reads the recorded names, objects and locations, walks the *namespace* once,
+/// and asks the recorded rows whether the filesystem still agrees:
+///
+/// * a **name** whose path is gone is `name-vanished` (the row is kept: the bytes may be on
+///   a tier, and only a human knows whether the path moved or the file is gone);
+/// * a symlink that does not resolve is `dangling-symlink`, one that resolves outside the
+///   tiers is `unexpected-target`, and one that resolves to a file the catalog has no
+///   location for is `unknown-version` — a version the catalog does not have;
+/// * a **location** with no file is `missing-copy`, and a primary location whose bytes do
+///   not match the recorded checksum is `checksum-mismatch`;
+/// * an object with no surviving location is `copy-floor` (§6);
+/// * a path in the tree with no `name` row is `unknown-path` — reported, never adopted;
+/// * cold bytes no name references are `orphaned-copy`.
+///
+/// Read-only. Nothing here writes the catalog or the tree; a disagreement is a finding, not
+/// something to reconcile.
+pub fn catalog_audit(
+    catalog: &Catalog,
+    watch: &Path,
+    dests: &[PathBuf],
+) -> Result<AuditReport, AuditError> {
+    let watch_root = canonical(watch);
+    let watch_tier = watch_root.to_string_lossy().into_owned();
+    let dest_tiers: Vec<(PathBuf, String)> = dests
+        .iter()
+        .map(|dest| {
+            let root = canonical(dest);
+            let tier = root.to_string_lossy().into_owned();
+            (root, tier)
+        })
+        .collect();
+
+    let objects = catalog.all_objects()?;
+    let object_index: BTreeMap<String, crate::catalog::ObjectRecord> = objects
+        .iter()
+        .map(|object| (object.id.clone(), object.clone()))
+        .collect();
+    let names = catalog.all_names()?;
+    let locations = catalog.all_locations()?;
+
+    let walk = scan(watch)?;
+    let known: BTreeSet<PathBuf> = names.iter().map(|(path, _)| PathBuf::from(path)).collect();
+
+    let mut findings = Vec::new();
+    // Paths and objects that have at least one problem, so `healthy` counts an object as
+    // healthy only when neither the name nor any of its copies is in question.
+    let mut suspect_names: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut suspect_objects: BTreeSet<String> = BTreeSet::new();
+
+    // 1. Names: the namespace the catalog recorded, against what the tree actually has.
+    //
+    // Locations are indexed by (tier, key) so a symlink can ask "does the catalog hold this
+    // exact version?" without a linear scan per link.
+    let mut location_of: BTreeMap<(String, String), String> = BTreeMap::new();
+    for location in &locations {
+        location_of.insert(
+            (location.tier.clone(), location.storage_key.clone()),
+            location.object.clone(),
+        );
+    }
+
+    for (path, object) in &names {
+        let relative = PathBuf::from(path);
+        let abs = watch.join(&relative);
+        let verdict = match walk.get(&relative).copied() {
+            None => Some(Verdict::NameVanished {
+                object: object.clone(),
+            }),
+            Some(SideKind::File) => {
+                // A real file at the path. If the object also has a cold copy, the source
+                // removal never happened (or a restore is in progress): a duplicate.
+                let has_cold = locations
+                    .iter()
+                    .any(|location| location.object == *object && location.tier != watch_tier);
+                if has_cold {
+                    Some(Verdict::Duplicate)
+                } else {
+                    None
+                }
+            }
+            Some(SideKind::Symlink) => match resolve_target(&abs, &dest_tiers)? {
+                LinkTarget::Dangling { target } => Some(Verdict::DanglingSymlink { target }),
+                LinkTarget::Outside { target } => Some(Verdict::UnexpectedTarget { target }),
+                LinkTarget::Cold { target, tier, key } => {
+                    // The link resolves, but does the catalog hold *this version* of the
+                    // object? A link to a file the catalog does not have is exactly the
+                    // "version the catalog does not have" case.
+                    match location_of.get(&(tier, key)) {
+                        Some(holder) if holder == object => None,
+                        _ => Some(Verdict::UnknownVersion { target }),
+                    }
+                }
+            },
+        };
+
+        if let Some(verdict) = verdict {
+            suspect_names.insert(relative.clone());
+            suspect_objects.insert(object.clone());
+            findings.push(Finding {
+                path: abs,
+                relative,
+                cold_copy: None,
+                verdict,
+            });
+        }
+    }
+
+    // 2. Locations: every recorded copy, against the file the catalog says is there.
+    let mut by_object: BTreeMap<String, Vec<&crate::catalog::LocationRecord>> = BTreeMap::new();
+    for location in &locations {
+        by_object
+            .entry(location.object.clone())
+            .or_default()
+            .push(location);
+    }
+
+    let named_objects: BTreeSet<String> = names.iter().map(|(_, object)| object.clone()).collect();
+
+    for (object, copies) in &by_object {
+        let expected = object_index
+            .get(object)
+            .map(|record| record.checksum.as_str())
+            .unwrap_or_default();
+        let mut surviving = 0usize;
+
+        for copy in copies {
+            let file = PathBuf::from(&copy.tier).join(&copy.storage_key);
+            if !fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+                suspect_objects.insert(object.clone());
+                findings.push(Finding {
+                    path: file,
+                    relative: PathBuf::from(&copy.storage_key),
+                    cold_copy: None,
+                    verdict: Verdict::MissingCopy {
+                        tier: copy.tier.clone(),
+                        key: copy.storage_key.clone(),
+                        primary: copy.is_primary,
+                    },
+                });
+                continue;
+            }
+            surviving += 1;
+
+            // Only the copy of record is hashed. Hashing every replica on every audit is a
+            // scrub (`docs/design.md` §6), not an audit; a replica's *presence* is checked
+            // here and its bytes are the scrubber's job. The primary is the copy the tool
+            // would hand a reader, so its integrity is the one an audit must not miss.
+            if !copy.is_primary {
+                continue;
+            }
+            match digest::file_digest(&file) {
+                Ok(hash) if hash.to_hex().as_str() == expected => {}
+                Ok(hash) => {
+                    suspect_objects.insert(object.clone());
+                    findings.push(Finding {
+                        path: file,
+                        relative: PathBuf::from(&copy.storage_key),
+                        cold_copy: None,
+                        verdict: Verdict::ChecksumMismatch {
+                            tier: copy.tier.clone(),
+                            key: copy.storage_key.clone(),
+                            expected: expected.to_string(),
+                            found: hash.to_hex().to_string(),
+                        },
+                    });
+                }
+                Err(source) => {
+                    // Present but unreadable is not intact; report it in the same shape as a
+                    // mismatch rather than pretending the copy is fine.
+                    suspect_objects.insert(object.clone());
+                    findings.push(Finding {
+                        path: file,
+                        relative: PathBuf::from(&copy.storage_key),
+                        cold_copy: None,
+                        verdict: Verdict::ChecksumMismatch {
+                            tier: copy.tier.clone(),
+                            key: copy.storage_key.clone(),
+                            expected: expected.to_string(),
+                            found: format!("unreadable: {source}"),
+                        },
+                    });
+                }
+            }
+        }
+
+        if surviving < COPY_FLOOR {
+            suspect_objects.insert(object.clone());
+            findings.push(Finding {
+                path: PathBuf::from(object),
+                relative: PathBuf::new(),
+                cold_copy: None,
+                verdict: Verdict::CopyFloor {
+                    object: object.clone(),
+                    copies: surviving,
+                },
+            });
+        }
+
+        // Cold bytes with no name: nothing in the tree will ever read them.
+        if !named_objects.contains(object) {
+            for copy in copies {
+                if copy.tier == watch_tier {
+                    continue;
+                }
+                findings.push(Finding {
+                    path: PathBuf::from(&copy.tier).join(&copy.storage_key),
+                    relative: PathBuf::from(&copy.storage_key),
+                    cold_copy: Some(PathBuf::from(&copy.tier).join(&copy.storage_key)),
+                    verdict: Verdict::OrphanedCopy,
+                });
+            }
+        }
+    }
+
+    // 3. Paths the catalog does not know about. Reported, never adopted: ingesting a new
+    //    name is `catalog sync`'s job, and an audit that silently ingested would be the
+    //    catalog rewriting itself to match a tree — the exact failure the sync pass avoids.
+    for relative in walk.keys() {
+        if !known.contains(relative) {
+            findings.push(Finding {
+                path: watch.join(relative),
+                relative: relative.clone(),
+                cold_copy: None,
+                verdict: Verdict::UnknownPath,
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.verdict.kind().as_str().cmp(b.verdict.kind().as_str()))
+    });
+
+    let mut scanned: BTreeSet<&PathBuf> = walk.keys().collect();
+    scanned.extend(known.iter());
+
+    let healthy = names
+        .iter()
+        .filter(|(path, object)| {
+            !suspect_names.contains(Path::new(path)) && !suspect_objects.contains(object)
+        })
+        .count();
+
+    Ok(AuditReport {
+        watch: watch.to_path_buf(),
+        dests: dests.to_vec(),
+        source: AuditSource::Catalog {
+            path: catalog.path().to_path_buf(),
+        },
+        scanned: scanned.len(),
+        healthy,
+        findings,
+    })
+}
+
+/// Canonical form of a root, so a tier string recorded by `catalog sync` (which uses the
+/// same canonicalization) matches the one the audit computes. A path that cannot be
+/// canonicalized is used as given — the same fallback the catalog makes.
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn scan(root: &Path) -> Result<BTreeMap<PathBuf, SideKind>, AuditError> {
@@ -579,6 +1073,12 @@ pub enum RepairAction {
     Refused { reason: String },
     /// The finding is not safely auto-repairable.
     NotAttempted { reason: String },
+    /// Catalog mode: the finding is a catalog/file disagreement, so repair did not touch
+    /// either side. The row is marked for resync — investigate the tree, then run
+    /// `catalog sync` (or a scrub) to re-record it. This is deliberately weaker than a
+    /// rewrite: the catalog may record a move the walk sees as unfinished, and guessing is
+    /// how a repair deletes the wrong thing.
+    MarkedForResync { reason: String },
 }
 
 impl RepairAction {
@@ -588,6 +1088,7 @@ impl RepairAction {
             RepairAction::RestoredSymlink { .. } => "restored-symlink",
             RepairAction::Refused { .. } => "refused",
             RepairAction::NotAttempted { .. } => "not-attempted",
+            RepairAction::MarkedForResync { .. } => "marked-for-resync",
         }
     }
 
@@ -601,9 +1102,9 @@ impl RepairAction {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            RepairAction::Refused { reason } | RepairAction::NotAttempted { reason } => {
-                Some(reason)
-            }
+            RepairAction::Refused { reason }
+            | RepairAction::NotAttempted { reason }
+            | RepairAction::MarkedForResync { reason } => Some(reason),
             _ => None,
         }
     }
@@ -694,6 +1195,19 @@ pub fn repair(report: &AuditReport) -> Result<Vec<RepairOutcome>, AuditError> {
                 reason: "replicating a lost copy from a surviving one is a mover pass, not audit repair"
                     .to_string(),
             },
+            // Catalog-mode verdicts are never repaired by the walk repairer: they are
+            // disagreements between the catalog and the tree, and `catalog_repair` marks
+            // them for resync instead of guessing. Reaching one here means a caller wired
+            // the wrong report to the wrong repairer, so refuse rather than act.
+            Verdict::NameVanished { .. }
+            | Verdict::MissingCopy { .. }
+            | Verdict::ChecksumMismatch { .. }
+            | Verdict::CopyFloor { .. }
+            | Verdict::UnknownVersion { .. }
+            | Verdict::UnknownPath => RepairAction::NotAttempted {
+                reason: "catalog-mode finding: use catalog repair, which marks it for resync"
+                    .to_string(),
+            },
         };
 
         outcomes.push(RepairOutcome {
@@ -704,6 +1218,33 @@ pub fn repair(report: &AuditReport) -> Result<Vec<RepairOutcome>, AuditError> {
     }
 
     Ok(outcomes)
+}
+
+/// Repair a catalog-backed audit: mark, do not rewrite.
+///
+/// Catalog mode never mutates. The catalog is the arbiter precisely because it can remember
+/// something the filesystem walk cannot see (a move recorded but not yet observable, a copy
+/// on an unmounted tier), so a disagreement is not an instruction to change the tree. Each
+/// finding is marked for resync — the operator investigates, then `catalog sync` re-records
+/// the tree's actual state (which itself refuses to guess: see `catalog.rs`). Nothing is
+/// deleted, re-pointed, or rewritten here, and the exit-code contract is unchanged: an
+/// unresolved finding keeps the alert up.
+pub fn catalog_repair(report: &AuditReport) -> Vec<RepairOutcome> {
+    report
+        .findings
+        .iter()
+        .map(|finding| RepairOutcome {
+            path: finding.path.clone(),
+            kind: finding.verdict.kind(),
+            action: RepairAction::MarkedForResync {
+                reason: format!(
+                    "{} is a catalog/file disagreement; the row was left unchanged. \
+                     Investigate, then run `just_cache catalog sync` to re-record it.",
+                    finding.verdict.kind().as_str()
+                ),
+            },
+        })
+        .collect()
 }
 
 /// Remove a verified-duplicate source file and leave the symlink the mover intended.
@@ -879,6 +1420,7 @@ mod tests {
         let report = AuditReport {
             watch: PathBuf::from("/watch"),
             dests: vec![PathBuf::from("/cold")],
+            source: AuditSource::Walk,
             scanned: 10,
             healthy: 6,
             findings: vec![
@@ -929,6 +1471,7 @@ mod tests {
         let report = AuditReport {
             watch: PathBuf::from("/watch"),
             dests: vec![PathBuf::from("/cold")],
+            source: AuditSource::Walk,
             scanned: 1,
             healthy: 0,
             findings: vec![Finding {
@@ -956,5 +1499,68 @@ mod tests {
         let json = report.to_json(Some(&repaired));
         assert!(json.contains("\"removed-duplicate\":1"));
         assert!(json.contains("\"enabled\":true"));
+    }
+
+    #[test]
+    fn the_copy_floor_is_the_one_the_schema_can_express() {
+        // A configurable per-tier floor needs a schema column the catalog does not have;
+        // until then the only honest floor is "at least one copy survives". Pinning it here
+        // makes a later change to that number a deliberate act, not an accident.
+        assert_eq!(COPY_FLOOR, 1);
+    }
+
+    #[test]
+    fn catalog_findings_render_their_tier_and_digest_and_name_their_source() {
+        let report = AuditReport {
+            watch: PathBuf::from("/watch"),
+            dests: vec![PathBuf::from("/cold")],
+            source: AuditSource::Catalog {
+                path: PathBuf::from("/watch/.just_cache-catalog.sqlite"),
+            },
+            scanned: 3,
+            healthy: 0,
+            findings: vec![
+                Finding {
+                    path: PathBuf::from("/cold/a.bin"),
+                    relative: PathBuf::from("a.bin"),
+                    cold_copy: None,
+                    verdict: Verdict::ChecksumMismatch {
+                        tier: "/cold".to_string(),
+                        key: "a.bin".to_string(),
+                        expected: "aaaa".to_string(),
+                        found: "bbbb".to_string(),
+                    },
+                },
+                Finding {
+                    path: PathBuf::from("/watch/b.bin"),
+                    relative: PathBuf::from("b.bin"),
+                    cold_copy: None,
+                    verdict: Verdict::NameVanished {
+                        object: "cccc".to_string(),
+                    },
+                },
+                Finding {
+                    path: PathBuf::from("dddd"),
+                    relative: PathBuf::new(),
+                    cold_copy: None,
+                    verdict: Verdict::CopyFloor {
+                        object: "dddd".to_string(),
+                        copies: 0,
+                    },
+                },
+            ],
+        };
+
+        let summary = report.summary_lines(10).join("\n");
+        assert!(summary.contains("from catalog"), "{summary}");
+        assert!(summary.contains("checksum-mismatch: 1"), "{summary}");
+        assert!(summary.contains("recorded aaaa, found bbbb"), "{summary}");
+        assert!(summary.contains("name-vanished: 1"), "{summary}");
+        assert!(summary.contains("floor is 1"), "{summary}");
+
+        let json = report.to_json(None);
+        assert!(json.contains("\"source\":\"catalog\""), "{json}");
+        assert!(json.contains("\"checksum-mismatch\":1"), "{json}");
+        assert!(json.contains(".just_cache-catalog.sqlite"), "{json}");
     }
 }
