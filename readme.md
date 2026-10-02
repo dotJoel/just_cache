@@ -19,12 +19,10 @@ just_cache \
 That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
 entries keep working); `just_cache sweep ...` is the explicit form,
 [`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
-<<<<<<< HEAD
-still agree, and [`just_cache explain ...`](#explaining-one-path) answers why one path is
-where it is.
-still agree, and [`just_cache restore ...`](#restoring-a-file) brings an offloaded file
-back.
->>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
+still agree, [`just_cache explain ...`](#explaining-one-path) answers why one path is
+where it is, [`just_cache restore ...`](#restoring-a-file) brings an offloaded file back,
+and [`just_cache scrub ...`](#scrubbing-for-bitrot) reads every stored copy back and
+verifies it against the catalog.
 
 ## Why
 
@@ -344,7 +342,6 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
-<<<<<<< HEAD
 ## The catalog
 
 `audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
@@ -458,7 +455,48 @@ A named gap: with no catalog there is no recorded digest to check a cold copy ag
 *before* copying it, so a copy that was already corrupt would be restored faithfully. The
 read-back catches a torn copy; only the catalog (issue #16) can catch a corrupt one, and
 `docs/design.md` §9 says so.
->>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
+
+## Scrubbing for bitrot
+
+`catalog sync` records what a copy *should* hash to; `scrub` is what proves it still does.
+Every location in the catalog is read back and hashed against the object id (which is the
+BLAKE3 checksum, so there is no second copy of the truth to drift), and a copy that no
+longer matches is repaired from a sibling that verifies clean — or, if none exists, marked
+damaged and reported, **never deleted**.
+
+```sh
+# verify every stored copy; --rate caps read throughput (KiB/s) so a busy tier keeps up
+just_cache scrub --catalog /mnt/cache/media/.just_cache-catalog.sqlite --rate 2048
+
+# see the damage before the tool touches anything
+just_cache scrub --catalog /mnt/cache/media/.just_cache-catalog.sqlite --dry-run
+```
+
+What it guarantees:
+
+- **A corrupt copy is repaired from a verified sibling.** The replacement is built beside
+  the corrupt file under the `.just_cache-partial-*` marker, read back and hashed against
+  the recorded checksum, and only then renamed into place — the same verify-before-delete
+  path restore uses, run in the other direction. The good copy is never touched.
+- **The last copy is never deleted.** If every copy of an object is corrupt, the object is
+  recorded damaged (the catalog's `damage` table) and named in the output; the bytes stay
+  exactly where they are for a human to recover or retire.
+- **A missing copy is reported, not called rot.** An unmounted tier may hold perfectly good
+  bytes, so a missing file is a finding, not damage; a tier root that does not exist is
+  named once instead of once per location under it.
+- **It resumes.** The last verification of every location is written to the catalog as the
+  scrub goes (`scrub_state`), so a run that is killed part-way re-reads only what it had
+  not reached, and `audit --catalog` can say "never scrubbed" for a copy instead of
+  implying the catalog vouches for bytes nobody has read back.
+- **`--dry-run` changes nothing.** It reads and reports what it would repair, writing
+  neither the repair nor any last-verified state, so it is safe to repeat.
+
+Exit codes: `0` clean, `1` corruption (repaired *or* damaged — rot is evidence about the
+tier and cron should see it), `2` bad invocation (missing catalog file, `--rate 0`).
+
+A named limit: `scrub` is on demand; it does not schedule itself (that is P2), and a
+location verified once is skipped until its content changes under the catalog. `--rate`
+is what makes a cron-driven scrub safe to run against a tier that is serving reads.
 
 ## Running it continuously
 
@@ -485,13 +523,13 @@ oldest-first ordering, access pins, dry runs, full tiers), scope (include/exclud
 and the size window), the guards (a real second process holding a real descriptor, and
 hardlinked pairs), metadata and sparseness across a real mount point, journal recovery
 (each crash state, plus the CLI against a damaged journal), audit (every
-classification, the checksum-guarded repair, and the exit-code contract cron sees), and
-<<<<<<< HEAD
-explain (the four-stage ordering, a real holding process named by pid, the migrated and
-missing cases, and the exit-code contract through the binary — `--json` included).
-restore (the round trip, idempotence, repairing a broken symlink, refusing a same-size
-stranger, `--remove-copy`, and a genuine cross-device restore).
->>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
+classification, the checksum-guarded repair, and the exit-code contract cron sees),
+`explain` (the four-stage ordering, a real holding process named by pid, the migrated and
+missing cases, and the exit-code contract through the binary — `--json` included),
+`restore` (the round trip, idempotence, repairing a broken symlink, refusing a same-size
+stranger, `--remove-copy`, and a genuine cross-device restore), and `scrub` (a hand-corrupted
+copy repaired from its sibling, a last surviving copy marked rather than deleted, `--dry-run`,
+resume via last-verified state, a measured sparse-file check, and `--rate` pacing).
 
 A few of these drive the actual binary rather than the library, because the promises that
 matter — exit codes, recovery messages, refusing to sweep with an unreadable journal —
@@ -547,18 +585,17 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
-<<<<<<< HEAD
+| [`src/scrub.rs`](src/scrub.rs) | Reading every stored copy back, repairing rot from a verified sibling, marking what cannot be repaired. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain` and `restore` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `restore` and `scrub` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
-<<<<<<< HEAD
 | [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
 | [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
->>>>>>> 3abc103 (docs: document restore and its catalog-free limits)
+| [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
