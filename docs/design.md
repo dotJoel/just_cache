@@ -357,7 +357,43 @@ Closed in P0: metadata/sparseness loss on cross-device copies; size-only adoptio
 the open-file/hardlink gap; the crash window between source removal and symlink
 creation; and CI's failure to exercise the EXDEV path.
 
+Closed in P1 by `just_cache catalog sync` (#16): the catalog is now *written*, so "where
+does this file live" is finally a question the filesystem is not the only answer to. It is
+content-addressed (id = BLAKE3 of the bytes, computed at ingest, so a rename keeps its
+identity and a scrub can compare any copy to any other); a location is a `(tier,
+storage_key)` pair where a tier is a real root — the watch root or a `--dest` root — and
+never a cache overlay (§2.1); and idle files move through the lifecycle states
+`present` -> `offloaded` -> `restoring`. Ingest is one SQLite transaction, committed at the
+end, so an interrupted sync leaves the catalog exactly as it was rather than half-applied
+(the same guarantee `journal.rs` gives a move). A tree the mover has already been running
+against is ingested by the first sync — migrations that predate the catalog are found by
+the same walk, which is why the migration story is "ingest, not migrate". A location is
+only removed when another location still holds the object (a normal offload, where the
+stale hot row is replaced by the cold one) or when no name references the object: a name
+is never stranded pointing at an object with nowhere to live.
+
 Still open, and honestly so:
+
+- **A tree edited by hand is reported, not reconciled.** A name the catalog recorded that
+  is gone or now hashes differently, and a location whose file vanished or was replaced,
+  are reported — `sync` exits non-zero — and their rows are left exactly as they were; new
+  names and locations that nothing contradicts are still ingested. What is missing is a
+  resolution step: deciding a vanished name was a rename might be a human command, but it
+  does not exist yet, so a difference repeats on every sync. That is deliberately louder
+  than auto-healing in the wrong direction, and it is the honest state of #16.
+- **Only the symlink provider's flat mirrored layout is understood.** Two-disk replication
+  within a tier, remote/object tiers, and offline volumes are later work; the `volume`
+  table ships empty.
+- **`lifecycle` is ingested, not maintained.** `last_access` is filled at first ingest
+  from atime; nothing updates it yet because proper access observation is the namespace
+  provider's job (§4, P2). A `restoring` state is recorded when both a hot and a cold copy
+  exist, but no command drives a restore to completion; `audit` remains the tool that
+  tells a restore-in-progress from a true duplicate.
+- **Every file is hashed on every sync.** Correct, because identity is the hash, but not
+  cheap; there is no digest cache keyed on size and mtime yet.
+- **One unreadable file aborts the sync** rather than being skipped: a catalog built by
+  silently ignoring a file would be a catalog that disagrees with the tree. The mover's
+  rule that one failure never stops a sweep has no catalog equivalent yet.
 
 - **Journal records carry a size, not a digest.** Recovery refuses to link a name to a
   copy whose size does not match what the move promised, which is the strongest check

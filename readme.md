@@ -263,6 +263,41 @@ just_cache audit --watch /mnt/cache/media --dest /mnt/disk-slow/media || notify
 With `--repair` the exit code is `0` only when every finding was resolved, so a cron
 job that keeps the tree healthy stays quiet.
 
+## The catalog
+
+`audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
+tree and every cold tier and ingests their current state into a SQLite file whose id for
+each object is the BLAKE3 hash of its bytes — so identity survives a rename, dedup falls
+out, and "does this file exist?" is a question the catalog can answer even for a tier that
+is not mounted.
+
+```sh
+just_cache catalog sync \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media
+```
+
+The catalog defaults to `.just_cache-catalog.sqlite` beside the watch root (the walk
+skips the `.just_cache` prefix, so it can never be moved onto a cold tier); `--catalog
+<FILE>` puts it anywhere else. A file the mover already offloaded is picked up by the
+first sync exactly like one offloaded afterwards — the migration story is ingest, not
+migrate.
+
+Each row records where the bytes are (a tier plus a storage key), their size, and the
+BLAKE3 checksum computed at ingest. An object moves through `present` -> `offloaded` ->
+`restoring`, and a location is only removed when another location still holds the object
+or when no name references it. Cache residency is never written to `location` (§2.1 of the
+design): a copy in a RAM or SSD promotion target is re-derivable, so a restart can never
+turn a volatile copy into data of record.
+
+`sync` **ingests new facts and reports contradictions; it never rewrites the catalog to
+match a hand-edited tree**. If a name the catalog recorded is gone or now hashes to
+different bytes, or a location's file vanished or changed, the difference is printed and
+the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
+bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
+the tree is worse than none.
+
 ## Running it continuously
 
 ```sh
@@ -340,16 +375,18 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 | [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
 | [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
 | [`src/journal.rs`](src/journal.rs) | What the mover was in the middle of: the intent record, and recovery from an interrupted move. |
+| [`src/catalog.rs`](src/catalog.rs) | The SQLite catalog — content-addressed locations, names, and the transactional `sync` that ingests the tree. |
 | [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep` and `audit` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit` and `catalog` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
+| [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
 
 ## Design
