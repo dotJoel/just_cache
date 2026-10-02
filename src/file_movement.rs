@@ -469,6 +469,7 @@ mod tests {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             size,
+            allocated: size,
             last_access: SystemTime::now() - Duration::from_secs(last_access_secs_ago),
             is_symlink: false,
         }

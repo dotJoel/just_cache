@@ -217,7 +217,7 @@ fn sweep(
     for dest in &cli.dest {
         let tier =
             file_movement::migrate_least_used(&pending, tracker, policy, scope, now, |entry| {
-                Ok(destination_with_room(dest, entry.size, min_free))
+                Ok(destination_with_room(dest, entry.allocated, min_free))
             });
 
         // Whatever this tier took (or would take) is off the table for slower disks.
@@ -285,9 +285,18 @@ fn sweep(
 ///
 /// The floor keeps a sweep from filling the disk it is moving onto; a tier with no
 /// room is not an error, the file simply waits for the next sweep.
-fn destination_with_room(dest: &Path, size: u64, min_free: u64) -> Option<PathBuf> {
+/// Whether this tier can hold the bytes about to be written to it.
+///
+/// `needed` is the file's *allocated* size, not its apparent length: the copy preserves
+/// holes, so a 1 GiB sparse file needs kilobytes of room, and measuring it by `len()` would
+/// refuse a move the tier can easily afford. The risk of being wrong the other way (a
+/// destination that cannot preserve holes, where the fallback copy writes every byte) is
+/// covered downstream: a copy that runs out of space removes its partial file, reports a
+/// failure and leaves the source untouched, so the worst case is a failed move rather than
+/// a lost file.
+fn destination_with_room(dest: &Path, needed: u64, min_free: u64) -> Option<PathBuf> {
     match disk_management::available_space(dest) {
-        Some(free) if free >= min_free.saturating_add(size) => Some(dest.to_path_buf()),
+        Some(free) if free >= min_free.saturating_add(needed) => Some(dest.to_path_buf()),
         Some(_) => None,
         // Free space unknown on this filesystem: try the tier instead of stalling.
         None => Some(dest.to_path_buf()),

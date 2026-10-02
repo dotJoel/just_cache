@@ -101,6 +101,10 @@ pub struct FileEntry {
     /// Path of the file relative to the watched root.
     pub relative: PathBuf,
     pub size: u64,
+    /// Bytes the file actually occupies on disk (`st_blocks`). Below `size` for a sparse
+    /// file, and the number that matters when asking whether a tier has room: a copy that
+    /// preserves holes writes these bytes, not `size` of them.
+    pub allocated: u64,
     /// Best available "when was this last used" stamp: atime, falling back to mtime.
     pub last_access: SystemTime,
     /// True when this entry is itself a symlink (i.e. already migrated).
@@ -152,7 +156,7 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
             };
 
             if metadata.is_symlink() {
-                found.push(entry_for(root, path, 0, last_access(&metadata), true));
+                found.push(entry_for(root, path, 0, 0, last_access(&metadata), true));
                 continue;
             }
             if metadata.is_dir() {
@@ -172,6 +176,7 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
                 root,
                 path,
                 metadata.len(),
+                allocated_bytes(&metadata),
                 last_access(&metadata),
                 false,
             ));
@@ -185,6 +190,7 @@ fn entry_for(
     root: &Path,
     path: PathBuf,
     size: u64,
+    allocated: u64,
     last_access: SystemTime,
     is_symlink: bool,
 ) -> FileEntry {
@@ -196,9 +202,23 @@ fn entry_for(
         path,
         relative,
         size,
+        allocated,
         last_access,
         is_symlink,
     }
+}
+
+/// Bytes a file occupies on disk. A sparse file's holes are not allocated, so this is
+/// below `len()`, and it is the amount a hole-preserving copy has to find room for.
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn last_access(metadata: &fs::Metadata) -> SystemTime {
