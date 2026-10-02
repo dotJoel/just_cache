@@ -3,6 +3,7 @@
 
 pub mod disk_management;
 pub mod file_movement;
+pub mod opened;
 pub mod scope;
 
 pub use disk_management::{
@@ -13,4 +14,5 @@ pub use file_movement::{
     log_file_movement, migrate_least_used, select_candidates, FileOutcome, MigrationRecord,
     MigrationReport, Policy, SkipReason, UsageTracker,
 };
+pub use opened::{Coverage, FileId, Guards, InUse, OpenFiles};
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError};

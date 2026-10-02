@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::disk_management::{self, DiskError, FileEntry, MoveOutcome};
+use crate::opened::{Guards, InUse};
 use crate::scope::{Rejected, Scope};
 
 /// What we know about one tracked file.
@@ -129,6 +130,21 @@ pub enum SkipReason {
     RecentlyAccessed(u64),
     BeyondLimit,
     EmptyFile,
+    /// A process has the file open right now.
+    OpenElsewhere,
+    /// Moving it would split a hardlinked pair across filesystems.
+    Hardlinked {
+        links: u64,
+    },
+}
+
+impl From<InUse> for SkipReason {
+    fn from(in_use: InUse) -> Self {
+        match in_use {
+            InUse::OpenElsewhere => SkipReason::OpenElsewhere,
+            InUse::Hardlinked { links } => SkipReason::Hardlinked { links },
+        }
+    }
 }
 
 impl From<Rejected> for SkipReason {
@@ -161,6 +177,10 @@ impl std::fmt::Display for SkipReason {
             SkipReason::RecentlyAccessed(n) => write!(f, "accessed {n}x this run"),
             SkipReason::BeyondLimit => write!(f, "over this sweep's move limit"),
             SkipReason::EmptyFile => write!(f, "empty file, nothing to reclaim"),
+            SkipReason::OpenElsewhere => write!(f, "open by another process"),
+            SkipReason::Hardlinked { links } => {
+                write!(f, "hardlinked elsewhere ({links} links)")
+            }
         }
     }
 }
@@ -176,6 +196,7 @@ pub fn select_candidates<'a>(
     tracker: &UsageTracker,
     policy: &Policy,
     scope: &Scope,
+    guards: &Guards,
     now: SystemTime,
 ) -> (Vec<&'a FileEntry>, Vec<(&'a FileEntry, SkipReason)>) {
     let mut eager: Vec<(&FileEntry, SystemTime)> = Vec::new();
@@ -191,6 +212,13 @@ pub fn select_candidates<'a>(
         }
         if entry.size == 0 {
             skipped.push((entry, SkipReason::EmptyFile));
+            continue;
+        }
+        // Live state beats every heuristic below: a file something is using is not cold,
+        // whatever its access time says, and a hardlinked file cannot be moved without
+        // breaking the pair.
+        if let Err(in_use) = guards.check(entry) {
+            skipped.push((entry, SkipReason::from(in_use)));
             continue;
         }
 
@@ -288,6 +316,17 @@ impl MigrationReport {
         self.count(|outcome| matches!(outcome, FileOutcome::NoRoom))
     }
 
+    /// Files left alone because something is using them: open, or hardlinked.
+    pub fn in_use(&self) -> usize {
+        self.count(|outcome| {
+            matches!(
+                outcome,
+                FileOutcome::Skipped(SkipReason::OpenElsewhere)
+                    | FileOutcome::Skipped(SkipReason::Hardlinked { .. })
+            )
+        })
+    }
+
     /// Files left alone because of scope or the size window — i.e. not this tool's to
     /// move in the first place, as opposed to "not cold yet".
     pub fn excluded(&self) -> usize {
@@ -368,13 +407,14 @@ pub fn migrate_least_used<F>(
     tracker: &UsageTracker,
     policy: &Policy,
     scope: &Scope,
+    guards: &Guards,
     now: SystemTime,
     mut choose_destination: F,
 ) -> MigrationReport
 where
     F: FnMut(&FileEntry) -> Result<Option<PathBuf>, DiskError>,
 {
-    let (candidates, skipped) = select_candidates(entries, tracker, policy, scope, now);
+    let (candidates, skipped) = select_candidates(entries, tracker, policy, scope, guards, now);
     let mut report = MigrationReport::default();
 
     for (entry, reason) in skipped {
@@ -387,11 +427,22 @@ where
     }
 
     for entry in candidates {
+        // Re-checked here, immediately before bytes move: a descriptor can be opened
+        // between selection and the move, and on a busy box that window is real.
         if let Err(rejected) = scope.allows(entry) {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+            });
+            continue;
+        }
+        if let Err(in_use) = guards.check(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
                 size: entry.size,
             });
             continue;
@@ -493,6 +544,7 @@ mod tests {
             &UsageTracker::new(),
             &policy,
             &Scope::everything(),
+            &Guards::permissive(),
             now,
         );
 
@@ -521,6 +573,7 @@ mod tests {
             &UsageTracker::new(),
             &policy,
             &Scope::everything(),
+            &Guards::permissive(),
             now,
         );
 
@@ -553,8 +606,14 @@ mod tests {
             ..Policy::default()
         };
 
-        let (candidates, skipped) =
-            select_candidates(&entries, &tracker, &policy, &Scope::everything(), now);
+        let (candidates, skipped) = select_candidates(
+            &entries,
+            &tracker,
+            &policy,
+            &Scope::everything(),
+            &Guards::permissive(),
+            now,
+        );
         assert!(candidates.is_empty());
         assert_eq!(skipped[0].1, SkipReason::RecentlyAccessed(1));
         assert_eq!(tracker.observed_accesses(Path::new("/watch/used.bin")), 1);
@@ -596,6 +655,7 @@ mod tests {
             &UsageTracker::new(),
             &policy,
             &Scope::everything(),
+            &Guards::permissive(),
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
         );

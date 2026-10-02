@@ -35,6 +35,7 @@ Every option is a flag; there is no config file and nothing is hardcoded.
 | `--exclude <GLOB>` | *(nothing)* | Never manage paths matching this glob. Repeatable; wins over `--include`. |
 | `--min-size <SIZE>` | `0` | Ignore files smaller than this (e.g. `1MiB`). |
 | `--max-size <SIZE>` | *(no limit)* | Ignore files larger than this (e.g. `500GiB`). |
+| `--allow-hardlinked` | off | Move files with more than one hard link (see Guards below). |
 | `--min-idle-days <DAYS>` | `30` | Only touch files last used at least this long ago. |
 | `--min-observed-accesses <N>` | `1` | Pin a file once it has been read `N` times *during this run*; `0` disables the pin. |
 | `--limit <N>` | `10` | Most files moved per destination per sweep. |
@@ -79,6 +80,29 @@ that is both out of scope and too small reports the outermost reason (out of sco
 Out-of-scope files are not even tracked, so a long-running sweep does not carry them in
 memory.
 
+### Guards: things that are in use
+
+A cold file that something is *currently using* is not cold, so two checks run before any
+move — once when candidates are chosen, and again immediately before the bytes move,
+because a descriptor can be opened in between:
+
+- **Open by another process.** On Linux the sweep takes one snapshot of open descriptors
+  per sweep (from `/proc/*/fd`, matched by device + inode) and skips anything in it.
+  Taking the snapshot once per sweep rather than once per file matters: a process-table
+  scan per candidate would cost more than the copy it protects. The check is honest about
+  its own reach — without root it can only see this user's processes, and it says so
+  (`open-file check is partial: N of M process(es) could not be inspected without
+  privileges`) rather than implying a guarantee it cannot make. On platforms where
+  descriptors cannot be enumerated at all, it warns that files in use may be moved.
+- **Hardlinked elsewhere.** A file with more than one link cannot be moved across
+  filesystems without breaking the pair — the link is not merely broken, it is impossible,
+  and the other name keeps pointing at the old bytes. Such files are skipped by default;
+  `--allow-hardlinked` does it anyway, deliberately.
+
+The sweep summary counts these separately (`N in use`), so a busy box reads differently
+from a genuinely cold one — if every sweep reports files in use, the guard is working, not
+failing.
+
 **Destinations are never created.** A missing `--dest` is a startup error, not a
 `mkdir`: if a slow disk is unmounted, silently creating its mount point would have the
 tool write terabytes into a directory on the wrong filesystem.
@@ -93,7 +117,8 @@ A file is moved when **all** of these hold:
 0. it is in scope (§above): inside `--include`, not `--exclude`, within the size window;
 1. it is not already a symlink (already migrated);
 2. it is not empty;
-3. nothing has read it during this run (the `--min-observed-accesses` pin);
+3. nothing has read it during this run (the `--min-observed-accesses` pin), and nothing is
+   *holding it open* or hardlinked to it right now (see Guards above);
 4. its last-use stamp is at least `--min-idle-days` old;
 5. it is within the per-destination `--limit`, oldest use first.
 
@@ -210,6 +235,7 @@ A sibling set of tests for metadata preservation and interruption/repair uses th
 |---|---|
 | [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
 | [`src/scope.rs`](src/scope.rs) | Which paths the tool may touch at all: include/exclude globs and the size window, plus size parsing. |
+| [`src/opened.rs`](src/opened.rs) | Whether something is using a file right now: open descriptors and hard links. |
 | [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
 | [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |

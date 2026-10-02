@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use just_cache::disk_management::{self, DiskError, FileEntry, MoveOutcome};
 use just_cache::file_movement::{self, FileOutcome, Policy, UsageTracker};
+use just_cache::opened::{FileId, Guards, OpenFiles};
 use just_cache::scope::Scope;
 
 fn scan(root: &Path) -> Vec<FileEntry> {
@@ -96,6 +97,7 @@ fn a_second_run_is_a_no_op() {
         &tracker,
         &policy,
         &Scope::everything(),
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -231,6 +233,7 @@ fn a_sweep_skips_everything_outside_the_include_set() {
         &UsageTracker::new(),
         &policy,
         &scope,
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -269,6 +272,7 @@ fn an_excluded_directory_survives_a_sweep_even_when_it_is_the_coldest_thing_ther
         &UsageTracker::new(),
         &policy,
         &scope,
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -307,6 +311,7 @@ fn the_size_window_skips_tiny_and_enormous_files() {
         &UsageTracker::new(),
         &policy,
         &scope,
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
@@ -366,6 +371,114 @@ fn a_source_that_changed_since_the_scan_is_not_moved() {
 }
 
 #[test]
+fn a_file_something_else_has_open_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let held = watch.join("held.bin");
+    fs::write(&held, b"being read right now").unwrap();
+    fs::write(watch.join("idle.bin"), b"nobody wants this").unwrap();
+
+    // A real second process holding a real descriptor, so the /proc scan is exercised
+    // rather than mocked.
+    let mut holder = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec 3< '{}'; sleep 20", held.display()))
+        .spawn()
+        .expect("spawn a holder process");
+
+    let target = FileId::of(&held).unwrap();
+    let mut open = OpenFiles::snapshot();
+    for _ in 0..50 {
+        if open.contains(target) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        open = OpenFiles::snapshot();
+    }
+    let holder_seen = open.contains(target);
+
+    let entries = scan(&watch);
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let guards = Guards::new(open, true);
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &Scope::everything(),
+        &guards,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    assert!(holder_seen, "the holder process should have been observed");
+    assert_eq!(report.in_use(), 1);
+    assert_eq!(report.moved(), 1);
+    assert!(
+        !fs::symlink_metadata(&held).unwrap().is_symlink(),
+        "a file held open must not be moved"
+    );
+    assert!(fs::read(&held).is_ok());
+    assert!(!cold.join("held.bin").exists());
+    assert!(cold.join("idle.bin").is_file());
+}
+
+#[test]
+fn a_hardlinked_file_is_skipped_unless_the_guard_is_relaxed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let original = watch.join("original.bin");
+    fs::write(&original, b"shared bytes").unwrap();
+    fs::hard_link(&original, watch.join("second-name.bin")).unwrap();
+
+    let entries = scan(&watch);
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+
+    let guarded = Guards::new(OpenFiles::default(), true);
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &Scope::everything(),
+        &guarded,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+    assert_eq!(report.moved(), 0);
+    assert_eq!(report.in_use(), 2, "both names of the pair are protected");
+
+    let relaxed = Guards::new(OpenFiles::default(), false);
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        &Scope::everything(),
+        &relaxed,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+    assert_eq!(report.moved(), 2);
+}
+
+#[test]
 fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
     let tmp = tempfile::tempdir().unwrap();
     let watch = tmp.path().join("hot");
@@ -386,6 +499,7 @@ fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
         &UsageTracker::new(),
         &policy,
         &Scope::everything(),
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(None), // the tier says it is out of space
     );
@@ -418,6 +532,7 @@ fn a_sweep_reports_failures_without_stopping_the_rest() {
         &UsageTracker::new(),
         &policy,
         &Scope::everything(),
+        &Guards::permissive(),
         SystemTime::now(),
         |_| Ok(Some(cold.clone())),
     );
