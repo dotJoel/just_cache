@@ -470,11 +470,7 @@ fn is_cross_device(err: &io::Error) -> bool {
 /// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
 fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let partial = dir.join(format!(
-        "{PARTIAL_PREFIX}{}-{}.tmp",
-        std::process::id(),
-        nanos()
-    ));
+    let partial = partial_sibling(dir);
 
     // Anything that fails here is reported as a failed move against this pair, except
     // `SourceChanged`, which has already said precisely what went wrong.
@@ -571,7 +567,7 @@ fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskEr
 ///    `ftruncate`s the tail, which is what actually keeps a sparse image sparse;
 /// 3. a plain sequential copy, only when the filesystem does not implement
 ///    `SEEK_DATA` (some network and exotic filesystems return `EINVAL`).
-fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
+pub(crate) fn copy_contents(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
     #[cfg(all(
         target_os = "linux",
         not(any(target_arch = "sparc", target_arch = "sparc64"))
@@ -690,7 +686,11 @@ fn copy_all(src: &File, dest: &mut File, size: u64) -> io::Result<()> {
 /// Copy mode, ownership, extended attributes and timestamps from a source file onto a
 /// destination that already holds its bytes.
 #[cfg(unix)]
-fn preserve_metadata(src: &Path, dest: &Path, src_metadata: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn preserve_metadata(
+    src: &Path,
+    dest: &Path,
+    src_metadata: &fs::Metadata,
+) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Ownership first: chown clears setuid/setgid bits, so the mode has to be applied
@@ -731,7 +731,11 @@ fn preserve_metadata(src: &Path, dest: &Path, src_metadata: &fs::Metadata) -> io
 }
 
 #[cfg(not(unix))]
-fn preserve_metadata(_src: &Path, _dest: &Path, _src_metadata: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn preserve_metadata(
+    _src: &Path,
+    _dest: &Path,
+    _src_metadata: &fs::Metadata,
+) -> io::Result<()> {
     // The Unix-only metadata model (mode, uid/gid, xattrs) has no equivalent here; on
     // Windows the symlink fallback is already best-effort.
     Ok(())
@@ -818,6 +822,19 @@ fn nanos() -> u128 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// A fresh, private temporary name in `dir` for an in-flight copy.
+///
+/// Shared by the mover's cross-device path and by `restore`, so both leave the same
+/// `.just_cache-partial-*` marker that the walk skips (invariant 8): a crash mid-restore
+/// can never leave a name the next sweep would try to move onto a cold tier.
+pub(crate) fn partial_sibling(dir: &Path) -> PathBuf {
+    dir.join(format!(
+        "{PARTIAL_PREFIX}{}-{}.tmp",
+        std::process::id(),
+        nanos()
+    ))
 }
 
 /// Free bytes available on the filesystem holding `path`.

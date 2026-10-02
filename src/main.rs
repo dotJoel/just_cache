@@ -22,6 +22,7 @@ use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::journal::{self, Journal};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
+use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
 
 /// Exit code for findings that were reported and not resolved, so cron can alert
@@ -61,10 +62,13 @@ enum Command {
     Sweep(SweepArgs),
     /// Report structural inconsistency between the watched tree and the cold tiers.
     Audit(AuditArgs),
+
     /// Manage the catalog: the source of truth for where files live.
     Catalog(CatalogArgs),
     /// Explain why one path is where it is, and what a sweep would do with it next.
     Explain(ExplainArgs),
+    /// Bring an offloaded file back to the hot path, verified.
+    Restore(RestoreArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -212,6 +216,7 @@ struct CatalogSyncArgs {
     watch: PathBuf,
 
     /// Cold-storage root, fastest tier first. Repeat for each slower disk. Every
+
     /// destination must already exist and is used both to resolve migrated symlinks and
     /// to find orphaned copies.
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
@@ -294,13 +299,42 @@ impl ExplainArgs {
     }
 }
 
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// Path to bring back to the hot tier. Must be inside --watch. It may currently be a
+    /// working symlink, a broken one, or missing.
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
+
+    /// Directory to watch. The same tree a sweep moved the file out of.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk. Every
+    /// destination must already exist; the cold copy is looked up at the path relative to
+    /// the watched root under each one, in order.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Remove the cold copy once the restored file has been verified. Verify-before-delete:
+    /// the cold bytes are dropped only after the fresh copy checksums clean.
+    #[arg(long)]
+    remove_copy: bool,
+
+    /// Print only problems.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Sweep(args)) => run_sweep(args),
         Some(Command::Audit(args)) => run_audit(args),
+
         Some(Command::Catalog(args)) => run_catalog(args),
         Some(Command::Explain(args)) => run_explain(args),
+        Some(Command::Restore(args)) => run_restore(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -544,6 +578,7 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
+
     let scope = match Scope::build(&args.include, &args.exclude, args.min_size, args.max_size) {
         Ok(scope) => scope,
         Err(err) => {
@@ -596,6 +631,39 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         }
     }
     ExitCode::from(explanation.exit_code())
+}
+
+fn run_restore(args: RestoreArgs) -> ExitCode {
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let request = RestoreRequest {
+        path: &args.path,
+        watch: &args.watch,
+        dests: &args.dest,
+        remove_copy: args.remove_copy,
+    };
+    match restore::restore(&request) {
+        Ok(outcome) => {
+            if !args.quiet {
+                println!("{}", outcome.describe(&args.path));
+            }
+            ExitCode::SUCCESS
+        }
+        // A path outside the tree, or an unusable one, is a bad invocation (exit 2, the
+        // same code `audit` uses); everything else is the requested restore failing on its
+        // own terms (exit 1), so cron can tell the two apart without parsing text.
+        Err(err @ RestoreError::OutsideWatch { .. }) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::from(EXIT_FINDINGS)
+        }
+    }
 }
 
 fn validate_sweep(watch: &Path, args: &SweepArgs) -> Result<(), String> {

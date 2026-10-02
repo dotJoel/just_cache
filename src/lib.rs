@@ -10,6 +10,7 @@ pub mod explain;
 pub mod file_movement;
 pub mod journal;
 pub mod opened;
+pub mod restore;
 pub mod scope;
 
 pub use audit::{
@@ -33,4 +34,5 @@ pub use file_movement::{
     MigrationReport, Policy, SkipReason, UsageTracker,
 };
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
+pub use restore::{RestoreError, RestoreOutcome, RestoreRequest};
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
