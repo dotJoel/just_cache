@@ -1,66 +1,145 @@
-# File Management System
+# just_cache
 
-This Rust program monitors a specified folder, tracks file usage, and moves the least-used files to slower disks. It also creates symbolic links in the original location to maintain file accessibility.
+Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink
+behind, so every existing path keeps working.
 
-## Modules
+Point it at a directory and one or more cold-storage roots. On each sweep it walks the
+tree, asks the filesystem when each file was last *used*, and moves the ones that have
+gone untouched onto the cold tier, replacing them with a symlink to the new location.
 
-### `disk_management`
+```sh
+just_cache \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media \
+  --min-idle-days 60 \
+  --limit 25
+```
 
-This module handles file operations such as reading, writing, deleting, listing files, and moving files with symbolic links.
+## Why
 
-- [`disk_management::write_file`](src/disk_management.rs)
-- [`disk_management::read_file`](src/disk_management.rs)
-- [`disk_management::delete_file`](src/disk_management.rs)
-- [`disk_management::list_files`](src/disk_management.rs)
-- [`disk_management::move_file_with_symlink`](src/disk_management.rs)
-
-### `file_movement`
-
-This module tracks file usage and moves the least-used files to slower disks.
-
-- [`file_movement::UsageTracker`](src/file_movement.rs)
-- [`file_movement::move_least_used_files`](src/file_movement.rs)
-- [`file_movement::log_file_movement`](src/file_movement.rs)
-
-## Usage
-
-1. **Clone the repository:**
-
-    ```sh
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
-
-2. **Build the project:**
-
-    ```sh
-    cargo build
-    ```
-
-3. **Run the project:**
-
-    ```sh
-    cargo run
-    ```
+Caches, media libraries and build directories fill up with files nobody has opened in
+months. Deleting them loses data; leaving them wastes expensive flash. `just_cache`
+buys back the fast tier while every script, playlist and application path keeps
+resolving, because the file is still there — it is just a symlink now.
 
 ## Configuration
 
-- **Watched Folder:** The folder to monitor for file access.
-- **Slower Disks:** A list of slower disks where the least-used files will be moved.
+Every option is a flag; there is no config file and nothing is hardcoded.
 
-These configurations can be modified in the [`main.rs`](src/main.rs) file.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--watch <DIR>` | *required* | Tree to watch. Walked recursively. |
+| `--dest <DIR>` | *required* | Cold root, fastest tier first. Repeat for each slower disk. Must already exist. |
+| `--min-idle-days <DAYS>` | `30` | Only touch files last used at least this long ago. |
+| `--min-observed-accesses <N>` | `1` | Pin a file once it has been read `N` times *during this run*; `0` disables the pin. |
+| `--limit <N>` | `10` | Most files moved per destination per sweep. |
+| `--min-free-gb <GB>` | `1.0` | Floor of free space a destination must keep, on top of room for the file. |
+| `--interval <SECS>` | `3600` | Delay between sweeps. |
+| `--once` | | One sweep, then exit. |
+| `--dry-run` | | Report the plan, touch nothing. |
+| `-v` / `--verbose` | | Show every file considered, including why it was left alone. |
+| `-q` / `--quiet` | | Only problems. |
 
-## Example
+**Destinations are never created.** A missing `--dest` is a startup error, not a
+`mkdir`: if a slow disk is unmounted, silently creating its mount point would have the
+tool write terabytes into a directory on the wrong filesystem.
 
-In the `main.rs` file, you can specify the folder to monitor and the slower disks:
+With several destinations, sweeps fill the fastest tier first and only spill onto the
+next when a tier is out of room (or has hit `--limit`).
 
-```rust
-fn main() {
-    let watched_folder = "/path/to/watched/folder"; // Folder to monitor
-    let slower_disks = vec!["/path/to/slow/disk1", "/path/to/slow/disk2"]; // Slower disks
-    // ...
-}
+## How a file is chosen
+
+A file is moved when **all** of these hold:
+
+1. it is not already a symlink (already migrated);
+2. it is not empty;
+3. nothing has read it during this run (the `--min-observed-accesses` pin);
+4. its last-use stamp is at least `--min-idle-days` old;
+5. it is within the per-destination `--limit`, oldest use first.
+
+"Last use" is the filesystem's **access time (atime)**, falling back to mtime where
+atime cannot be read. That is the honest signal: it reflects every reader since the
+file was written, not just the fact that the file exists. Two mount options matter,
+though:
+
+- `relatime` (the Linux default) only updates atime when the old atime is more than 24
+  hours old, so a file read twice today still looks "today"; fine for a tool that
+  measures idleness in weeks.
+- `noatime` — and **ZFS, where atime is off by default** — never updates atime, so the
+  fallback to mtime means a file that is read often but never rewritten looks cold.
+  Before pointing this at a ZFS pool, either turn atime on
+  (`zfs set atime=on <pool/dataset>`, with `relatime` a reasonable middle ground) or
+  accept mtime semantics.
+
+## What happens to a file
+
+1. The destination keeps the file's path *relative to the watched root*, so nested
+   trees keep their shape and same-named files in different directories cannot collide.
+2. The file is `rename`d when the move stays on one filesystem. Since a "slower disk"
+   is normally a different mount — where `rename` fails with `EXDEV` — it falls back to
+   copy, `fsync`, rename-into-place, then delete the source. A partial copy is never
+   left at the destination.
+3. The original path becomes a **relative** symlink (absolute only when the two trees
+   share no ancestor), so the pair survives the tree being moved or the cold disk being
+   remounted elsewhere.
+
+Sweeps are safe to interrupt and safe to repeat:
+
+- an entry that is already a symlink is skipped;
+- a destination that already holds a byte-identical copy is adopted — the source is
+  replaced by the symlink instead of being transferred twice;
+- a destination of a *different* size is refused rather than overwritten, and reported
+  as a failure;
+- one file failing never stops the sweep; `--once` exits `1` if anything failed.
+
+A destination below its free-space floor is not a failure: those files are reported as
+*waiting for room* and picked up when the slow disk has space again.
+
+## Example run
+
+```
+$ just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --min-idle-days 30 --once -v
+  skipped: idle for only 0h /mnt/cache/media/recent.txt
+  moved /mnt/cache/media/shows/s1/ep1.mkv -> /mnt/disk-slow/media/shows/s1/ep1.mkv
+pass 1: 3 files scanned, 3 tracked, 1 moved, 0 linked, 0 waiting for room, 1 skipped, 0 failed, 21 B onto the cold tiers
 ```
 
+`/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
+episode.
+
+## Running it continuously
+
+```sh
+# one sweep per hour, forever
+just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --interval 3600
+```
+
+Or schedule single sweeps from cron/systemd and use `--once` instead.
+
+## Building and testing
+
+```sh
+cargo build --release
+cargo test        # unit + integration tests against real temporary trees
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+```
+
+Tests cover the walk (nested directories, symlink loops), the move (nested layout,
+existing symlinks, resumed moves, size conflicts, same-named files in sibling
+directories), and the policy (idle thresholds, oldest-first ordering, access pins, dry
+runs, full tiers).
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| [`src/disk_management.rs`](src/disk_management.rs) | Walking the tree, moving a file, making the symlink, reading free space. |
+| [`src/file_movement.rs`](src/file_movement.rs) | `UsageTracker` and the policy that picks cold files, plus the report types. |
+| [`src/main.rs`](src/main.rs) | The CLI and the sweep loop. |
+| [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
+
 ## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+
+MIT — see [LICENSE](LICENSE).
