@@ -1,0 +1,267 @@
+//! End-to-end behaviour of the move layer against a real temporary tree.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use just_cache::disk_management::{self, DiskError, FileEntry, MoveOutcome};
+use just_cache::file_movement::{self, FileOutcome, Policy, UsageTracker};
+
+fn scan(root: &Path) -> Vec<FileEntry> {
+    disk_management::list_files_recursive(root).expect("walk should succeed")
+}
+
+fn find<'a>(entries: &'a [FileEntry], relative: &str) -> &'a FileEntry {
+    entries
+        .iter()
+        .find(|entry| entry.relative == Path::new(relative))
+        .unwrap_or_else(|| panic!("{relative} should have been found"))
+}
+
+#[test]
+fn a_cold_file_is_moved_and_left_behind_as_a_relative_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("shows/season1")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("shows/season1/ep1.mkv"), b"episode one").unwrap();
+
+    let entries = scan(&watch);
+    let entry = find(&entries, "shows/season1/ep1.mkv");
+    let outcome =
+        disk_management::move_file_with_symlink(&cold, entry).expect("move should succeed");
+
+    assert_eq!(outcome, MoveOutcome::Moved);
+    let moved = cold.join("shows/season1/ep1.mkv");
+    assert_eq!(fs::read(&moved).unwrap(), b"episode one");
+
+    let link = watch.join("shows/season1/ep1.mkv");
+    let link_metadata = fs::symlink_metadata(&link).unwrap();
+    assert!(
+        link_metadata.is_symlink(),
+        "the original path must be a symlink"
+    );
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "episode one",
+        "reads through the symlink must still work"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        PathBuf::from("../../../cold/shows/season1/ep1.mkv"),
+        "links are stored relative so the pair survives being moved or remounted"
+    );
+}
+
+#[test]
+fn a_second_run_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("clip.mov"), b"clip").unwrap();
+
+    let entries = scan(&watch);
+    let entry = find(&entries, "clip.mov");
+    assert_eq!(
+        disk_management::move_file_with_symlink(&cold, entry).unwrap(),
+        MoveOutcome::Moved
+    );
+
+    // Re-scanning finds the symlink, and re-running against it changes nothing.
+    let rescan = scan(&watch);
+    let linked = find(&rescan, "clip.mov");
+    assert!(linked.is_symlink);
+    assert_eq!(
+        disk_management::move_file_with_symlink(&cold, linked).unwrap(),
+        MoveOutcome::AlreadyLinked
+    );
+
+    // And running the whole sweep again moves nothing.
+    let mut tracker = UsageTracker::new();
+    for entry in rescan.iter().filter(|entry| !entry.is_symlink) {
+        tracker.observe(entry);
+    }
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report =
+        file_movement::migrate_least_used(&rescan, &tracker, &policy, SystemTime::now(), |_| {
+            Ok(Some(cold.clone()))
+        });
+
+    assert_eq!(
+        report.records.len(),
+        0,
+        "an already-migrated tree has no work"
+    );
+    assert_eq!(fs::read(cold.join("clip.mov")).unwrap(), b"clip");
+}
+
+#[test]
+fn an_identical_copy_already_on_the_cold_disk_is_reused_not_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("same.bin"), b"identical").unwrap();
+    fs::write(cold.join("same.bin"), b"identical").unwrap();
+
+    let entries = scan(&watch);
+    let outcome = disk_management::move_file_with_symlink(&cold, find(&entries, "same.bin"))
+        .expect("a same-size copy is the resumed state of an interrupted move");
+
+    assert_eq!(outcome, MoveOutcome::LinkedExisting);
+    assert_eq!(fs::read(cold.join("same.bin")).unwrap(), b"identical");
+    assert!(fs::symlink_metadata(watch.join("same.bin"))
+        .unwrap()
+        .is_symlink());
+}
+
+#[test]
+fn a_destination_of_a_different_size_is_refused_rather_than_overwritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("clash.bin"), b"the source copy").unwrap();
+    fs::write(cold.join("clash.bin"), b"something else entirely").unwrap();
+
+    let entries = scan(&watch);
+    let err = disk_management::move_file_with_symlink(&cold, find(&entries, "clash.bin"))
+        .expect_err("mismatched destination must not be clobbered");
+
+    assert!(matches!(err, DiskError::DestinationConflict { .. }));
+    assert_eq!(
+        fs::read(cold.join("clash.bin")).unwrap(),
+        b"something else entirely"
+    );
+    assert!(!fs::symlink_metadata(watch.join("clash.bin"))
+        .unwrap()
+        .is_symlink());
+}
+
+#[test]
+fn a_symlink_loop_does_not_hang_the_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    fs::create_dir_all(watch.join("a")).unwrap();
+    fs::write(watch.join("a/real.txt"), b"real").unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&watch, watch.join("a/loop")).unwrap();
+    #[cfg(not(unix))]
+    return;
+
+    let entries = scan(&watch);
+    let names: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.relative.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"a/real.txt".to_string()));
+    assert!(
+        names.contains(&"a/loop".to_string()),
+        "the link itself is listed"
+    );
+    assert!(!names.iter().any(|name| name.starts_with("a/loop/")));
+}
+
+#[test]
+fn interleaved_moves_of_two_files_keep_their_own_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("x")).unwrap();
+    fs::create_dir_all(watch.join("y")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("x/same-name.bin"), b"from x").unwrap();
+    fs::write(watch.join("y/same-name.bin"), b"from y").unwrap();
+
+    for entry in scan(&watch) {
+        let outcome = disk_management::move_file_with_symlink(&cold, &entry)
+            .unwrap_or_else(|err| panic!("{}: {err}", entry.path.display()));
+        assert_eq!(outcome, MoveOutcome::Moved);
+    }
+
+    assert_eq!(fs::read(cold.join("x/same-name.bin")).unwrap(), b"from x");
+    assert_eq!(fs::read(cold.join("y/same-name.bin")).unwrap(), b"from y");
+    assert_eq!(
+        fs::read_to_string(watch.join("x/same-name.bin")).unwrap(),
+        "from x"
+    );
+    assert_eq!(
+        fs::read_to_string(watch.join("y/same-name.bin")).unwrap(),
+        "from y"
+    );
+}
+
+#[test]
+fn a_full_tier_leaves_files_waiting_instead_of_failing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("cold.bin"), b"needs a home").unwrap();
+
+    let entries = scan(&watch);
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        SystemTime::now(),
+        |_| Ok(None), // the tier says it is out of space
+    );
+
+    assert_eq!(report.waiting_for_room(), 1);
+    assert_eq!(report.failed(), 0, "a full cold disk is not an error");
+    assert_eq!(fs::read(watch.join("cold.bin")).unwrap(), b"needs a home");
+}
+
+#[test]
+fn a_sweep_reports_failures_without_stopping_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("good.bin"), b"good").unwrap();
+    fs::write(watch.join("blocked.bin"), b"blocked copy").unwrap();
+    fs::write(cold.join("blocked.bin"), b"a different length entirely").unwrap();
+
+    let entries = scan(&watch);
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &policy,
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.failed(), 1);
+    assert_eq!(report.moved(), 1);
+    assert!(report
+        .records
+        .iter()
+        .any(|record| record.path.ends_with("good.bin") && record.outcome == FileOutcome::Moved));
+    assert!(fs::read_to_string(watch.join("good.bin")).unwrap() == "good");
+}
