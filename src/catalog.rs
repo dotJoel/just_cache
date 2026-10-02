@@ -131,6 +131,32 @@ CREATE TABLE IF NOT EXISTS cache_residency (
 
 CREATE INDEX IF NOT EXISTS location_by_object ON location(object_id);
 CREATE INDEX IF NOT EXISTS name_by_object ON name(object_id);
+
+-- Scrub state (issue #21): one row per location, recording the last time its bytes
+-- hashed back to the object they claim to be. This is what lets a restart resume instead
+-- of re-reading a whole tier. It is a *new table* rather than a column added to
+-- `location` on purpose: `CREATE TABLE IF NOT EXISTS` is then the entire migration, and
+-- a catalog written before scrub existed gains it on the next open with no `ALTER TABLE`
+-- and no window in which a partially-upgraded schema can be read.
+CREATE TABLE IF NOT EXISTS scrub_state (
+    tier        TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    object_id   BLOB NOT NULL REFERENCES object(id),  -- the id verified at verified_at
+    verified_at INTEGER NOT NULL,
+    PRIMARY KEY (tier, storage_key)
+);
+-- Corruption for which no good copy existed to repair from. The object is never deleted
+-- for this: a damaged copy is still the only evidence of what the bytes were meant to
+-- be, and a human decides. A clean read (a later scrub, or a restore) clears the row.
+CREATE TABLE IF NOT EXISTS damage (
+    object_id   BLOB NOT NULL REFERENCES object(id),
+    tier        TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    detected_at INTEGER NOT NULL,
+    detail      TEXT NOT NULL,
+    PRIMARY KEY (tier, storage_key)
+);
+CREATE INDEX IF NOT EXISTS damage_by_object ON damage(object_id);
 ";
 
 #[derive(Debug, Error)]
@@ -281,6 +307,66 @@ impl ObjectRecord {
             .iter()
             .find(|location| location.is_primary)
             .or_else(|| self.locations.first())
+    }
+}
+
+/// One location to scrub, with what the catalog expects to find there.
+///
+/// The expected checksum is the object id itself: the identity of every object is the
+/// BLAKE3 digest of its bytes (`docs/design.md` §3), which is exactly what makes a scrub
+/// possible without a second column to keep in step with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubTarget {
+    /// The tier root the bytes sit under (absolute, canonical when it was ingested).
+    pub tier: String,
+    /// The path within that tier.
+    pub storage_key: String,
+    /// The object id the location claims to hold, raw BLAKE3 bytes.
+    pub object: Vec<u8>,
+    pub size: u64,
+    /// The object id recorded the last time this location verified clean, if ever.
+    /// `Some` equal to `object` means "already scrubbed"; anything else means it must be
+    /// read again (a location that changed content since its last verification).
+    pub verified_object: Option<Vec<u8>>,
+}
+
+impl ScrubTarget {
+    /// Where the bytes are: the tier root joined with the key within it.
+    pub fn path(&self) -> PathBuf {
+        Path::new(&self.tier).join(&self.storage_key)
+    }
+
+    /// True when this location has already been verified against the object it now
+    /// claims, so a resuming scrub can skip re-reading it.
+    pub fn is_already_verified(&self) -> bool {
+        self.verified_object.as_deref() == Some(self.object.as_slice())
+    }
+
+    pub fn object_hex(&self) -> String {
+        hex(&self.object)
+    }
+}
+
+/// The counts behind "has this copy ever been scrubbed?", for `audit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubSummary {
+    /// Every location the catalog records.
+    pub locations: usize,
+    /// Locations whose last recorded verification matches the object they hold.
+    pub verified: usize,
+    /// Locations with no verification, or one that no longer matches: never scrubbed
+    /// (or scrubbed before the file changed under the catalog).
+    pub never_scrubbed: usize,
+    /// Locations recorded damaged by a scrub that found no good copy to repair from.
+    pub damaged: usize,
+}
+
+impl ScrubSummary {
+    pub fn summary_lines(&self) -> Vec<String> {
+        vec![format!(
+            "  scrub: {} location(s): {} verified, {} never scrubbed, {} damaged",
+            self.locations, self.verified, self.never_scrubbed, self.damaged
+        )]
     }
 }
 
@@ -913,6 +999,35 @@ impl Catalog {
         Ok(out)
     }
 
+    // -- Scrub state (issue #21), read and written per location. --
+
+    /// Every location the catalog records, with the checksum it must hash to and whether
+    /// it was verified before. Ordered by object, then tier/key, so a scrub can repair
+    /// sibling copies without holding the whole table in a map.
+    pub fn scrub_targets(&self) -> Result<Vec<ScrubTarget>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.tier, l.storage_key, l.object_id, o.size, s.object_id
+               FROM location l
+               JOIN object o ON o.id = l.object_id
+               LEFT JOIN scrub_state s ON s.tier = l.tier AND s.storage_key = l.storage_key
+              ORDER BY l.object_id, l.tier, l.storage_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ScrubTarget {
+                tier: row.get(0)?,
+                storage_key: row.get(1)?,
+                object: row.get(2)?,
+                size: row.get::<_, i64>(3)? as u64,
+                verified_object: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Record a replica the mover placed for an object the catalog already knows.
     ///
     /// Returns `Ok(false)` when the object is not in the catalog — nothing is inserted,
@@ -956,6 +1071,91 @@ impl Catalog {
             ],
         )?;
         Ok(true)
+    }
+
+    /// Record that a location was read back and matched the object it claims.
+    ///
+    /// Written per location, not once per run: a scrub killed at location 900 of 1000
+    /// must resume at 901, and only a durable write at each stop gives that. The same
+    /// statement retires any damage record for the location, because a clean read is
+    /// exactly the evidence that the corruption is gone.
+    pub fn record_verified(
+        &self,
+        tier: &str,
+        storage_key: &str,
+        object: &[u8],
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO scrub_state (tier, storage_key, object_id, verified_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(tier, storage_key) DO UPDATE SET
+                 object_id = excluded.object_id, verified_at = excluded.verified_at",
+            params![tier, storage_key, object, now_seconds()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM damage WHERE tier = ?1 AND storage_key = ?2",
+            params![tier, storage_key],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a location's bytes did not match its object and no good copy existed.
+    ///
+    /// Nothing is deleted: the corrupt bytes may be the only surviving record of what the
+    /// file held. Any previous verification for this location is dropped, so the next
+    /// scrub reads it again rather than trusting a row that is no longer true.
+    pub fn mark_damaged(
+        &self,
+        tier: &str,
+        storage_key: &str,
+        object: &[u8],
+        detail: &str,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO damage (object_id, tier, storage_key, detected_at, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(tier, storage_key) DO UPDATE SET
+                 object_id = excluded.object_id, detected_at = excluded.detected_at,
+                 detail = excluded.detail",
+            params![object, tier, storage_key, now_seconds(), detail],
+        )?;
+        self.conn.execute(
+            "DELETE FROM scrub_state WHERE tier = ?1 AND storage_key = ?2",
+            params![tier, storage_key],
+        )?;
+        Ok(())
+    }
+
+    /// How much of the catalog has been scrubbed, and how much is damaged. `audit` reads
+    /// this to say "never scrubbed" for a copy instead of implying the catalog vouches
+    /// for bytes nobody has read back.
+    pub fn scrub_summary(&self) -> Result<ScrubSummary, CatalogError> {
+        let locations: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM location", [], |row| row.get(0))?;
+        let verified: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM location l
+               JOIN scrub_state s ON s.tier = l.tier AND s.storage_key = l.storage_key
+              WHERE s.object_id = l.object_id",
+            [],
+            |row| row.get(0),
+        )?;
+        let never_scrubbed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM location l
+               LEFT JOIN scrub_state s ON s.tier = l.tier AND s.storage_key = l.storage_key
+              WHERE s.object_id IS NULL OR s.object_id <> l.object_id",
+            [],
+            |row| row.get(0),
+        )?;
+        let damaged: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM damage", [], |row| row.get(0))?;
+        Ok(ScrubSummary {
+            locations: locations as usize,
+            verified: verified as usize,
+            never_scrubbed: never_scrubbed as usize,
+            damaged: damaged as usize,
+        })
     }
 
     /// The state of the object a namespace path names, if that path is in the catalog.
@@ -1316,7 +1516,15 @@ mod tests {
         assert!(catalog.path().exists());
         // The tables the design fixes are all there; a missing one would only surface
         // much later, as a query error in some unrelated command.
-        for table in ["object", "location", "name", "lifecycle", "volume"] {
+        for table in [
+            "object",
+            "location",
+            "name",
+            "lifecycle",
+            "volume",
+            "scrub_state",
+            "damage",
+        ] {
             let found: i64 = catalog
                 .conn
                 .query_row(
@@ -1587,5 +1795,60 @@ mod tests {
         assert!(hits[1].id.starts_with("4217"));
         // A prefix that matches nothing is an empty list, not an error.
         assert!(catalog.records_with_prefix("deadbeef").unwrap().is_empty());
+    }
+
+    #[test]
+    fn scrub_state_round_trips_and_a_fresh_catalog_reports_never_scrubbed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold = tmp.path().join("cold");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold).unwrap();
+        fs::write(watch.join("a.bin"), b"payload").unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+
+        // Before any scrub, every location is "never scrubbed" — the catalog says where
+        // bytes are, not that anyone has read them back.
+        let fresh = catalog.scrub_summary().unwrap();
+        assert_eq!(fresh.locations, 1);
+        assert_eq!(fresh.verified, 0);
+        assert_eq!(fresh.never_scrubbed, 1);
+        assert_eq!(fresh.damaged, 0);
+
+        let target = catalog.scrub_targets().unwrap().pop().unwrap();
+        assert!(!target.is_already_verified());
+        assert_eq!(target.path(), watch.join("a.bin"));
+
+        catalog
+            .record_verified(&target.tier, &target.storage_key, &target.object)
+            .unwrap();
+        let after = catalog.scrub_summary().unwrap();
+        assert_eq!(after.verified, 1);
+        assert_eq!(after.never_scrubbed, 0);
+        // The re-read agrees, so the second scrub would skip this location.
+        let target = catalog
+            .scrub_targets()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.storage_key == "a.bin")
+            .unwrap();
+        assert!(target.is_already_verified());
+
+        // Damage is recorded against the object, and drops the stale verification so the
+        // location is read again rather than trusted.
+        catalog
+            .mark_damaged(
+                &target.tier,
+                &target.storage_key,
+                &target.object,
+                "test rot",
+            )
+            .unwrap();
+        let damaged = catalog.scrub_summary().unwrap();
+        assert_eq!(damaged.damaged, 1);
+        assert_eq!(damaged.verified, 0);
+        assert_eq!(damaged.never_scrubbed, 1);
     }
 }

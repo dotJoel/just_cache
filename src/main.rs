@@ -25,6 +25,7 @@ use just_cache::locate::{self, LocateRequest};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
+use just_cache::scrub::{self, ScrubRequest};
 
 /// Exit code for findings that were reported and not resolved, so cron can alert
 /// without parsing any text.
@@ -73,6 +74,8 @@ enum Command {
     Locate(LocateArgs),
     /// Bring an offloaded file back to the hot path, verified.
     Restore(RestoreArgs),
+    /// Read every stored copy back and verify it against the catalog, repairing rot.
+    Scrub(ScrubArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -206,6 +209,13 @@ struct AuditArgs {
     /// How many findings the readable summary lists (JSON always has them all).
     #[arg(long, value_name = "N", default_value_t = audit::DEFAULT_EXAMPLES)]
     examples: usize,
+
+    /// Read scrub state from this catalog and report it: how many copies have been
+    /// verified, how many were never scrubbed, and how many are marked damaged. Read-only;
+    /// it does not change the structural findings or the exit code. (The JSON document does
+    /// not carry this section yet — see `docs/design.md` §9.)
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
 }
 
 /// The `catalog` subcommand and its own subcommands.
@@ -375,6 +385,30 @@ struct RestoreArgs {
     quiet: bool,
 }
 
+/// Everything `scrub` needs. Unlike restore/sweep it names no `--watch`/`--dest`: the
+/// catalog already knows every tier root and every key within it, which is the point of
+/// having made the catalog the source of truth.
+#[derive(Debug, Args)]
+struct ScrubArgs {
+    /// The catalog file to scrub.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+
+    /// Cap read throughput at this many KiB/s, so a scrub of a busy media tier does not
+    /// contend with playback. Omit for unlimited.
+    #[arg(long, value_name = "KIB")]
+    rate: Option<u64>,
+
+    /// Report what scrub would repair, changing nothing: no repair is written and no
+    /// last-verified state is recorded, so a dry run is safe to repeat.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print only problems.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -385,6 +419,7 @@ fn main() -> ExitCode {
         Some(Command::Explain(args)) => run_explain(args),
         Some(Command::Locate(args)) => run_locate(args),
         Some(Command::Restore(args)) => run_restore(args),
+        Some(Command::Scrub(args)) => run_scrub(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -642,6 +677,27 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         }
     }
 
+    // Scrub state is a separate signal from the structural verdicts above, so it is
+    // reported when asked for but changes neither the findings nor the exit code: a
+    // "never scrubbed" copy is a gap in verification, not an inconsistency between the
+    // tree and its tiers. (Readable output only for now; the JSON document does not carry
+    // the section, which §9 names as an open gap.)
+    if let Some(catalog_path) = &args.catalog {
+        if !args.json {
+            match catalog::Catalog::open(catalog_path) {
+                Ok(catalog) => match catalog.scrub_summary() {
+                    Ok(summary) => {
+                        for line in summary.summary_lines() {
+                            println!("{line}");
+                        }
+                    }
+                    Err(err) => eprintln!("just_cache: {err}"),
+                },
+                Err(err) => eprintln!("just_cache: {err}"),
+            }
+        }
+    }
+
     // Read-only audit alerts on any finding; a repair run only alerts on findings it
     // could not resolve, so a cron job that keeps the tree healthy exits zero.
     let unresolved = match &repairs {
@@ -800,6 +856,63 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
             eprintln!("just_cache: {err}");
             ExitCode::from(EXIT_FINDINGS)
         }
+    }
+}
+
+/// Read every stored copy back and verify it against the catalog.
+///
+/// Exit contract: `0` when every copy verified or was repaired, `1` when corruption,
+/// missing bytes or an unmounted tier were seen, `2` on a bad invocation. Unlike
+/// `audit --repair` (which goes quiet once a finding is resolved), a scrub that *repaired*
+/// something still exits `1`: bitrot is evidence about the tier, and the operator has to
+/// be able to see that it happened even though it was fixed.
+fn run_scrub(args: ScrubArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} is not an existing file",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if args.rate == Some(0) {
+        eprintln!("just_cache: --rate must be at least 1 KiB/s");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let request = ScrubRequest {
+        catalog: &catalog,
+        rate_kib_per_sec: args.rate,
+        dry_run: args.dry_run,
+    };
+    let report = match scrub::scrub(&request) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if args.quiet {
+        for line in report.finding_lines() {
+            println!("{line}");
+        }
+    } else {
+        for line in report.summary_lines() {
+            println!("{line}");
+        }
+    }
+
+    if report.has_findings() {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

@@ -14,14 +14,15 @@ pub mod opened;
 pub mod replication;
 pub mod restore;
 pub mod scope;
+pub mod scrub;
 
 pub use audit::{
     audit, audit_with_copies, classify, repair, AuditError, AuditReport, Finding, RepairAction,
     RepairOutcome, SourceState, Verdict, VerdictKind, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
-    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, ObjectRecord, SyncReport,
-    CATALOG_NAME,
+    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, ObjectRecord, ScrubSummary,
+    ScrubTarget, SyncReport, CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{
@@ -39,5 +40,6 @@ pub use file_movement::{
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
 pub use replication::{replicate, ReplicaPlacement, ReplicaStatus, ReplicationOutcome};
-pub use restore::{RestoreError, RestoreOutcome, RestoreRequest};
+pub use restore::{replace_from_verified, RestoreError, RestoreOutcome, RestoreRequest};
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
+pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};

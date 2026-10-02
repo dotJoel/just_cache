@@ -390,6 +390,23 @@ when one exists (the default beside the watch root, or `--catalog`) through the 
 `catalog_answer` seam and reports a catalog/filesystem disagreement instead of resolving it
 silently; with no catalog its answers are exactly what they were before.
 
+Closed in P1 by `just_cache scrub` (#21): every location in the catalog is read back and
+hashed against the object id, which *is* the checksum, so "are the bytes still what I put
+there" is a question the tool answers between operations. A location that no longer matches
+is repaired from a sibling that verifies clean — through `restore`'s
+build-a-private-copy-then-rename path, so the replacement is read back and hashed before the
+atomic swap — and one with no good sibling is *marked damaged* (the `damage` table) and
+reported, never deleted. Last-verified state is written per location (`scrub_state`) as the
+run goes, so a kill resumes instead of re-reading a tier, and `audit --catalog` can say
+"never scrubbed" for a copy instead of implying the catalog vouches for it. `--dry-run`
+reads and reports what it would repair, writing neither the repair nor any state. On the §9
+sparse-file question below: a scrub only *reads*, and `read(2)` on a hole returns zeroes
+without allocating disk blocks or unsharing a reflink extent on common Linux filesystems
+(ext4/xfs/btrfs/tmpfs) — the copies a repair writes reuse `copy_contents`, which already
+preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of a 64 MiB
+sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
+already fixed; it did not apply to verification reads.
+
 Still open, and honestly so:
 
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
@@ -442,8 +459,13 @@ Still open, and honestly so:
   would still be linked; the catalog's digests (P1) are what close that, and the mover
   already checksums destinations it *adopts*, so the hole is narrow and named.
 - **No read-back verification of freshly copied bytes.** A torn copy is caught by the
-  short-copy and source-changed guards, not by re-reading what was written: hashing a
-  sparse file means materializing its holes, and re-reading a 40 GB copy doubles I/O.
+  short-copy and source-changed guards, not by re-reading what was written while the copy
+  runs: re-reading a 40 GB copy doubles I/O. Deliberate verification is now `scrub`'s job
+  (#21), which reads stored copies back on a schedule the operator controls and inside an
+  I/O budget; the mover still does not hash what it just wrote. The old half of this note —
+  "hashing a sparse file means materializing its holes" — was wrong about *reading*: it is
+  a non-hole-preserving *copy* that materializes holes, and `copy_contents` already
+  preserves them. `tests/scrub.rs` measures it.
 - **Restore has no catalog digest to check a cold copy against.** `restore` reads its own
   write back and hashes it before the atomic swap, so a torn copy cannot reach the path,
   but with no recorded digest there is nothing independent to compare a *pre-existing*
@@ -501,6 +523,15 @@ Still open, and honestly so:
   is exercised at its decision point in a unit test rather than end to end. What `explain`
   *can* surface on such a mount is the symptom: when atime equals mtime it says so, since
   the stamp may then be the last write rather than the last read.
+- **Scrub has no schedule of its own.** `just_cache scrub` is an on-demand command; the
+  background scheduler that decides how often to re-scrub is P2, and until it exists a
+  location verified once is skipped until its content changes under the catalog (or the
+  damage record for it is cleared). `--rate` is what makes a cron-driven scrub safe to run
+  against a tier that is serving reads.
+- **`audit --json` does not carry the scrub section.** `audit --catalog` adds
+  "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
+  document has no `scrub` object yet; only the readable path reports it. The readable
+  output is what ships, and the omission is named rather than silently implied.
 
 ## 10. Non-goals
 

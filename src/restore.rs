@@ -446,6 +446,90 @@ fn copy_to_partial(hot: &Path, cold: &Path, partial: &Path, size: u64) -> Result
     }
 }
 
+/// Overwrite a corrupt copy at its own location with bytes from a verified sibling.
+///
+/// This is `restore`'s build-a-private-copy-then-rename machinery, used in the other
+/// direction: instead of writing into the watched tree, it repairs a tier in place. The
+/// guarantees are the same ones the module documents — the replacement is built beside
+/// the corrupt file under the `.just_cache-partial-*` marker the walk skips (invariant
+/// 8), read back and hashed against `expected` *before* the atomic rename puts it live,
+/// and the good sibling is never touched. So the worst a failure here does is leave a
+/// partial to be cleaned up; it can never make a location hold unverified bytes, and it
+/// never deletes the only copy of anything.
+///
+/// `expected` is the object's checksum from the catalog, which is what makes this a fix
+/// rather than a guess: the bytes are known before the corrupt copy is overwritten.
+pub fn replace_from_verified(
+    good: &Path,
+    corrupt: &Path,
+    expected: &blake3::Hash,
+) -> Result<u64, RestoreError> {
+    let good_metadata = fs::metadata(good).map_err(|error| RestoreError::Stat {
+        path: good.to_path_buf(),
+        error,
+    })?;
+    if !good_metadata.is_file() {
+        return Err(RestoreError::Stat {
+            path: good.to_path_buf(),
+            error: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the repair source is not a regular file",
+            ),
+        });
+    }
+    // Refuse to replace anything that is not the regular file a location is expected to
+    // be: a symlink or directory at a location is a different problem, and the rename
+    // below would either follow or fail on it in a way that is not this function's job.
+    let corrupt_metadata = fs::symlink_metadata(corrupt).map_err(|error| RestoreError::Stat {
+        path: corrupt.to_path_buf(),
+        error,
+    })?;
+    if !corrupt_metadata.is_file() {
+        return Err(RestoreError::Stat {
+            path: corrupt.to_path_buf(),
+            error: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the corrupt location is not a regular file",
+            ),
+        });
+    }
+
+    let parent = corrupt.parent().unwrap_or_else(|| Path::new("."));
+    let partial = disk_management::partial_sibling(parent);
+    copy_to_partial(corrupt, good, &partial, good_metadata.len())?;
+
+    // Read the private copy back and hash it before it replaces anything. A torn copy is
+    // caught here rather than becoming the location's bytes.
+    let found_digest = digest::file_digest(&partial).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        RestoreError::Stat {
+            path: partial.clone(),
+            error,
+        }
+    })?;
+    if found_digest != *expected {
+        let _ = fs::remove_file(&partial);
+        return Err(RestoreError::VerifyMismatch {
+            path: corrupt.to_path_buf(),
+            expected_digest: expected.to_hex().to_string(),
+            found_digest: found_digest.to_hex().to_string(),
+        });
+    }
+
+    // Same directory, so this rename stays on one filesystem and atomically replaces the
+    // corrupt file with verified bytes.
+    fs::rename(&partial, corrupt).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        RestoreError::Copy {
+            path: corrupt.to_path_buf(),
+            from: partial.clone(),
+            error,
+        }
+    })?;
+
+    Ok(good_metadata.len())
+}
+
 fn digest_of(path: &Path) -> Result<blake3::Hash, RestoreError> {
     digest::file_digest(path).map_err(|error| RestoreError::Stat {
         path: path.to_path_buf(),
