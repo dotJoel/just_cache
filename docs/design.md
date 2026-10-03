@@ -589,6 +589,21 @@ drives the real binary for both, both directions, plus a symlinked `--dest` that
 inside the watch (the check is on the canonical path, not the spelling) and a name-prefix
 sibling that must still be accepted.
 
+Closed by #81: the in-flight partial is created `0600` explicitly rather than under the
+caller's umask. The destination-resolution work above already opened it that way
+(`DestDir::create_partial` uses `openat(..., O_CREAT|O_EXCL, 0600)`, and umask can only
+clear bits 0600 does not have), so the module's "no reader ever sees the process umask's
+guess at a mode" guarantee held; what was missing was the proof and an aligned doc. The
+source's own mode is still applied only once every byte is in, just before the rename
+publishes the name — the file bears the private partial name until then. The proof is a new
+`JUST_CACHE_FAULT=partial-mode-mid-copy=N` seam: after N bytes it reads the partial's mode
+back from the process holding it open, the only vantage point that can see the window before
+the rename, and `tests/fault_injection.rs` asserts a cross-device copy of a 0600 source is
+witnessed at a mode with no group/other bits and publishes 0600. It fails (mode 100644) if
+`create_partial` is regressed to the process umask, and needs a second filesystem like the
+other copy-path seams, because a same-filesystem copy is a reflink and never enters the
+chunked reader the seam reports through.
+
 Still open, and honestly so:
 
 - **The open-descriptor re-check is a fresh scan, not a lock (#77).** The sweep's
