@@ -1181,7 +1181,14 @@ fn tier_key(dest: &Path) -> String {
 }
 
 /// Shared checks for both subcommands: the watched tree exists, and each destination is
-/// a real directory that is not the watched tree itself.
+/// a real directory that is neither the watched tree nor nested inside it.
+///
+/// Equality alone is not enough: a `--dest` *beneath* the watch (`--watch /data --dest
+/// /data/cold`) is not the watched tree, so it used to pass, and the sweep would discover
+/// and re-move the copies it had just written deeper on every pass — each pass tiering the
+/// previous pass's output. The reverse nesting (`--watch` under a `--dest` root) is the same
+/// hazard seen from the other side, so both directions are refused. `Path::starts_with`
+/// compares whole components, so `/data` matches `/data/cold` but not `/database`.
 fn validate_paths(watch: &Path, dests: &[PathBuf]) -> Result<(), String> {
     if !watch.is_dir() {
         return Err(format!("--watch {} is not a directory", watch.display()));
@@ -1195,11 +1202,32 @@ fn validate_paths(watch: &Path, dests: &[PathBuf]) -> Result<(), String> {
                 dest.display()
             ));
         }
-        if dest.canonicalize().ok() == watched {
-            return Err(format!(
-                "--dest {} is the watched directory, which would do nothing",
-                dest.display()
-            ));
+        // Both roots exist (checked above), so these resolve; the literal fallback keeps a
+        // permission oddity from turning a comparison into a false mismatch.
+        let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+        if let Some(watched) = watched.as_ref() {
+            if &canonical_dest == watched {
+                return Err(format!(
+                    "--dest {} is the watched directory, which would do nothing",
+                    dest.display()
+                ));
+            }
+            if canonical_dest.starts_with(watched) {
+                return Err(format!(
+                    "--dest {} is inside the watched tree {}; a destination under the watch \
+                     would re-tier the tool's own copies on every pass",
+                    dest.display(),
+                    watch.display()
+                ));
+            }
+            if watched.starts_with(&canonical_dest) {
+                return Err(format!(
+                    "--watch {} is inside the --dest root {}; the watched tree must not \
+                     contain the destination it tiers into",
+                    watch.display(),
+                    dest.display()
+                ));
+            }
         }
     }
     Ok(())
