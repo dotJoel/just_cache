@@ -102,13 +102,100 @@ impl Recall {
     }
 }
 
+/// Which transport driver serves a tier: §2's `kind` field, "which transport driver serves
+/// this tier". The variants are the ones the design names, so the type can answer the two
+/// questions the later drivers need — whether a driver exists yet, and whether the tier's
+/// bytes leave this machine — without every caller re-deriving them from a string.
+///
+/// Until now `kind` was parsed as free text and never read again: only `fs` existed, and a
+/// tier written `kind = "object"` with a `path` was silently served as an ordinary local
+/// directory — the mover treating a destination as something it had not understood
+/// (invariant 3). The parse below refuses that instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierKind {
+    /// A local filesystem root: copy + fsync across a tier edge, `EXDEV` and all.
+    Fs,
+    /// A cloud object store: chunked upload with resumable state.
+    Object,
+    /// Another host's tier, reached over the LAN.
+    Peer,
+    /// A volume a person inserts: export to it plus a catalog handshake.
+    Offline,
+}
+
+impl TierKind {
+    /// Every kind the design names, in the order a refusal lists them.
+    pub const ALL: [TierKind; 4] = [
+        TierKind::Fs,
+        TierKind::Object,
+        TierKind::Peer,
+        TierKind::Offline,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TierKind::Fs => "fs",
+            TierKind::Object => "object",
+            TierKind::Peer => "peer",
+            TierKind::Offline => "offline",
+        }
+    }
+
+    /// The supported set as a refusal message spells it: `fs, object, peer, offline`.
+    pub fn names() -> String {
+        TierKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "fs" => Some(TierKind::Fs),
+            "object" => Some(TierKind::Object),
+            "peer" => Some(TierKind::Peer),
+            "offline" => Some(TierKind::Offline),
+            _ => None,
+        }
+    }
+
+    /// True when a transport driver for this kind exists. The parse refuses a kind without
+    /// one, so this is the single place to flip as drivers land — and the tests that pin the
+    /// refusals are the reminder to flip it.
+    pub fn is_served(self) -> bool {
+        matches!(self, TierKind::Fs)
+    }
+
+    /// §2 rule 2: "anything crossing the machine boundary is encrypted first." The envelope
+    /// is required exactly where this is true, which is what the seam has to answer before a
+    /// driver places any bytes.
+    ///
+    /// `Object` and `Peer` cross because the bytes leave the host. `Offline` crosses because
+    /// the volume leaves it: a drawer is further out of reach than a bucket, not less, so the
+    /// export path is the same requirement.
+    pub fn crosses_machine_boundary(self) -> bool {
+        match self {
+            TierKind::Fs => false,
+            TierKind::Object | TierKind::Peer | TierKind::Offline => true,
+        }
+    }
+}
+
+impl std::fmt::Display for TierKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One configured tier: §2's fields, with the name it was declared under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tier {
     /// The table key: `[tiers.ssd]` gives the name `ssd`. This is what commands print.
     pub name: String,
-    /// Which transport driver serves this tier (`fs`, later `object`/`offline`/`peer`).
-    pub kind: String,
+    /// Which transport driver serves this tier. Only `TierKind::Fs` exists today; a config
+    /// naming another kind is refused rather than served as a local directory.
+    pub kind: TierKind,
     /// The filesystem root this tier's bytes sit under.
     pub path: PathBuf,
     pub volatility: Volatility,
@@ -599,11 +686,32 @@ impl RawTier {
             detail,
         };
 
-        let kind = self.kind.get_ref().trim().to_string();
-        if kind.is_empty() {
+        let raw_kind = self.kind.get_ref().trim();
+        if raw_kind.is_empty() {
             return Err(invalid(format!(
                 "line {}: tier `{name}` has an empty `kind`",
                 line_at(text, self.kind.span().start)
+            )));
+        }
+        let kind = TierKind::parse(raw_kind).ok_or_else(|| {
+            invalid(format!(
+                "line {}: tier `{name}` kind `{raw_kind}` is not one of {}; a tier's `kind` \
+                 names the transport driver that serves it",
+                line_at(text, self.kind.span().start),
+                TierKind::names()
+            ))
+        })?;
+        // A kind the design names but no driver serves yet. Refused rather than accepted,
+        // because the alternative is what happened before this seam existed: the tier parsed
+        // and then behaved as a local directory, so the mover would have written a file to a
+        // root it had not understood (invariant 3). Flipping `is_served` is what a driver
+        // landing changes — and the test that pins this refusal is the reminder.
+        if !kind.is_served() {
+            return Err(invalid(format!(
+                "line {}: tier `{name}` kind `{}` has no transport driver yet; `fs` is the \
+                 only kind that exists, so this tier cannot be a file's home",
+                line_at(text, self.kind.span().start),
+                kind
             )));
         }
 
@@ -716,7 +824,7 @@ cost = "$0.02"
         let set = TierSet::parse(sample(), &dir.path().join("tiers.toml")).unwrap();
         assert_eq!(set.tiers().len(), 2);
         let ssd = set.get("ssd").expect("ssd");
-        assert_eq!(ssd.kind, "fs");
+        assert_eq!(ssd.kind, TierKind::Fs);
         assert_eq!(ssd.path, PathBuf::from("/mnt/nvme-pool"));
         assert_eq!(ssd.volatility, Volatility::Persistent);
         assert_eq!(ssd.recall, Recall::Ms);

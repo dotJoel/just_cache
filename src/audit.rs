@@ -895,7 +895,7 @@ impl AuditReport {
                         format!(
                             "{{\"name\":{},\"kind\":{},\"path\":{},\"volatility\":{},\"recall\":{},\"copies\":{},\"cost\":{}}}",
                             json_string(&tier.name),
-                            json_string(&tier.kind),
+                            json_string(tier.kind.as_str()),
                             json_string(&tier.path.to_string_lossy()),
                             json_string(tier.volatility.as_str()),
                             json_string(tier.recall.as_str()),
