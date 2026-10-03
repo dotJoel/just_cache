@@ -31,7 +31,8 @@ pub use audit::{
 };
 pub use catalog::{
     resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind, LocationRecord,
-    MalformedRow, ObjectRecord, RowPathError, ScrubSummary, ScrubTarget, SyncReport, CATALOG_NAME,
+    MalformedRow, ObjectRecord, Resolution, ResolveReport, RowPathError, ScrubSummary, ScrubTarget,
+    SyncReport, CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{

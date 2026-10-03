@@ -24,6 +24,7 @@ entries keep working); `just_cache sweep ...` is the explicit form. The other
 subcommands: [`audit ...`](#auditing-consistency) checks that the tree and the cold tiers
 still agree, [`explain ...`](#explaining-one-path) answers why one path is where it is,
 [`catalog sync ...`](#the-catalog) records the state of both sides in a SQLite catalog,
+and [`catalog resolve ...`](#the-catalog) concludes the differences it reports,
 [`locate ...`](#finding-an-object) says where an object lives,
 [`restore ...`](#restoring-a-file) brings an offloaded file back,
 [`scrub ...`](#scrubbing-for-bitrot) reads every stored copy back and verifies it against
@@ -468,6 +469,20 @@ different bytes, or a location's file vanished or changed, the difference is pri
 the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
 bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
 the tree is worse than none.
+
+A difference a sync reports is a question, not a verdict. `catalog resolve` is the command
+that answers it: it re-walks the tree and the tiers and concludes a difference only where
+the evidence supports it — a rename (the object is still named elsewhere and the file at
+the new name hashes to the recorded digest), a delete (the object survives at another name
+or another copy), or a replacement whose old object still survives elsewhere. It is
+**report-only unless `--apply` is given**, and it refuses everything else with a reason: an
+object with no surviving copy keeps its rows, and nothing is ever deleted. Run it after the
+sync that reported the differences; its exit code matches sync's (`1` when a difference
+remains).
+
+```sh
+just_cache catalog resolve --watch /mnt/cache/media --dest /mnt/disk-slow/media --apply
+```
 
 ## Auditing consistency
 

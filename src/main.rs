@@ -286,6 +286,10 @@ enum CatalogCommand {
     /// after. Anything that contradicts what the catalog already recorded is reported,
     /// and the catalog is left as it was rather than rewritten to match the tree.
     Sync(CatalogSyncArgs),
+    /// Resolve the differences `sync` reported, where the tree's evidence supports a
+    /// conclusion: conclude a rename, a delete or a replacement only when the object it
+    /// touches still survives elsewhere. Report-only unless `--apply` is given.
+    Resolve(CatalogResolveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -316,6 +320,38 @@ struct CatalogSyncArgs {
     /// many copies happen to exist. Default 1.
     #[arg(long, value_name = "N", default_value_t = 1)]
     copies: usize,
+}
+
+/// Everything `catalog resolve` needs. It mirrors `catalog sync`'s tree inputs — the same
+/// tree, the same tiers, the same catalog — because it resolves the differences that sync
+/// reported, and it must see the tree the same way sync did to conclude anything about it.
+#[derive(Debug, Args)]
+struct CatalogResolveArgs {
+    /// Directory to watch. The same tree a sweep moves files out of.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk. Every
+    /// destination must already exist and is used to resolve migrated symlinks and to
+    /// confirm a surviving copy.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// It must already exist: `resolve` acts on recorded differences and never creates a
+    /// catalog (`catalog sync` does).
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// Write the resolutions. Without this flag the pass is report-only: it names every
+    /// difference it would resolve and every one it refuses, and changes nothing.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// Everything `explain` needs to answer for one path. The flags deliberately mirror
@@ -782,6 +818,7 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
 fn run_catalog(args: CatalogArgs) -> ExitCode {
     match args.command {
         CatalogCommand::Sync(sync) => run_catalog_sync(sync),
+        CatalogCommand::Resolve(resolve) => run_catalog_resolve(resolve),
     }
 }
 
@@ -861,6 +898,79 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
     }
 
     if report.has_differences() {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Resolve the differences a `sync` reported, where the tree's evidence supports a
+/// conclusion.
+///
+/// Exit contract, matching `sync`: `0` when the catalog and the tree agree — after an
+/// `--apply` that resolved everything, or when there was nothing to resolve — and `1` when
+/// a difference remains, whether it was refused as irreconcilable or merely reported by a
+/// dry run. `2` on a bad invocation or a catalog that cannot be read. A report-only pass
+/// names what it would resolve but writes nothing, so it is safe to run from cron.
+fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
+    if !args.watch.is_dir() {
+        eprintln!(
+            "just_cache: --watch {} is not a directory",
+            args.watch.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    // Unlike sync, resolve must not create a catalog: it acts on differences already
+    // recorded, and one conjured empty here would report "nothing to resolve" for a tree
+    // that has simply never been synced. A named file that is missing is a bad invocation.
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
+    if !catalog_path.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            catalog_path.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let mut catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = match catalog.resolve(&args.watch, &args.dest, args.apply) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for line in report.summary_lines() {
+        println!("{line}");
+    }
+
+    if report.has_findings() {
         ExitCode::from(EXIT_FINDINGS)
     } else {
         ExitCode::SUCCESS

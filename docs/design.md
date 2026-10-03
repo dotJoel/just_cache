@@ -790,13 +790,15 @@ Still open, and honestly so:
   replicates the same `--limit` candidates across all destinations; it does not fill each
   disk to its own limit first, because a floor is about one object living in N places, not
   about how many objects a disk takes.
-- **A tree edited by hand is reported, not reconciled.** A name the catalog recorded that
-  is gone or now hashes differently, and a location whose file vanished or was replaced,
+- **A tree edited by hand is reported, not reconciled by default.** A name the catalog recorded
+  that is gone or now hashes differently, and a location whose file vanished or was replaced,
   are reported — `sync` exits non-zero — and their rows are left exactly as they were; new
-  names and locations that nothing contradicts are still ingested. What is missing is a
-  resolution step: deciding a vanished name was a rename might be a human command, but it
-  does not exist yet, so a difference repeats on every sync. That is deliberately louder
-  than auto-healing in the wrong direction, and it is the honest state of #16.
+  names and locations that nothing contradicts are still ingested. That is deliberately louder
+  than auto-healing in the wrong direction, and it stays the default. What used to be missing
+  was a resolution step: deciding a vanished name was a rename might be a human command, but it
+  did not exist, so a difference repeated on every sync. That command now exists (`catalog
+  resolve`, #52) and concludes a rename, a delete or a replacement only where the evidence
+  supports it; it is report-only unless `--apply` is given, so nothing is inferred silently.
 - **The copy floor is recorded per tier; a catalog-mode `audit` still checks only the one-copy
   floor.** §6 wants a *per-tier* `copies` floor the scheduler maintains. The schema now holds
   one — the `tier` table's `copies` column, added with the table by #20 — and `catalog sync`
@@ -1125,6 +1127,31 @@ visible next-run, a repair reported once and then quiet, the configured rate pac
 and a floor holding a pass back without verifying a byte; the `schedule.rs` unit tests cover
 the next-run calculation, the config refusals naming their line, and a corrupt state file
 reading as never-run.
+
+Closed by #52: a tree edited by hand is no longer a difference that repeats forever.
+`just_cache catalog resolve --watch … --dest … [--apply]` re-observes the tree and the tiers
+exactly as `sync` does and concludes a difference only where the evidence is a *surviving
+reference the catalog already records*: a vanished name is dropped when the object is still
+named elsewhere in the tree (the rename/duplicate case, the file at the new name hashing to the
+recorded digest), a vanished location is dropped when the object survives as another name or
+another copy (a deleted replica with a sibling left), and a name whose path now holds different
+bytes is repointed only when the object it used to name survives named elsewhere. It is
+report-only unless `--apply` is given, so the default stays report-not-heal and a cron job can
+run it just to see the plan. Everything the evidence does not settle is reported as
+irreconcilable and left alone: an object with no surviving copy keeps its rows (invariant 6),
+and a replacement whose old object survives nowhere is refused because repointing would drop
+the last record of it. No file is ever deleted; only catalog rows move, inside one transaction,
+and a row is never dropped if that would leave an object without its last reference. Two bounds
+are named rather than hidden. First, `resolve` consumes what a `sync` already ingested and does
+not ingest itself — run `catalog sync` first, its non-zero exit is the report — so a surviving
+name the tree shows but the catalog never recorded is not a conclusion this command will make.
+Second, a vanished name whose object survives only as an *unnamed* cold copy is refused, because
+dropping the name would orphan that copy and turn one reported difference into another; the
+operator restores the link or adopts the copy by hand. `tests/resolve.rs` drives the real binary
+through a rename, a deleted replica, a replacement that is repointed and one that is refused, an
+irreconcilable delete, a report-only pass and a clean tree; the three resolution cases were
+checked to fail with the drop/repoint step removed, which is what makes them coverage rather
+than decoration.
 
 ## 10. Non-goals
 
