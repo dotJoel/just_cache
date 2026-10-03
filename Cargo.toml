@@ -18,14 +18,27 @@ toml = "1.1"
 
 # The envelope (#140): authenticated encryption for bytes crossing the machine boundary.
 # XChaCha20-Poly1305, pure Rust, no `unsafe`; `rand_core` supplies the OS entropy for the
-# per-object nonce; `zeroize` clears key material on drop. No driver consumes it yet — the
-# object store is next — so this lands as the seam its issue decided: format, key source,
-# and the plaintext-digest contract in §2.
+# per-object nonce; `zeroize` clears key material on drop. Consumed by the object-store
+# driver (#141) — the first consumer of the envelope.
 chacha20poly1305 = "0.11"
 # The per-object nonce's randomness: the OS entropy source directly (`getrandom::fill`),
 # rather than pulling in `rand` for one 24-byte draw.
 getrandom = "0.4"
 zeroize = "1"
+
+# The object-store driver (#141): S3-compatible HTTPS with request signing.
+# `rustls` provides TLS with no system library dependency (pure Rust); `webpki-roots`
+# supplies root certificates for verifying server certificates. The gateway hand-rolls
+# `std::net` HTTP because it serves plain HTTP on loopback; an object store requires
+# HTTPS, and `std::net` cannot provide TLS without an external implementation — this
+# is the minimal addition that makes the driver work, and the dependency stays inside
+# `src/object_store.rs`; no other module links it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "0.26"
+# AWS SigV4 request signing: HMAC-SHA256, SHA256, and hex for the signature.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -361,6 +361,8 @@ impl Recaller {
             dests: &dests,
             remove_copy: false,
             catalog: Some(&catalog),
+            object_tier_configs: &[],
+            encryption_keys: &[],
         })
         .map_err(|err| failed(err.to_string()))?;
 

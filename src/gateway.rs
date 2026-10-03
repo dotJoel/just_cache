@@ -518,6 +518,8 @@ impl Gateway {
             dests: &self.config.dests,
             remove_copy: false,
             catalog: Some(&catalog),
+            object_tier_configs: &[],
+            encryption_keys: &[],
         };
         match restore::restore(&request) {
             // Both outcomes are success; `AlreadyPresent` makes a repeated restore

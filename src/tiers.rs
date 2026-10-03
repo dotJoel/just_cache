@@ -164,7 +164,7 @@ impl TierKind {
     /// one, so this is the single place to flip as drivers land — and the tests that pin the
     /// refusals are the reminder to flip it.
     pub fn is_served(self) -> bool {
-        matches!(self, TierKind::Fs)
+        matches!(self, TierKind::Fs | TierKind::Object)
     }
 
     /// §2 rule 2: "anything crossing the machine boundary is encrypted first." The envelope
@@ -196,7 +196,9 @@ pub struct Tier {
     /// Which transport driver serves this tier. Only `TierKind::Fs` exists today; a config
     /// naming another kind is refused rather than served as a local directory.
     pub kind: TierKind,
-    /// The filesystem root this tier's bytes sit under.
+    /// The filesystem root this tier's bytes sit under. For `kind = "fs"` this is the
+    /// tier root; for `kind = "object"` this is a local scratch directory for
+    /// downloads and partial upload buffers.
     pub path: PathBuf,
     pub volatility: Volatility,
     pub recall: Recall,
@@ -206,6 +208,9 @@ pub struct Tier {
     /// acts on it yet — placement decisions are P4 — but it is part of the tier's honest
     /// description and printing it is how a reader checks it was parsed.
     pub cost: Option<String>,
+    /// The object-store configuration, present only when `kind == Object`. Kept here
+    /// so callers that match on `kind` can reach the config without a second lookup.
+    pub object_config: Option<crate::object_store::ObjectTierConfig>,
 }
 
 impl Tier {
@@ -438,6 +443,10 @@ impl Tier {
         );
         if let Some(cost) = &self.cost {
             line.push_str(&format!(" cost={cost}"));
+        }
+        if let Some(ref obj) = self.object_config {
+            use std::fmt::Write;
+            let _ = write!(line, " endpoint={} bucket={}", obj.endpoint, obj.bucket);
         }
         line
     }
@@ -677,6 +686,29 @@ struct RawTier {
     copies: toml::Spanned<i64>,
     #[serde(default)]
     cost: Option<toml::Spanned<toml::Value>>,
+    // Object-store fields (#141): required when kind = "object", ignored otherwise.
+    #[serde(default)]
+    endpoint: Option<toml::Spanned<String>>,
+    #[serde(default)]
+    bucket: Option<toml::Spanned<String>>,
+    #[serde(default)]
+    prefix: Option<toml::Spanned<String>>,
+    #[serde(default)]
+    region: Option<toml::Spanned<String>>,
+    /// Path to a credentials file or an environment variable name. For an env var,
+    /// the value must start with `$` (e.g. `$S3_CREDS`).
+    #[serde(default)]
+    credential_source: Option<toml::Spanned<String>>,
+    /// Envelope encryption key: a file path or `$ENV_VAR`. Required for `kind = "object"`
+    /// (bytes cross the machine boundary, §2 rule 2). Same format as `credential_source`.
+    #[serde(default)]
+    encryption_key: Option<toml::Spanned<String>>,
+    /// When true, use plain HTTP instead of TLS. Exposed as a tiers.toml field for
+    /// loopback testing; a real prod config must never set this.
+    #[serde(default)]
+    insecure: bool,
+    #[serde(default)]
+    chunk_size: Option<toml::Spanned<String>>,
 }
 
 impl RawTier {
@@ -763,6 +795,113 @@ impl RawTier {
         });
         let cost = cost.filter(|cost| !cost.trim().is_empty());
 
+        // Object-tier validation (#141): require the object fields when kind == Object,
+        // and leave object_config as None for fs tiers.
+        let object_config = if kind == TierKind::Object {
+            let endpoint = self.endpoint.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `endpoint` (the S3-compatible endpoint host)", 
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let endpoint_str = endpoint.get_ref().trim().to_string();
+            if endpoint_str.is_empty() {
+                return Err(invalid(format!(
+                    "line {}: tier `{name}` endpoint is empty",
+                    line_at(text, endpoint.span().start)
+                )));
+            }
+
+            let bucket = self.bucket.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `bucket`",
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let bucket_str = bucket.get_ref().trim().to_string();
+            if bucket_str.is_empty() {
+                return Err(invalid(format!(
+                    "line {}: tier `{name}` bucket is empty",
+                    line_at(text, bucket.span().start)
+                )));
+            }
+
+            let region = self.region.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `region` (the AWS region for SigV4 signing)", 
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let region_str = region.get_ref().trim().to_string();
+            if region_str.is_empty() {
+                return Err(invalid(format!(
+                    "line {}: tier `{name}` region is empty",
+                    line_at(text, region.span().start)
+                )));
+            }
+
+            let credential_source = self.credential_source.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `credential_source` \
+                     (a file path or an environment variable prefixed with `$`)",
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let cred_str = credential_source.get_ref().trim();
+            let cred = if let Some(var) = cred_str.strip_prefix('$') {
+                crate::object_store::CredentialSource::Env(var.to_string())
+            } else {
+                crate::object_store::CredentialSource::File(PathBuf::from(cred_str))
+            };
+
+            let encryption_key = self.encryption_key.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `encryption_key` \
+                         (a file path or an environment variable prefixed with `$`; the key is \
+                         64 hex characters, 32 bytes — docs/design.md §2 rule 2)",
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let enc_key_str = encryption_key.get_ref().trim();
+            let enc_key = if let Some(var) = enc_key_str.strip_prefix('$') {
+                crate::object_store::CredentialSource::Env(var.to_string())
+            } else {
+                crate::object_store::CredentialSource::File(PathBuf::from(enc_key_str))
+            };
+
+            let prefix = self
+                .prefix
+                .map(|p| p.into_inner().trim().to_string())
+                .filter(|p| !p.is_empty());
+
+            let chunk_size = match self.chunk_size {
+                Some(ref cs) => {
+                    let size_str = cs.get_ref().trim();
+                    crate::scope::parse_size(size_str).map_err(|err| {
+                        invalid(format!(
+                            "line {}: tier `{name}` chunk_size {err}",
+                            line_at(text, cs.span().start)
+                        ))
+                    })?
+                }
+                None => crate::object_store::CHUNK_SIZE,
+            };
+
+            Some(crate::object_store::ObjectTierConfig {
+                name: name.to_string(),
+                endpoint: endpoint_str,
+                bucket: bucket_str,
+                prefix,
+                region: region_str,
+                insecure: self.insecure,
+                credentials: cred,
+                chunk_size,
+                encryption_key: enc_key,
+            })
+        } else {
+            None
+        };
+
         Ok(Tier {
             name: name.to_string(),
             kind,
@@ -771,6 +910,7 @@ impl RawTier {
             recall,
             copies: copies as usize,
             cost,
+            object_config,
         })
     }
 }

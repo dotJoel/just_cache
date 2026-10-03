@@ -18,6 +18,7 @@ pub mod fuse;
 // the `gateway` subcommand reaches it.
 pub mod gateway;
 pub mod namespace;
+pub mod object_store;
 // Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
 // built without test cfg, so the fault seam has to be compiled into production and stay
 // inert there. It is private because nothing outside the crate may set a fault.
@@ -57,8 +58,9 @@ pub use explain::{
     RuleReport, ScopeReport, Verdict as ExplainVerdict,
 };
 pub use file_movement::{
-    log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
-    MigrationRecord, MigrationReport, Policy, ReplicationDetail, SkipReason, UsageTracker,
+    log_file_movement, migrate_least_used, migrate_replicated, migrate_to_object,
+    select_candidates, FileOutcome, MigrationRecord, MigrationReport, Policy, ReplicationDetail,
+    SkipReason, UsageTracker,
 };
 #[cfg(unix)]
 pub use fuse::{serve as mount_serve, MountError, MountRequest};

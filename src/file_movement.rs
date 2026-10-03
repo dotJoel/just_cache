@@ -1111,6 +1111,332 @@ pub fn log_file_movement(record: &MigrationRecord) {
     }
 }
 
+/// Move each eligible candidate to an object-store tier: upload encrypted bytes, verify
+/// the remote copy by downloading and decrypting, record the catalog location, and
+/// remove the source.
+///
+/// This is the object-tier counterpart of [`migrate_least_used`]. The flow is:
+/// 1. Select candidates via [`select_candidates`] (same policy, scope, guards, and pins).
+/// 2. Compute the source file's BLAKE3 digest.
+/// 3. Journal the intent (invariant 5).
+/// 4. Upload through [`crate::object_store::upload`], using the envelope for encryption.
+/// 5. Verify: download + decrypt + hash against the recorded digest
+///    ([`crate::object_store::download_and_verify`]).
+/// 6. Only when verification passes, record the object-tier location in the catalog
+///    (tier = configured tier name, storage_key = S3 object key, content-addressed by
+///    the BLAKE3 id). An object-tier copy has no local representation — the catalog
+///    is the source of truth (`docs/design.md` §3, §4).
+/// 7. Remove the source. No symlink is left: without the FUSE mount the name is
+///    absent, and `locate`/`explain`/`restore` answer from the catalog.
+#[allow(clippy::too_many_arguments)]
+pub fn migrate_to_object(
+    entries: &[FileEntry],
+    tracker: &UsageTracker,
+    context: &mut MoveContext<'_>,
+    now: SystemTime,
+    config: &crate::object_store::ObjectTierConfig,
+    key: &crate::envelope::Key,
+    catalog_path: Option<&Path>,
+    scratch_root: &Path,
+) -> MigrationReport {
+    let (candidates, skipped) = select_candidates(entries, tracker, context, now);
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let pins = context.pins;
+    let journal: &mut Journal = context.journal;
+    let tier_name = &config.name;
+    let mut report = MigrationReport::default();
+
+    for (entry, reason) in skipped {
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: None,
+            outcome: FileOutcome::Skipped(reason),
+            size: entry.size,
+            rule: None,
+        });
+    }
+
+    for candidate in candidates {
+        let entry = candidate.entry;
+        // Same belt-and-braces re-check as the single-copy path.
+        if let Err(rejected) = scope.allows(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Err(in_use) = guards.recheck(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Some(until) = live_pin(pins, &entry.relative, now) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::PinnedUntil { until }),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        if policy.dry_run {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Planned,
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        // The destination the journal records — not a real path, just a namespaced label
+        // so journal recovery can tell it was an object upload.
+        let virtual_dest = scratch_root.join(&entry.relative);
+
+        // Journal the intent before any bytes move (invariant 5).
+        let journalled = journal
+            .intent(&entry.relative, &virtual_dest, entry.size)
+            .is_ok();
+
+        let result = move_to_object_tier(entry, config, key, catalog_path, scratch_root, tier_name);
+
+        let outcome = match result {
+            Ok((obj_key, _digest_hex, digest_bytes)) => {
+                // Upload verified — record the catalog location first,
+                // then remove the source. An object tier holds no local bytes;
+                // a moved name has no local representation — it is offloaded
+                // in the catalog with its only location on the object tier
+                // (docs/design.md §4 no-local-representation decision).
+                //
+                // Crash windows (in order of execution):
+                //   A. uploaded-but-not-recorded: the next sweep re-verifies
+                //      (download + decrypt + hash) and records, or cleans up
+                //      the orphan via abort_upload if the resumable state is
+                //      still present — the source file is still on disk, so
+                //      no data is lost.
+                //   B. recorded-but-source-not-retired: the source is still
+                //      on disk; recovery must not delete it until it vouches
+                //      for the remote copy (invariant 6). The next sweep
+                //      re-downloads, verifies, sees the catalog row already
+                //      there, and removes the source.
+                let recorded = if let Some(cat_path) = catalog_path {
+                    record_object_in_catalog(
+                        cat_path,
+                        digest_bytes.as_bytes(),
+                        entry.size,
+                        config,
+                        &obj_key,
+                    )
+                } else {
+                    Err("no catalog was given for this sweep".to_string())
+                };
+
+                if let Err(record_failed) = recorded {
+                    // The copy is uploaded and verified but the catalog does not
+                    // know it. The source stays — retiring it now would be an
+                    // unrecorded copy, which by §3 is data loss the tool caused.
+                    // The next sweep re-verifies the upload and records it.
+                    FileOutcome::Failed(format!(
+                        "upload verified but could not record the object-tier \
+                         copy in the catalog: {record_failed} — the source is \
+                         kept; run the sweep again to retry"
+                    ))
+                } else {
+                    // Remove the source — no symlink, no local representation.
+                    match std::fs::remove_file(&entry.path) {
+                        Ok(()) => {
+                            if journalled {
+                                journal.forget(&entry.relative);
+                            }
+                            report.records.push(MigrationRecord {
+                                path: entry.path.clone(),
+                                destination: Some(PathBuf::from(format!(
+                                    "s3://{}/{}",
+                                    config.bucket, obj_key
+                                ))),
+                                outcome: FileOutcome::Moved,
+                                size: entry.size,
+                                rule: candidate.rule.clone(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            // The catalog has the location, but we couldn't
+                            // remove the source. The next sweep will retry:
+                            // it verifies the remote copy exists, sees the
+                            // catalog row, and removes the source.
+                            FileOutcome::Failed(format!(
+                                "upload verified and catalog recorded, but cannot \
+                                 remove source {}: {e} — the catalog knows the \
+                                 object-tier copy; run the sweep again to retry \
+                                 source removal",
+                                entry.path.display()
+                            ))
+                        }
+                    }
+                }
+            }
+            Err(err) => FileOutcome::Failed(err.to_string()),
+        };
+
+        if !journalled {
+            eprintln!(
+                "just_cache: cannot record the object move of {} in the journal; a crash during \
+                 this move would not be recoverable",
+                entry.path.display()
+            );
+        }
+
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: Some(virtual_dest),
+            outcome,
+            size: entry.size,
+            rule: candidate.rule.clone(),
+        });
+    }
+
+    report
+}
+
+/// Upload a single file to an object tier, then download and verify.
+/// Returns the object key, the hex digest, and the raw digest bytes on success.
+/// On failure the remote state is undefined (a partial upload may exist and can be
+/// resumed by a later sweep).
+fn move_to_object_tier(
+    entry: &FileEntry,
+    config: &crate::object_store::ObjectTierConfig,
+    key: &crate::envelope::Key,
+    catalog_path: Option<&Path>,
+    scratch_root: &Path,
+    tier_name: &str,
+) -> Result<(String, String, blake3::Hash), String> {
+    // Compute the digest of the source file.
+    let digest = crate::digest::file_digest(&entry.path).map_err(|e| {
+        format!(
+            "cannot read {} to compute its digest: {e}",
+            entry.path.display()
+        )
+    })?;
+
+    // Upload the file, encrypted through the envelope. Every chunk is a separate
+    // envelope chunk; the resumable_upload table tracks which chunks landed.
+    // The catalog path is required by the upload function for the resumable_upload
+    // table; the caller ensures it exists before calling this function.
+    let cat_path = catalog_path.ok_or_else(|| {
+        "object-tier upload without a catalog; resumable state cannot be tracked".to_string()
+    })?;
+    crate::object_store::upload(
+        config,
+        key,
+        cat_path,
+        &entry.path,
+        &digest.to_hex(),
+        &digest,
+    )
+    .map_err(|e| format!("object upload failed for {}: {e}", entry.path.display()))?;
+
+    // Verify: download and decrypt to a temp file, hash, and compare.
+    let digest_hex = digest.to_hex();
+    let obj_key = crate::object_store::object_key(config, digest_hex.as_ref());
+
+    let verify_path = scratch_root.join(format!(
+        ".verify-{}-{}",
+        tier_name,
+        entry
+            .relative
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+    ));
+
+    // Remove stale verify file from a prior attempt.
+    let _ = std::fs::remove_file(&verify_path);
+
+    crate::object_store::download_and_verify(config, key, &obj_key, &digest, &verify_path)
+        .map_err(|e| {
+            format!(
+                "object download-and-verify failed for {} (tier `{tier_name}`): {e}",
+                entry.path.display()
+            )
+        })?;
+
+    // Clean up the verify scratch file — it served its purpose.
+    let _ = std::fs::remove_file(&verify_path);
+
+    Ok((obj_key, digest_hex.to_string(), digest))
+}
+
+/// Record the object and its object-tier location in the catalog.
+///
+/// The object row may not exist yet (a sweep can run before `catalog sync`), so
+/// this ensures it is present before recording the location. The state is set to
+/// `offloaded` because after this call the source is removed: the only copy is in
+/// the object store.
+///
+/// Returns false when the catalog could not be opened or written.
+fn record_object_in_catalog(
+    catalog_path: &Path,
+    digest_bytes: &[u8],
+    size: u64,
+    config: &crate::object_store::ObjectTierConfig,
+    obj_key: &str,
+) -> Result<(), String> {
+    let catalog = crate::catalog::Catalog::open(catalog_path)
+        .map_err(|e| format!("cannot open the catalog: {e}"))?;
+
+    // Ensure the object row exists. The digest is both the identity and the
+    // checksum — the same way `catalog sync` ingests it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Every step's failure is a refusal to retire, not a warning: the caller
+    // removes the source only when this returns true, and a row that failed to
+    // write is exactly the unrecorded copy this function exists to prevent.
+    // (The source stays on disk; the next sweep re-verifies and records.)
+    catalog
+        .ensure_object(digest_bytes, size as i64, digest_bytes, "offloaded", now)
+        .map_err(|e| format!("catalog ensure_object: {e}"))
+        .and_then(|_| {
+            // The object row may already exist from a prior `catalog sync` with
+            // state `present`. After an object-tier move the source is gone:
+            // the state must be `offloaded` because the only copy is in the
+            // object store.
+            catalog
+                .set_object_state(digest_bytes, "offloaded")
+                .map_err(|e| format!("catalog set_object_state: {e}"))
+        })
+        .and_then(|_| {
+            // Record the location row: the tier is the configured tier name, and
+            // the storage key is the S3 object key. This is the catalogue record
+            // that `locate`, `explain`, `restore`, and `audit` query to find the
+            // copy.
+            catalog
+                .record_replica(
+                    digest_bytes,
+                    &config.name,
+                    obj_key,
+                    true,               // verified: the download-and-verify already passed
+                    Some(digest_bytes), // checksum: the same digest
+                )
+                .map(|_| ())
+                .map_err(|e| format!("catalog record_replica: {e}"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1461,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let journal = Journal::at(tmp.path().join("journal")).unwrap();
         (tmp, journal)
+    }
+
+    /// A catalog write that cannot happen must read as "not recorded", because the
+    /// caller removes the source only when this answers Ok — a success on a failed
+    /// write is the unrecorded-copy defect this function exists to prevent.
+    #[test]
+    fn a_catalog_that_cannot_open_is_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory in place of the catalog file: `Catalog::open` refuses it.
+        let not_a_catalog = tmp.path().join("catalog-dir");
+        std::fs::create_dir(&not_a_catalog).unwrap();
+        assert!(record_object_in_catalog(
+            &not_a_catalog,
+            &[0u8; 32],
+            1,
+            &crate::object_store::ObjectTierConfig {
+                name: "offsite".into(),
+                endpoint: "s3.example.com".into(),
+                bucket: "bucket".into(),
+                prefix: None,
+                region: "us-east-1".into(),
+                credentials: crate::object_store::CredentialSource::Env("VAR".into()),
+                chunk_size: crate::object_store::CHUNK_SIZE,
+                insecure: false,
+                encryption_key: crate::object_store::CredentialSource::Env("KEY".into()),
+            },
+            "key",
+        )
+        .is_err());
     }
 
     #[test]
