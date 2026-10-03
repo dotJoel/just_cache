@@ -482,6 +482,21 @@ from it. What is deliberately out of scope is deciding *when* to reconcile (§10
 scrub scheduling) and verifying copies that are present — a stat per location answers
 "is this copy absent", and anything more is the scrubber's job.
 
+Closed in P1 by the journal-record containment check (#68): `journal::repair` no longer acts
+on the paths a record names without first proving they are paths it is allowed to touch. A
+`rel` that is absolute, or that contains a `..` component, is refused — `watch_root.join`
+discards the root for an absolute path and does not resolve `..`, so either shape let a
+hand-edited or truncated journal line make the sweep create a symlink (with a
+size-checked-but-never-hashed destination) or delete a `.just_cache-partial-*` file
+anywhere on the filesystem, before the first move ran. The joined source is also required
+to sit under the watched root, the same `strip_prefix` containment `restore` applies
+(§4), and a record's `dest` must sit under one of the `--dest` roots the invocation was
+given. A refused record is reported as `REFUSED a journal record` and kept in the journal
+so the operator sees the line on the next run; nothing it names is touched. This is the
+`SECURITY.md` in-scope case (a journal line that escapes the watched tree or a destination
+root), and `tests/journal.rs` writes such lines and asserts the outside paths are
+untouched — the test fails if the check is removed.
+
 Still open, and honestly so:
 
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears

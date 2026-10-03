@@ -169,13 +169,13 @@ struct SweepArgs {
 }
 
 impl SweepArgs {
-    fn policy(&self) -> Policy {
-        Policy {
-            min_idle: Duration::from_secs_f64(self.min_idle_days.max(0.0) * 86_400.0),
+    fn policy(&self) -> Result<Policy, String> {
+        Ok(Policy {
+            min_idle: min_idle_duration(self.min_idle_days)?,
             observed_access_pin: self.min_observed_accesses,
             limit: self.limit,
             dry_run: self.dry_run,
-        }
+        })
     }
 
     fn min_free_bytes(&self) -> u64 {
@@ -337,15 +337,15 @@ struct ExplainArgs {
 }
 
 impl ExplainArgs {
-    fn policy(&self) -> Policy {
-        Policy {
-            min_idle: Duration::from_secs_f64(self.min_idle_days.max(0.0) * 86_400.0),
+    fn policy(&self) -> Result<Policy, String> {
+        Ok(Policy {
+            min_idle: min_idle_duration(self.min_idle_days)?,
             observed_access_pin: self.min_observed_accesses,
             limit: 10,
             // `explain` never moves anything; dry_run in the policy is the mover's switch,
             // and this command does not call the mover at all.
             dry_run: true,
-        }
+        })
     }
 
     fn min_free_bytes(&self) -> u64 {
@@ -510,7 +510,13 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let policy = args.policy();
+    let policy = match args.policy() {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let scope = match Scope::build(&args.include, &args.exclude, args.min_size, args.max_size) {
         Ok(scope) => scope,
         Err(err) => {
@@ -547,7 +553,7 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
 
     // What the last run was in the middle of. Run once, before any new work, so a recovered
     // name is visible to this very sweep rather than the one after it.
-    match journal::repair(&mut journal, &watch) {
+    match journal::repair(&mut journal, &watch, &args.dest) {
         Ok(report) => {
             if let Some(summary) = report.summary() {
                 println!("{summary}");
@@ -836,7 +842,13 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         );
     }
 
-    let policy = args.policy();
+    let policy = match args.policy() {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     // Which catalog to consult, if any. An explicit `--catalog` must exist: naming a file
     // that is not there is a bad invocation, not a quiet fallback. The default beside the
     // watch root is consulted only when it is already present — a plain sweep must never
@@ -1101,13 +1113,43 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
 
 fn validate_sweep(watch: &Path, args: &SweepArgs) -> Result<(), String> {
     validate_paths(watch, &args.dest)?;
-    if args.min_idle_days < 0.0 {
-        return Err("--min-idle-days cannot be negative".to_string());
-    }
+    min_idle_duration(args.min_idle_days)?;
     if args.interval == 0 && !args.once {
         return Err("--interval must be at least 1 second".to_string());
     }
     Ok(())
+}
+
+/// The largest `--min-idle-days` that makes sense for a tiering tool. Anything past this
+/// (a millennium) is a typo rather than a policy, and a finite value past `Duration`'s
+/// range would otherwise reach the conversion below and abort the run instead of being
+/// refused like every other bad input.
+const MAX_MIN_IDLE_DAYS: f64 = 365_000.0;
+
+/// Convert `--min-idle-days` into the `Duration` the policy gates on, refusing every value
+/// `f64` will happily parse but the gate cannot honour.
+///
+/// `NaN` is the dangerous one. `NaN < 0.0` is false, so a bare "not negative" check lets it
+/// through, and `NaN.max(0.0)` is `0.0`, so the idle gate collapses to `Duration::ZERO` —
+/// the flag meant to protect files still in use would silently disable the protection.
+/// `inf`, and a finite value whose seconds overflow `Duration`, would panic inside
+/// `from_secs_f64`; `try_from_secs_f64` keeps that a reported error instead.
+fn min_idle_duration(days: f64) -> Result<Duration, String> {
+    if !days.is_finite() {
+        return Err(format!(
+            "--min-idle-days must be a finite number of days, got {days}"
+        ));
+    }
+    if days < 0.0 {
+        return Err("--min-idle-days cannot be negative".to_string());
+    }
+    if days > MAX_MIN_IDLE_DAYS {
+        return Err(format!(
+            "--min-idle-days {days} is above the {MAX_MIN_IDLE_DAYS}-day maximum"
+        ));
+    }
+    Duration::try_from_secs_f64(days * 86_400.0)
+        .map_err(|err| format!("--min-idle-days {days} is not a usable duration: {err}"))
 }
 
 /// Number of distinct destination roots, keyed on canonical path so two names for one

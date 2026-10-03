@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -263,6 +263,10 @@ pub enum Recovery {
     PartialRemoved { path: PathBuf },
     /// An in-flight partial we did not dare delete, because nothing else may be left.
     PartialKept { path: PathBuf },
+    /// A record naming a path outside the watched tree, or a destination outside every
+    /// `--dest` root. Attacker-controlled input, or a truncated journal: nothing was
+    /// touched, and the record is kept so the operator can look at the line.
+    RecordRejected { detail: String },
 }
 
 impl Recovery {
@@ -315,6 +319,10 @@ impl Recovery {
                 path.display(),
                 relative.display()
             ),
+            Recovery::RecordRejected { detail } => format!(
+                "  REFUSED a journal record for {}: {detail}",
+                relative.display()
+            ),
         }
     }
 
@@ -335,7 +343,10 @@ impl Recovery {
     pub fn is_trouble(&self) -> bool {
         matches!(
             self,
-            Recovery::DataLost { .. } | Recovery::Refused { .. } | Recovery::PartialKept { .. }
+            Recovery::DataLost { .. }
+                | Recovery::Refused { .. }
+                | Recovery::PartialKept { .. }
+                | Recovery::RecordRejected { .. }
         )
     }
 }
@@ -383,16 +394,35 @@ impl RecoveryReport {
 /// still worth knowing.
 ///
 /// Reads the filesystem rather than trusting the records: the journal knows what was
-/// *attempted*, and only the filesystem knows what happened.
-pub fn repair(journal: &mut Journal, watch_root: &Path) -> Result<RecoveryReport, JournalError> {
+/// *attempted*, and only the filesystem knows what happened. It also does not trust the
+/// records to name paths inside the tree or inside a destination root — see
+/// [`check_record`] — because the journal is a file in the watched tree that anyone who
+/// can write that tree can edit, and a truncated or hand-edited journal reaches the same
+/// state with no attacker at all.
+pub fn repair(
+    journal: &mut Journal,
+    watch_root: &Path,
+    dests: &[PathBuf],
+) -> Result<RecoveryReport, JournalError> {
     let mut report = RecoveryReport::default();
     let mut still_needs_attention = Vec::new();
 
     for record in journal.unfinished() {
-        let source = watch_root.join(&record.relative);
-        let (outcome, keep) = recover_one(&source, &record);
         journal.forget(&record.relative);
         let relative = record.relative.clone();
+        // The record is checked before anything is done with the paths it names. Without
+        // this, `watch_root.join(absolute)` discards the root and `..` is not resolved, so
+        // an unchecked `rel` would let recovery create a symlink or delete a file anywhere
+        // on the filesystem — before the first move of the sweep runs.
+        if let Err(detail) = check_record(&record, watch_root, dests) {
+            still_needs_attention.push(record);
+            report
+                .outcomes
+                .push((relative, Recovery::RecordRejected { detail }));
+            continue;
+        }
+        let source = watch_root.join(&record.relative);
+        let (outcome, keep) = recover_one(&source, &record);
         if keep {
             still_needs_attention.push(record);
         }
@@ -404,6 +434,107 @@ pub fn repair(journal: &mut Journal, watch_root: &Path) -> Result<RecoveryReport
         journal.compact()?;
     }
     Ok(report)
+}
+
+/// Whether one journal record names paths this pass is allowed to touch.
+///
+/// Three escapes are refused, each because `repair` would otherwise act on a path the
+/// operator never pointed the tool at:
+///
+/// - an absolute `rel`: `watch_root.join` discards the root, so the record names a path
+///   anywhere on the filesystem;
+/// - a `..` component in `rel`: the join does not resolve it, so the source climbs out of
+///   the watched tree;
+/// - a `dest` that is not lexically under one of the `--dest` roots: the `PartialOnly`
+///   branch removes the partial sitting beside it and the restore branch creates a symlink
+///   pointing at it, so an unchecked destination is a deletion or a link aimed outside
+///   every tier.
+///
+/// The source containment test is the same one `restore` applies — a `strip_prefix` of the
+/// watch root — with `..` rejected first, so a lexical prefix match cannot be used to
+/// climb back out (`<root>/../outside` strips to `../outside`, which is not contained).
+fn check_record(record: &Record, watch_root: &Path, dests: &[PathBuf]) -> Result<(), String> {
+    let relative = &record.relative;
+    if relative.as_os_str().is_empty() {
+        return Err("the recorded path is empty".to_string());
+    }
+    if relative.is_absolute() {
+        return Err(format!(
+            "the recorded path {} is absolute, and joining it onto the watched tree would \
+             name a file outside it",
+            relative.display()
+        ));
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "the recorded path {} contains `..`, which escapes the watched tree",
+            relative.display()
+        ));
+    }
+
+    let watch = absolute(watch_root);
+    let source = absolute(&watch_root.join(relative));
+    match source.strip_prefix(&watch) {
+        Ok(rest) if !rest.as_os_str().is_empty() => {}
+        _ => {
+            return Err(format!(
+                "the recorded path {} resolves to {}, outside the watched tree {}",
+                relative.display(),
+                source.display(),
+                watch.display()
+            ))
+        }
+    }
+
+    if let Some(destination) = &record.destination {
+        if !under_any_root(destination, dests) {
+            return Err(format!(
+                "the recorded destination {} is not under any --dest root ({})",
+                destination.display(),
+                display_roots(dests)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` sits under one of `roots`. `..` in the remainder is rejected so that a
+/// lexical prefix like `<root>/../outside` cannot pass as contained.
+fn under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = absolute(path);
+    roots
+        .iter()
+        .any(|root| match path.strip_prefix(absolute(root)) {
+            Ok(rest) => {
+                !rest.as_os_str().is_empty()
+                    && !rest
+                        .components()
+                        .any(|component| matches!(component, Component::ParentDir))
+            }
+            Err(_) => false,
+        })
+}
+
+fn display_roots(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "none given".to_string();
+    }
+    roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// An absolute form of `path`, without resolving symlinks. `std::path::absolute` is purely
+/// lexical plus the current directory, which is what the containment checks need: a
+/// symlink-resolving `canonicalize` would require the path to exist, and a record's source
+/// may be gone precisely because it was moved.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Decide what became of one interrupted move.
