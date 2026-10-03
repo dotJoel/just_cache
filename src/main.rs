@@ -1737,9 +1737,9 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         None => None,
     };
 
-    // Gather object-tier configs and keys so a file offloaded to S3 can be
-    // brought back by downloading through the object-store driver. A tier without
-    // an object config is skipped (it is an FS tier).
+    // Gather remote-tier configs and keys so a file offloaded to an object or peer
+    // tier can be brought back by downloading through the object-store driver. A tier
+    // without an object config is skipped (it is an FS tier).
     let object_configs: Vec<just_cache::object_store::ObjectTierConfig> = tiers
         .as_ref()
         .map(|set| {
@@ -2673,13 +2673,20 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
         report.replication.extend(by_rules.replication);
         pending.clear();
     } else {
-        // Split destinations into FS tiers and object tiers. FS tiers go through the
-        // existing local-copy path; object tiers go through the object-store driver.
-        let (object_dests, fs_dests): (Vec<_>, Vec<_>) = dests.iter().partition(|dest| {
+        // Split destinations into FS tiers and remote tiers. FS tiers go through the
+        // existing local-copy path; remote tiers (`object` and `peer`) go through the
+        // object-store driver — a peer runs the object-server, so it is the same
+        // S3-compatible wire path.
+        let (remote_dests, fs_dests): (Vec<_>, Vec<_>) = dests.iter().partition(|dest| {
             state
                 .tiers
                 .and_then(|t| t.tier_for_root(dest))
-                .is_some_and(|t| matches!(t.kind, just_cache::tiers::TierKind::Object))
+                .is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        just_cache::tiers::TierKind::Object | just_cache::tiers::TierKind::Peer
+                    )
+                })
         });
 
         // --- FS destinations: the existing local-disk path ---------------------------
@@ -2730,8 +2737,8 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             }
         }
 
-        // --- Object-tier destinations: upload + verify + retire ----------------------
-        for dest in &object_dests {
+        // --- Remote-tier destinations: upload + verify + retire ---------------------
+        for dest in &remote_dests {
             let Some(full_tier) = state.tiers.and_then(|t| t.tier_for_root(dest)) else {
                 continue;
             };
@@ -2744,22 +2751,22 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             let key = match tier.load_encryption_key() {
                 Ok(k) => k,
                 Err(err) => {
-                    eprintln!("just_cache: cannot load encryption key for tier `{}` (object store): {err}", tier.name);
+                    eprintln!("just_cache: cannot load encryption key for tier `{}` (remote store): {err}", tier.name);
                     // The sweep can't move to this tier without a key, so drop it but
                     // keep going — the FS tiers already processed their files.
                     continue;
                 }
             };
 
-            // A catalog is required for object-tier movement: the resumable-upload
+            // A catalog is required for remote-tier movement: the resumable-upload
             // table lives there, and object ids need a catalog source of truth (§3).
             let catalog_path = catalog::Catalog::default_path(state.watch);
             let catalog_opt = if catalog_path.is_file() {
                 Some(catalog_path.as_path())
             } else {
                 eprintln!(
-                    "just_cache: object-tier sweep for `{}` needs a catalog (the \
-                     resumable-upload table lives there); skipping object-tier destination {} \
+                    "just_cache: remote-tier sweep for `{}` needs a catalog (the \
+                     resumable-upload table lives there); skipping remote-tier destination {} \
                      — run `catalog sync` first",
                     tier.name,
                     dest.display()

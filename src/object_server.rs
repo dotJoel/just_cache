@@ -841,7 +841,7 @@ fn verify_sigv4(request: &Request, credentials: &(String, String)) -> bool {
         .unwrap_or("UNSIGNED-PAYLOAD");
 
     let canonical_request = format!(
-        "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}{signed_headers_str}\n{payload_hash}"
+        "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
     );
 
     let hashed_canonical_request = hex_sha256(canonical_request.as_bytes());
@@ -857,16 +857,21 @@ fn verify_sigv4(request: &Request, credentials: &(String, String)) -> bool {
 }
 
 fn sigv4_date_is_recent(amz_date: &str) -> bool {
-    // Parse YYYYMMDDTHHMMSSZ
-    if amz_date.len() < 16 {
-        return false;
-    }
-    // Simple check: the date must parse as roughly correct.
-    // For now accept any well-formed timestamp; the credential scope check
-    // plus the server's clock are enough in practice.
-    let date_part = &amz_date[..8];
-    let time_part = &amz_date[9..15];
-    date_part.chars().all(|c| c.is_ascii_digit()) && time_part.chars().all(|c| c.is_ascii_digit())
+    // AWS SigV4 x-amz-date format: `YYYYMMDD'T'HHMMSS'Z'` (18 chars; colons at
+    // indices 11 and 14). This is a well-formedness check, not a skew window — the
+    // credential-scope date stamp ties the signature to the request's date, which is
+    // the real guard. (It used to slice `[9..15]` straight through the colons, which
+    // rejected every real timestamp.)
+    let bytes = amz_date.as_bytes();
+    amz_date.len() == 18
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'T'
+        && bytes[9..11].iter().all(u8::is_ascii_digit)
+        && bytes[11] == b':'
+        && bytes[12..14].iter().all(u8::is_ascii_digit)
+        && bytes[14] == b':'
+        && bytes[15..17].iter().all(u8::is_ascii_digit)
+        && amz_date.ends_with('Z')
 }
 
 // ---------- Cryptographic helpers -----------------------------------------------
@@ -1412,7 +1417,10 @@ mod tests {
             month += 1;
         }
         let day = rd + 1;
-        format!("{year:04}{month:02}{day:02}T{hours:02}{mins:02}{remain_secs:02}Z")
+        // The AWS standard format, with colons: `YYYYMMDDTHH:MM:SSZ`. (A colon-less
+        // `...T224101Z` slipped through the server's old recency check — the real
+        // client always emits the standard form, so the test helper must too.)
+        format!("{year:04}{month:02}{day:02}T{hours:02}:{mins:02}:{remain_secs:02}Z")
     }
 
     fn is_leap(year: i64) -> bool {
@@ -1437,7 +1445,7 @@ mod tests {
         let canonical_headers =
             format!("host:{host}\nx-amz-content-sha256:{body_hash}\nx-amz-date:{amz_date}\n");
         let canonical_request =
-            format!("{method}\n{path}\n\n{canonical_headers}{signed_headers}\n{body_hash}");
+            format!("{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{body_hash}");
         let hashed_request = hex_sha256(canonical_request.as_bytes());
         let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
         let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashed_request}");

@@ -92,11 +92,11 @@ Hard rules:
 
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
-than accepted and then treated as a filesystem. **As implemented (#141):** `fs` and
-`object` have drivers; `peer` and `offline` are still refused by name. **As implemented
-(#155 — the object-server):** a `peer` tier speaks the same S3-compatible subset the
-object-store client speaks — a peer runs `just_cache object-server` (the server half of
-#142), and the `peer` driver (the client half, the follow-up) connects to it. The boundary rule (rule 2) is the type's own answer,
+than accepted and then treated as a filesystem. **As implemented (#141, #142):** `fs`,
+`object` and `peer` have drivers; `offline` is still refused by name. **As implemented
+(#155 + #142 — the LAN-peer tier):** a `peer` tier speaks the same S3-compatible subset the
+object-store client speaks — a peer runs `just_cache object-server` (the server half, #155),
+and the `peer` driver (the client half, #142) connects to it. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -439,7 +439,8 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   *(In progress — this is the phase being worked, one issue at a time because every driver
   adds a variant to the same `kind` dispatch: the tier edge becomes a driver seam and an
   unsupported `kind` is refused (#146), then the encrypted envelope every boundary-crossing
-  driver must go through (#140), the object-store driver (#141), the LAN-peer driver (#142),
+  driver must go through (#140), the object-store driver (#141), the LAN-peer driver (#142 —
+  *done*, see §9),
   the offline-volume driver with vault tracking and the insert prompt (#143), and delete plus
   garbage collection on tiers that are not mounted (#144). The envelope follows the seam
   rather than leading it because the seam is what decides what "crosses the boundary" means;
@@ -1590,9 +1591,49 @@ client (#141) uses: PUT/GET/HEAD/DELETE with SigV4 auth, backed by local directo
 pattern); writes land via `.partial` temp + atomic rename; Content-Length/Content-MD5 are
 verified; the server fails closed on unknown requests. `--insecure` exists for plain HTTP on
 loopback; a non-loopback bind without TLS or `--insecure` is refused. TLS itself is the
-follow-up worker's, with the client half of the `peer` driver. Tests (7 unit tests) cover
+follow-up wiring work. Tests (7 unit tests) cover
 the PUT+GET round trip with real SigV4 signing, bad signature refusal, key escape refusal,
 atomicity, DELETE, Content-MD5 mismatch, and bind safety.
+
+Closed by #142: the `peer` tier driver — the client half of the LAN-peer tier. **The
+transport decision the issue asked to record:** a peer runs `just_cache object-server`
+(#155), and the `peer` driver is the object-store client pointed at it — the same
+S3-compatible subset, one credential pair, and the envelope (§2 rule 2) sealing every byte
+that crosses. This host runs no new daemon; the peer is reached only for roots configured
+for it, and an unreachable, refusing or full peer is a *named* per-file refusal that leaves
+the source, the journal and the catalog exactly as they were (invariants 2, 5 and 7). A
+`peer` tier config is the `object` shape minus a meaningful region: `endpoint` (the peer
+host), `bucket`, `credential_source`, `encryption_key`, optional `chunk_size`/`prefix`, and
+`insecure` for a trusted LAN or loopback — the driver defaults the signing region to `peer`
+(the object-server derives the signing region from the request's credential scope, so the
+value only has to be self-consistent). Recall and restore flow through the same verified
+download path as object tiers, and a `min`/`hours` peer tier refuses inline recall exactly
+as a slow object tier does.
+
+Two things #142 records honestly rather than hides:
+
+- **Single-PUT uploads.** The object-server accepts single-object PUT/GET/HEAD/DELETE only —
+  no multipart endpoints — so a peer tier never uses the multipart/resume path; the whole
+  encrypted file goes in one PUT (the envelope already buffers it, so nothing extra is
+  spent). The trade is recorded: a large upload to a peer interrupted mid-flight restarts
+  from scratch on the next sweep rather than resuming — the source is kept until the
+  read-back verifies, so nothing is lost, only re-sent. Resumable multipart remains
+  cloud-S3-only.
+- **Three SigV4 bugs the real round trip caught.** #141's fake S3 never verified
+  signatures, so client and server had never met. The first real client→server exchange
+  (#142's tests run `just_cache sweep`/`restore` against a real `object-server` over
+  loopback) exposed: the server's canonical request omitted the newline before the signed
+  headers list; the server's recency check rejected every real `YYYYMMDDTHH:MM:SSZ`
+  timestamp (its own test helper used a colon-less form that hid it); and the client signed
+  an empty `host` while doubling `host` and `x-amz-content-sha256`. All three are fixed, and
+  the server's test helper now emits the standard date format.
+
+Tests: 7 end-to-end tests in `tests/peer_tier_e2e.rs` drive the real binary against a real
+`object-server` subprocess — a move + verified recall, a restore back to the original
+content, an unreachable peer, a refused credential, a transfer interrupted and resumed, a
+>8 MiB file over the single-PUT path, and a `hours`-class peer tier parsing as a valid
+destination — plus the tier-parser tests in `tests/tier_kind.rs`. Server-side TLS remains
+the follow-up wiring work.
 
 ## 10. Non-goals
 
