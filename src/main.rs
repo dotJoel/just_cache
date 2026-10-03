@@ -27,6 +27,7 @@ use just_cache::reconcile;
 use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
 use just_cache::scrub::{self, ScrubRequest};
+use just_cache::tiers::TierSet;
 
 /// Exit code for findings that were reported and not resolved, so cron can alert
 /// without parsing any text.
@@ -96,6 +97,13 @@ struct SweepArgs {
     /// plain directory on the wrong filesystem.
     #[arg(long, value_name = "DIR", num_args = 1..)]
     dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`): names each tier and describes it by kind, path,
+    /// volatility, recall and copy floor. Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created. An explicitly named file
+    /// that is missing or malformed is an error, not a silent fallback.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
 
     /// Seconds to sleep between sweeps.
     #[arg(long, value_name = "SECS", default_value_t = 3600)]
@@ -195,6 +203,12 @@ struct AuditArgs {
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
     dest: Vec<PathBuf>,
 
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created. A configured tier is named
+    /// in the output instead of its path; a volatile tier is refused as a `--dest`.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
     /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
     ///
     /// When a catalog exists, audit answers from it plus one filesystem pass over the
@@ -263,6 +277,12 @@ struct CatalogSyncArgs {
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
     dest: Vec<PathBuf>,
 
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created. A configured tier's
+    /// `copies` is recorded as its floor, and a volatile tier is refused as a `--dest`.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
     /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
     #[arg(long, value_name = "FILE")]
     catalog: Option<PathBuf>,
@@ -291,6 +311,12 @@ struct ExplainArgs {
     /// answer can name where the file would go (or where a migrated one already lives).
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
     dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created. A volatile tier is refused
+    /// as a `--dest` (a destination is a home; a volatile tier is a mirror, §2.1).
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
 
     /// Only manage files matching these globs — the same `--include` a sweep uses.
     #[arg(long, value_name = "GLOB")]
@@ -368,6 +394,13 @@ struct LocateArgs {
     #[arg(long, value_name = "FILE")]
     catalog: PathBuf,
 
+    /// Tier configuration (`tiers.toml`). Names each copy's tier and states its recall
+    /// class. Defaults to `tiers.toml` in the catalog's directory, consulted only when it
+    /// is already there — never created. An explicitly named file that is missing or
+    /// malformed is an error, not a silent fallback to path-as-tier-name.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
     /// Print a machine-readable JSON document instead of the summary.
     #[arg(long)]
     json: bool,
@@ -389,6 +422,12 @@ struct RestoreArgs {
     /// the watched root under each one, in order.
     #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
     dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch root,
+    /// consulted only when it is already there — never created. A volatile tier is refused
+    /// as a `--dest` (a volatile copy is a mirror, never data of record).
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
 
     /// Remove the cold copy once the restored file has been verified. Verify-before-delete:
     /// the cold bytes are dropped only after the fresh copy checksums clean.
@@ -508,6 +547,20 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
     if let Err(message) = validate_sweep(&watch, &args) {
         eprintln!("just_cache: {message}");
         return ExitCode::FAILURE;
+    }
+    // Tiers are loaded (and checked) before anything moves. A volatile tier in `--dest`
+    // is a usage error, not a warning: §2.1 forbids a cache being a home, and the error
+    // names the tier so the fix is obvious.
+    let tiers = match load_tiers(args.tiers.as_deref(), &watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
     }
 
     let policy = match args.policy() {
@@ -637,6 +690,17 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
 
     let catalog_path = args
         .catalog
@@ -650,9 +714,20 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
         }
     };
 
-    // The copy floor is a per-tier property, recorded once, and this is the command that
-    // records it — not derived from how many locations happen to exist. Set before the
-    // sync so the same pass can report objects that fall below it.
+    // The copy floor is a per-tier property (#20), and a configured tier now carries its
+    // own: `copies` in `tiers.toml` is the floor for that disk. Recorded once per tier,
+    // not guessed from how many locations happen to exist — and the explicit `--copies`
+    // below still wins when the operator gives one.
+    if let Some(tiers) = &tiers {
+        for dest in &args.dest {
+            if let Some(tier) = tiers.tier_for_root(dest) {
+                if let Err(err) = catalog.set_tier_floor(&tier_key(dest), tier.copies) {
+                    eprintln!("just_cache: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
     if args.copies > 1 {
         for dest in &args.dest {
             if let Err(err) = catalog.set_tier_floor(&tier_key(dest), args.copies) {
@@ -683,6 +758,17 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
 
 fn run_audit(args: AuditArgs) -> ExitCode {
     if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
@@ -728,6 +814,10 @@ fn run_audit(args: AuditArgs) -> ExitCode {
             }
         }
     };
+
+    // The configured tiers ride along in the report so the summary names them, and a
+    // finding can print a tier's name instead of its path. `None` changes nothing.
+    let report = report.with_tiers(tiers);
 
     // Walk mode repairs (checksum-verify a duplicate, re-point a dangling link) are
     // unchanged. Catalog mode never mutates: it marks each finding for resync, because a
@@ -836,6 +926,17 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
 
     let scope = match Scope::build(&args.include, &args.exclude, args.min_size, args.max_size) {
         Ok(scope) => scope,
@@ -926,9 +1027,26 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
 /// Exit codes are the contract: `0` found, `1` nothing found, `2` a bad invocation or an
 /// unusable catalog.
 fn run_locate(args: LocateArgs) -> ExitCode {
+    // `locate` names no watch root, so the default config is `tiers.toml` beside the
+    // catalog — which is beside the watch root for the default catalog path. An explicit
+    // `--tiers` must exist and parse; the default is consulted only when already there.
+    let base = args
+        .catalog
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tiers = match load_tiers(args.tiers.as_deref(), base) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
     let request = LocateRequest {
         query: &args.query,
         catalog: &args.catalog,
+        tiers: tiers.as_ref(),
     };
     let report = match locate::locate(&request) {
         Ok(report) => report,
@@ -953,6 +1071,17 @@ fn run_locate(args: LocateArgs) -> ExitCode {
 
 fn run_restore(args: RestoreArgs) -> ExitCode {
     if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
@@ -1186,6 +1315,45 @@ fn tier_key(dest: &Path) -> String {
         .unwrap_or_else(|_| dest.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+/// Load the tier config for an invocation: `--tiers` when named, otherwise `tiers.toml`
+/// beside `beside` when it is already there.
+///
+/// An explicitly named file that is missing or malformed is an error, never a silent
+/// fallback to path-as-tier-name: the operator asked for *that* file, and answering from
+/// paths instead would answer a different question. The default is only read when it is
+/// present — a command must never create a config it was not asked to (invariant 9).
+fn load_tiers(explicit: Option<&Path>, beside: &Path) -> Result<Option<TierSet>, String> {
+    match explicit {
+        Some(path) => TierSet::load(path).map(Some).map_err(|err| err.to_string()),
+        None => TierSet::load_beside(beside).map_err(|err| err.to_string()),
+    }
+}
+
+/// Refuse a destination root the config marks volatile.
+///
+/// §2.1 is a hard rule: a volatile tier is a promotion target, never the place a file
+/// lives. A `--dest` is exactly the place a file lives, so a sweep told to move bytes into
+/// a volatile tier is told to make a cache the home — refused up front rather than obeyed.
+fn refuse_volatile_dests(tiers: Option<&TierSet>, dests: &[PathBuf]) -> Result<(), String> {
+    let Some(tiers) = tiers else {
+        return Ok(());
+    };
+    for dest in dests {
+        if let Some(tier) = tiers.tier_for_root(dest) {
+            if !tier.is_home() {
+                return Err(format!(
+                    "--dest {} is the volatile tier `{}` ({}): a volatile tier is a mirror, \
+                     never a home (docs/design.md §2.1)",
+                    dest.display(),
+                    tier.name,
+                    tier.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Shared checks for both subcommands: the watched tree exists, and each destination is

@@ -893,6 +893,30 @@ Still open, and honestly so:
   swapped by a process with write access to the root's *ancestors* remains out of scope
   (SECURITY.md), and is the reason the metadata helpers were not converted to `f*` variants.
 
+Closed by #40: a tier is now the configured object §2 describes, not a root path wearing
+its name. `tiers.toml` — read from `--tiers <FILE>`, or from `tiers.toml` beside the watch
+root **only when it is already there** (invariant 9: nothing is created in the watched
+tree that was not asked for) — names each tier and carries its `kind`, `path`,
+`volatility`, `recall`, copy floor `copies`, and optional `cost`. `locate` and `audit`
+print those names instead of raw paths, and `locate` states a copy's recall class even
+though nothing acts on it yet; `audit` prints the configured tiers once and renders a
+finding's tier by name. A `volatile` tier is refused as a destination root and as a policy
+target — §2.1, a volatile tier is a mirror, never a home — by `sweep`, `audit`,
+`catalog sync`, `explain`, and `restore` alike, naming the tier in the refusal. `catalog
+sync` records each configured tier's `copies` as the floor the `tier` table already held
+(#20), with an explicit `--copies` still winning. An explicitly named `--tiers` file that
+is missing or malformed is a usage error that names the line, never a silent fallback;
+with no file the tool behaves exactly as before — a destination root's path is its own
+tier name, and `locate`'s output is byte-for-byte what it was. What the config deliberately
+does not yet do is named rather than implied: nothing evaluates lifecycle rules against the
+tiers (#41), nothing acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1)
+are a later issue, and only the `fs` driver exists — `object`, `offline`, and `peer` tiers
+parse and are named but no driver moves bytes for them. `tests/tiers.rs` drives the real
+binary for the accepted behaviours: two tiers named in `locate`/`audit` output with their
+recall classes, a volatile tier refused as `--dest` by both `sweep` and `catalog sync`, a
+malformed config naming its line (a syntax error and a bad enum alike), and no config
+meaning today's behaviour and creating nothing.
+
 ## 10. Non-goals
 
 - **Deciding *when* to reconcile is not this feature's job.** `just_cache reconcile` is an
@@ -945,3 +969,13 @@ Still open, and honestly so:
   completely would need a kernel "no one may open this next" primitive that does not
   exist. The residual gap is declared in §9 rather than hidden behind a check that
   cannot promise it.
+
+- **The tier config describes tiers; it does not yet drive them.** #40 makes a tier a
+  configured object — a name, a driver, a recall class, a volatility, a copy floor, a cost
+  — and lets `locate`/`audit` speak in those names, and refuses a volatile tier as a
+  destination. Nothing evaluates lifecycle rules against the tiers (that is #41), nothing
+  acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1) are a later
+  issue, and the only driver implemented is the existing `fs` symlink mover: an `object`,
+  `offline`, or `peer` tier parses and is named, but no bytes move to or from it. A
+  config that named such a tier as a `--dest` would be accepted only because the destination
+  still has to exist as a local directory — the driver half is P3.

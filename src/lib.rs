@@ -20,6 +20,7 @@ pub mod replication;
 pub mod restore;
 pub mod scope;
 pub mod scrub;
+pub mod tiers;
 
 pub use audit::{
     audit, audit_with_copies, catalog_audit, catalog_repair, classify, repair, AuditError,
@@ -54,3 +55,4 @@ pub use restore::{
 };
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
 pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};
+pub use tiers::{Recall, Tier, TierSet, TiersError, Volatility, TIERS_FILE_NAME};
