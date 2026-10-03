@@ -809,10 +809,17 @@ pub fn move_file_with_symlink(
 }
 
 /// The deterministic seam for the window between a destination's content being verified
-/// and the source being removed: the destination is unlinked and replaced by a different
-/// file, which is exactly what a racing process (or an attacker) would do to make the
-/// removal delete the last verified copy. Inert unless `JUST_CACHE_FAULT` sets
-/// `replace-verified-dest`; see `faults.rs`.
+/// and the source being removed: the destination is replaced by a different file, which is
+/// exactly what a racing process (or an attacker) would do to make the removal delete the
+/// last verified copy. Inert unless `JUST_CACHE_FAULT` sets `replace-verified-dest`; see
+/// `faults.rs`.
+///
+/// The replacement is written under a private name *before* the destination is unlinked, so
+/// the kernel has already allocated it a distinct inode. Unlinking and then writing in place
+/// lets the fresh file take over the inode the old one just freed, and then the `(device,
+/// inode)` the guard re-stats is unchanged and the seam silently does nothing — which is what
+/// happened on CI (ext4 recycled the inode; the local filesystem did not). Creating the
+/// replacement first is what "the name now resolves to a different object" actually means.
 fn maybe_replace_verified_dest(dir: &DestDir, dest_name: &OsStr, dest: &Path) {
     let Some(crate::faults::Fault {
         mode: crate::faults::FaultMode::ReplaceVerifiedDest,
@@ -824,8 +831,16 @@ fn maybe_replace_verified_dest(dir: &DestDir, dest_name: &OsStr, dest: &Path) {
     if !crate::faults::claim_replace_verified_dest() {
         return;
     }
-    let _ = dir.remove(dest_name);
-    let _ = fs::write(dest, b"replaced after verification");
+    let staged = dest.with_file_name(format!(".just_cache-fault-replaced-{}", std::process::id()));
+    // A seam that half-fires is worse than one that does not fire: the test would assert a
+    // refusal that never happened. Leave the destination alone if the staging write fails.
+    if fs::write(&staged, b"replaced after verification").is_err() {
+        return;
+    }
+    if dir.remove(dest_name).is_err() || fs::rename(&staged, dest).is_err() {
+        let _ = fs::remove_file(&staged);
+        return;
+    }
     eprintln!(
         "just_cache: JUST_CACHE_FAULT=replace-verified-dest replaced {} after its content was \
          verified",
