@@ -1,0 +1,14 @@
+# Dependabot version updates. `versioning-strategy` is irrelevant to a binary
+# crate, but `schedule` is not: without a version-updates config Dependabot only
+# alerts on vulnerabilities and never opens PRs to move the lockfile forward.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
