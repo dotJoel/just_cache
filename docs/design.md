@@ -219,6 +219,22 @@ invariant, and the reason the symlink-only design breaks real workloads).
 | **symlink** (today's tool) | real file replaced by relative symlink | n/a — no recall, consumer must cope | consumers that do not follow links (rsync/backup defaults, some SMB clients, qBittorrent verify) |
 | **gateway** | S3/WebDAV endpoint over the catalog, for backup apps and non-POSIX consumers | explicit restore semantics | none unusual |
 
+The gateway (`just_cache gateway`, #47) is WebDAV, not S3: `PROPFIND` lists the namespace
+with size and lifecycle state (`jc:state` = `present` | `offloaded`), `GET`/`HEAD` with a
+single `Range` reads a present copy, and `POST <path>?restore` is the restore request. A
+`GET` of an offloaded object is answered `409` naming the restore request rather than
+streamed from a slow tier — that is the "explicit restore semantics" above. A read mutates
+nothing: the catalog is only read, bytes are opened read-only with `O_NOATIME` where the
+kernel allows it (so a backup app reading everything does not make everything look hot),
+and every write method is `405`. The restore request is the only thing that places bytes,
+and it is `restore::restore` — copy, read back, hash against the recorded checksum — with
+`--remove-copy` never set. Every request needs the token (`Bearer`, or the password of
+HTTP Basic), read from `--token-file` or `JUST_CACHE_GATEWAY_TOKEN` and never logged; an
+object any of whose copies sits on a root not given as `--watch`/`--dest` is `403` even
+when the catalog knows that root. The HTTP layer is plain `std::net`, so the gateway adds
+no dependency, and nothing but the `gateway` subcommand reaches it: the mover and the FUSE
+mount neither link a server nor need one running.
+
 The FUSE provider's one non-negotiable: **access observation**. Every open/read/close
 updates `lifecycle` directly — no atime, no relatime caveats, no fanotify. This fixes
 the v0.2.0 weakness where "usage" is really atime and degrades to mtime on
@@ -1308,6 +1324,23 @@ gated on `/dev/fuse`; a writer that opened its handle *before* a concurrent prom
 caught only by the size/mtime/inode re-check on the next hit, so a same-size rewrite within
 one mtime tick could be served stale until the next invalidating call; and residency does
 not yet survive a restart (the overlay is emptied instead).
+
+Closed by #47: the gateway provider. `just_cache gateway --watch W --dest D --token-file F`
+serves the catalog over WebDAV (`src/gateway.rs`, see §4): listing and metadata by
+`PROPFIND`, single-range reads of present copies, and `POST <path>?restore` through the
+verified restore path. `tests/gateway.rs` drives it over real HTTP against a real catalog:
+a listing and a range read of a present object that leave every catalog row and every byte
+in both roots unchanged; a restore request that turns the offloaded symlink into a verified
+regular file and leaves the cold copy; a restore from a rotted cold copy that is refused
+and places nothing; missing, wrong-Bearer and wrong-Basic credentials answered `401`; an
+object on a tier the gateway was not configured with refused `403` for both listing and
+restore; and the CLI's startup errors not containing the token. Still open, and named: a
+gateway restore writes no catalog rows, so the catalog keeps calling the object offloaded
+until the next `catalog sync` (the gateway serves the restored hot file meanwhile); the
+server handles one connection at a time and speaks plain HTTP only, so it belongs on
+loopback or behind a TLS terminator; there is no S3 API, only WebDAV; and `O_NOATIME` is
+best-effort — a file the gateway user does not own is read with a plain open, which can
+update atime and so the mover's usage signal.
 
 ## 10. Non-goals
 

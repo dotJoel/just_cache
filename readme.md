@@ -50,6 +50,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
 - 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
 - 🗂️ [Mounting the namespace](#mounting-the-namespace)
+- 🌐 [Serving it over WebDAV](#serving-it-over-webdav)
 - ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
 - 🔨 [Building and testing](#building-and-testing)
 - 👷 [How this codebase is built](#how-this-codebase-is-built)
@@ -857,6 +858,23 @@ What the mount is:
 `mount` needs `/dev/fuse` and the `fusermount3` helper; it is Unix-only, and no other
 subcommand depends on FUSE at run time, so the symlink mover and every read-only command
 keep working with no mount anywhere.
+
+## Serving it over WebDAV
+
+For a backup app or anything else that cannot mount, `gateway` serves the catalog's
+namespace over an authenticated WebDAV endpoint:
+
+```sh
+just_cache gateway --watch /mnt/user/media --dest /mnt/disk2/cold --token-file ~/.jc-token
+curl -H "Authorization: Bearer $(cat ~/.jc-token)" -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8730/shows
+curl -H "Authorization: Bearer $(cat ~/.jc-token)" -X POST 'http://127.0.0.1:8730/shows/old.mkv?restore'
+```
+
+Listing and reads change nothing — no catalog rows, no bytes. A read of an offloaded object
+is refused with `409` until a `POST <path>?restore` brings it back through the same verified
+copy `restore` uses. The token may also be sent as the password of HTTP Basic, or come from
+`JUST_CACHE_GATEWAY_TOKEN`; it is never logged. The endpoint is plain HTTP and listens on
+loopback by default — put a TLS terminator in front before exposing it.
 
 ## Scheduling the maintenance passes
 
