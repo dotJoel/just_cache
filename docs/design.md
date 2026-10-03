@@ -93,7 +93,10 @@ Hard rules:
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
 than accepted and then treated as a filesystem. **As implemented (#141):** `fs` and
-`object` have drivers; `peer` and `offline` are still refused by name. The boundary rule (rule 2) is the type's own answer,
+`object` have drivers; `peer` and `offline` are still refused by name. **As implemented
+(#155 — the object-server):** a `peer` tier speaks the same S3-compatible subset the
+object-store client speaks — a peer runs `just_cache object-server` (the server half of
+#142), and the `peer` driver (the client half, the follow-up) connects to it. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -1580,6 +1583,17 @@ interrupted upload keeps the source, a checksum mismatch adopts nothing. A manua
 against a real S3 bucket is documented below since CI cannot cover a cloud endpoint
 deterministically.
 
+Closed by #155: `just_cache object-server` — the server half of the LAN-peer tier (#142). A
+peer runs this on their machine, speaking the same S3-compatible subset the object-store
+client (#141) uses: PUT/GET/HEAD/DELETE with SigV4 auth, backed by local directories under
+`--root`, validated against `--bucket`. Key containment is lexical + canonical (the #68/#71
+pattern); writes land via `.partial` temp + atomic rename; Content-Length/Content-MD5 are
+verified; the server fails closed on unknown requests. `--insecure` exists for plain HTTP on
+loopback; a non-loopback bind without TLS or `--insecure` is refused. TLS itself is the
+follow-up worker's, with the client half of the `peer` driver. Tests (7 unit tests) cover
+the PUT+GET round trip with real SigV4 signing, bad signature refusal, key escape refusal,
+atomicity, DELETE, Content-MD5 mismatch, and bind safety.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
@@ -1715,3 +1729,12 @@ deterministically.
   catalog knows it. Neither is a correctness hole — every read is still answered from a root
   the catalog proved, and every row that cannot be resolved still refuses — but a long-lived
   mount is a snapshot of the catalog it opened, not a live view of it.
+- **The object-server speaks to exactly one credential pair, and in the clear unless the
+ operator wires TLS.** `just_cache object-server` (#155) verifies one SigV4 credential
+ pair — no tenants, no per-root credentials, no IAM — because a peer tier is a machine the
+ same person owns on both ends; anything richer is cloud-provider work. Transport
+ encryption is likewise out of scope for it: the *content* is always sealed by the
+ envelope (§2 rule 2), the loopback fake and a trusted-LAN peer may run plain HTTP, and a
+ non-loopback bind without TLS refuses unless `--insecure` is given explicitly, with a
+ warning naming the exposure. Server-side TLS (the client already speaks it via `rustls`)
+ is the peer-tier wiring work that follows.
