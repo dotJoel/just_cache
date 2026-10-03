@@ -85,7 +85,15 @@ worth reading before editing the code around them.
 - **Branch, then PR — never commit on `main`.** Even in a repo where you own every commit:
   undoing an accidental push to `main` costs a force push, which is worse than the PR it
   skipped. Check `git branch --show-current` before committing if you have several worktrees
-  checked out.
+  checked out. A ruleset now enforces this: `main` requires a PR and a green `build` check,
+  and rejects force pushes and branch deletion.
+- **Cleanup after a squash merge is ordered, not careful.** Merge from outside the PR's
+  worktree, then `git worktree remove <path>`, then `git branch -D <branch>`. The repo
+  auto-deletes the remote head branch on merge. Lowercase `-d` will always refuse here:
+  a squash commit shares no history with the branch, so every branch looks unmerged to
+  it — `-D` after a squash merge is expected and safe, because the content is already on
+  `main` under the squash commit. Deleting the branch *before* removing its worktree
+  triggers an avoidable approval prompt on destructive-looking commands.
 - Commits are authored as the repository owner, not as an agent.
 - Pushes touching `.github/workflows/` need the token's **Workflows** permission (fine-grained
   PATs have no `workflow` scope); without it the push is rejected and the change is stranded.
