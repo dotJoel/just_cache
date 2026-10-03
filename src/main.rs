@@ -853,7 +853,35 @@ fn run_audit(args: AuditArgs) -> ExitCode {
 
     // The configured tiers ride along in the report so the summary names them, and a
     // finding can print a tier's name instead of its path. `None` changes nothing.
-    let report = report.with_tiers(tiers);
+    //
+    // The scrub-state counts ride along too, read once here and carried by the report so
+    // the readable line and the JSON object are the same numbers from the same query.
+    // Without a catalog there is nothing to count: `None` makes the JSON key `null` rather
+    // than a zeroed object, which would read as "every copy verified" when no copy was
+    // read at all. A failure to read the summary is reported and also leaves it absent.
+    let scrub = if catalog_path.is_file() {
+        match catalog::Catalog::open(&catalog_path) {
+            Ok(catalog) => match catalog.scrub_summary() {
+                Ok(summary) => Some(audit::ScrubSection {
+                    locations: summary.locations,
+                    verified: summary.verified,
+                    never_scrubbed: summary.never_scrubbed,
+                    damaged: summary.damaged,
+                }),
+                Err(err) => {
+                    eprintln!("just_cache: {err}");
+                    None
+                }
+            },
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let report = report.with_tiers(tiers).with_scrub(scrub);
 
     // Walk mode repairs (checksum-verify a duplicate, re-point a dangling link) are
     // unchanged. Catalog mode never mutates: it marks each finding for resync, because a
@@ -919,23 +947,15 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         }
     }
 
-    // Scrub state is a separate signal from the structural verdicts above, so it is
-    // reported when asked for but changes neither the findings nor the exit code: a
-    // "never scrubbed" copy is a gap in verification, not an inconsistency between the
-    // tree and its tiers. (Readable output only for now; the JSON document does not carry
-    // the section, which §9 names as an open gap.)
-    if let Some(catalog_path) = &args.catalog {
-        if !args.json {
-            match catalog::Catalog::open(catalog_path) {
-                Ok(catalog) => match catalog.scrub_summary() {
-                    Ok(summary) => {
-                        for line in summary.summary_lines() {
-                            println!("{line}");
-                        }
-                    }
-                    Err(err) => eprintln!("just_cache: {err}"),
-                },
-                Err(err) => eprintln!("just_cache: {err}"),
+    // Scrub state is a separate signal from the structural verdicts above, so it changes
+    // neither the findings nor the exit code: a "never scrubbed" copy is a gap in
+    // verification, not an inconsistency between the tree and its tiers. Under `--json` it
+    // is the report's `scrub` object, part of the document printed above; on the terminal
+    // the same counts print here.
+    if !args.json {
+        if let Some(scrub) = &report.scrub {
+            for line in scrub.summary_lines() {
+                println!("{line}");
             }
         }
     }

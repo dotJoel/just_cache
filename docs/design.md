@@ -897,10 +897,6 @@ Still open, and honestly so:
   group that has rot, in which case it is re-read and a failed read is marked damaged
   (#75, above). `--rate` is what makes a cron-driven scrub safe to run
   against a tier that is serving reads.
-- **`audit --json` does not carry the scrub section.** `audit --catalog` adds
-  "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
-  document has no `scrub` object yet; only the readable path reports it. The readable
-  output is what ships, and the omission is named rather than silently implied.
 - **The symlinked-component guard covers the mover, not every writer.** #71 resolves and
   holds the destination directory only in `move_file_with_symlink`. `copy_into_place`, which
   `--copies` replication and `reconcile` call, still opens `dest.parent()` by path, so a
@@ -1025,6 +1021,23 @@ one, a non-zero exit, then zero after `chmod` restores readability and the file 
 ingested), and a file already in the catalog going unreadable (reported unreadable, *not*
 re-reported as name-vanished or location-missing, its rows kept). Deliberately not done, as
 §9 already names: a privileged re-read for a root-owned file a non-root sync cannot open.
+Closed by #55: `audit --json` carries the scrub section. When a catalog answered, the
+document now holds `"scrub":{"locations":N,"verified":N,"never-scrubbed":N,"damaged":N}` —
+the same four counts the readable `scrub:` line prints, read once in `run_audit` and carried
+by the report (`audit::ScrubSection`, `AuditReport::with_scrub`) so the human line and the
+JSON object cannot drift: there is one query and one struct behind both, not two renderings
+that a test would have to keep in step. The addition is additive — every existing JSON key
+is unchanged and the document still parses. Without a catalog the key is `"scrub":null`, not
+four zeroes: a walk-based audit read no stored bytes, and a zeroed object would read as
+"everything verified", the exact claim the section exists to avoid. One behaviour grew on
+the readable side for the same reason: a catalog-mode audit now prints its `scrub:` line
+whether the catalog was named with `--catalog` or found at the default path, because both
+renderings read the report's section rather than reopening the file on their own.
+`tests/audit_catalog.rs`'s `json_carries_the_scrub_counts_the_readable_output_prints` parses
+both renderings for the same catalog — before a scrub (nothing verified) and after one
+(every copy verified) — and asserts the counts agree and move, so it cannot pass on a
+hard-coded zero in both; `json_scrub_is_null_for_a_walk_based_audit` pins the no-catalog
+`null`. A unit test in `audit.rs` pins the object's exact shape.
 
 ## 10. Non-goals
 

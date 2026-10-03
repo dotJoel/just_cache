@@ -46,16 +46,17 @@ use crate::tiers::TierSet;
 /// How many examples the readable summary lists by default.
 pub const DEFAULT_EXAMPLES: usize = 10;
 
-/// The copy floor this audit enforces for every object.
+/// The copy floor an audit enforces for an object when the operator names none.
 ///
-/// `docs/design.md` §6 asks for a *per-tier* floor the scheduler maintains, but the schema
-/// the catalog shipped with has no floor column and adding one is more than a small, honest
-/// migration (it needs a versioning step, not an `ALTER TABLE` that existing catalogs never
-/// see). So this enforces the only floor the schema can express without inventing a column:
-/// **every object must keep at least one location that still exists**. An object whose every
-/// recorded copy is gone is below the floor and is reported as such — the "missing copy is a
-/// repair job, reported, not silent" case, made visible even when each individual copy was
-/// already reported missing. A configurable per-tier floor is named as a gap in §9.
+/// This is a per-*object* floor and it is not the schema's only one. `docs/design.md` §6
+/// asks for a per-tier floor, and the catalog records it: the `tier` table's `copies` column
+/// (written by `catalog sync` from `tiers.toml`, or by `--copies N`) is the floor a sweep
+/// enforces when it decides whether a tier is under-replicated. An audit answers a different
+/// question — how many locations still *exist* for one object — so its floor is per object and
+/// normally comes from `--copies`; this constant is the default. **Every object must keep at
+/// least one location that still exists**: an object whose every recorded copy is gone is
+/// below the floor and is reported as such — the "missing copy is a repair job, reported, not
+/// silent" case, made visible even when each individual copy was already reported missing.
 pub const COPY_FLOOR: usize = 1;
 
 #[derive(Debug, Error)]
@@ -401,6 +402,49 @@ impl AuditSource {
     }
 }
 
+/// The scrub-state counts `audit` reports alongside its structural findings.
+///
+/// A copy the catalog records but no scrub has read back is not *proven*: the whole point
+/// of §6's scrub is that "the catalog has it" is not the same as "the bytes are good". The
+/// readable output already says so, and this carries the same numbers into `--json` so a
+/// machine reading the document gets the same disclaimer a human reads on the terminal.
+///
+/// Only a catalog-backed audit has anything to count. The field is `Option` for exactly
+/// that reason: without a catalog the JSON is `null`, never a zeroed object. Four zeroes
+/// read as "nothing never-scrubbed, nothing damaged" — "everything verified" — which is the
+/// one thing a walk-based audit did not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubSection {
+    /// Every location the catalog records.
+    pub locations: usize,
+    /// Locations whose last recorded verification matches the object they hold.
+    pub verified: usize,
+    /// Locations with no verification, or one that no longer matches.
+    pub never_scrubbed: usize,
+    /// Locations a scrub marked damaged with no verified copy to repair from.
+    pub damaged: usize,
+}
+
+impl ScrubSection {
+    /// The readable line. Deliberately the same wording `catalog::ScrubSummary` prints, and
+    /// the one place both renderings read it from, so the human line and the JSON object
+    /// cannot drift apart — the test that compares them would be the only thing keeping
+    /// two copies of this sentence in step, and a test is not a guarantee at run time.
+    pub fn summary_lines(&self) -> Vec<String> {
+        vec![format!(
+            "  scrub: {} location(s): {} verified, {} never scrubbed, {} damaged",
+            self.locations, self.verified, self.never_scrubbed, self.damaged
+        )]
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"locations\":{},\"verified\":{},\"never-scrubbed\":{},\"damaged\":{}}}",
+            self.locations, self.verified, self.never_scrubbed, self.damaged
+        )
+    }
+}
+
 /// The whole result of an audit run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditReport {
@@ -417,6 +461,9 @@ pub struct AuditReport {
     /// tiers in the output and lets a finding print a tier's name instead of its path.
     /// `None` is exactly the pre-tiers behaviour: a tier's path is its own name.
     pub tiers: Option<TierSet>,
+    /// Scrub-state counts from the catalog that answered, or `None` for a walk-based audit
+    /// (and for a catalog-mode run whose summary could not be read). See [`ScrubSection`].
+    pub scrub: Option<ScrubSection>,
 }
 
 impl AuditReport {
@@ -428,6 +475,14 @@ impl AuditReport {
     /// exactly as it was before tiers existed — a tier's path is its own name.
     pub fn with_tiers(mut self, tiers: Option<TierSet>) -> Self {
         self.tiers = tiers;
+        self
+    }
+
+    /// Attach the catalog's scrub-state counts. `None` leaves the JSON's `scrub` key `null`
+    /// (and the readable output silent): a walk-based audit read no stored bytes, and a
+    /// zeroed object would claim every copy was verified.
+    pub fn with_scrub(mut self, scrub: Option<ScrubSection>) -> Self {
+        self.scrub = scrub;
         self
     }
 
@@ -585,6 +640,14 @@ impl AuditReport {
             AuditSource::Walk => "null".to_string(),
         };
 
+        // `null`, not a zeroed object, when no catalog answered. A consumer must be able to
+        // tell "this audit read no stored bytes" from "this audit read them and all were
+        // verified"; zeroes would collapse those into the reassuring one.
+        let scrub_json = match &self.scrub {
+            None => "null".to_string(),
+            Some(scrub) => scrub.json(),
+        };
+
         // The configured tiers, as a machine-readable list. `null` when none was given,
         // so a consumer can tell "no config" from "an empty config" the same way the CLI
         // does.
@@ -615,7 +678,7 @@ impl AuditReport {
         };
 
         format!(
-            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"tiers\":{},\"scanned\":{},\"healthy\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
+            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"tiers\":{},\"scanned\":{},\"healthy\":{},\"scrub\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
             json_string(&self.watch.to_string_lossy()),
             dest_json.join(","),
             json_string(self.source.as_str()),
@@ -623,6 +686,7 @@ impl AuditReport {
             tiers_json,
             self.scanned,
             self.healthy,
+            scrub_json,
             findings.join(","),
             counts.join(","),
             repair_json
@@ -768,6 +832,7 @@ pub fn audit_with_copies(
         healthy,
         findings,
         tiers: None,
+        scrub: None,
     })
 }
 
@@ -1107,6 +1172,7 @@ pub fn catalog_audit(
         healthy,
         findings,
         tiers: None,
+        scrub: None,
     })
 }
 
@@ -1543,6 +1609,7 @@ mod tests {
             scanned: 10,
             healthy: 6,
             tiers: None,
+            scrub: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/watch/a.bin"),
@@ -1595,6 +1662,7 @@ mod tests {
             scanned: 1,
             healthy: 0,
             tiers: None,
+            scrub: None,
             findings: vec![Finding {
                 path: PathBuf::from("/watch/a)weird\"name"),
                 relative: PathBuf::from("a)weird\"name"),
@@ -1623,6 +1691,53 @@ mod tests {
     }
 
     #[test]
+    fn the_json_scrub_section_matches_the_readable_line_and_nulls_without_a_catalog() {
+        let scrub = ScrubSection {
+            locations: 7,
+            verified: 4,
+            never_scrubbed: 2,
+            damaged: 1,
+        };
+
+        // The JSON object and the readable line are the same numbers from the same struct:
+        // a consumer and a human must never be told different things about the same catalog.
+        let report = AuditReport {
+            watch: PathBuf::from("/watch"),
+            dests: vec![PathBuf::from("/cold")],
+            source: AuditSource::Catalog {
+                path: PathBuf::from("/watch/.just_cache-catalog.sqlite"),
+            },
+            scanned: 1,
+            healthy: 0,
+            tiers: None,
+            scrub: Some(scrub),
+            findings: Vec::new(),
+        };
+        let json = report.to_json(None);
+        assert!(
+            json.contains(
+                "\"scrub\":{\"locations\":7,\"verified\":4,\"never-scrubbed\":2,\"damaged\":1}"
+            ),
+            "{json}"
+        );
+        // The readable line is the same struct rendered for a human: one source, two forms.
+        let readable = scrub.summary_lines().join("\n");
+        assert!(
+            readable.contains("scrub: 7 location(s): 4 verified, 2 never scrubbed, 1 damaged"),
+            "{readable}"
+        );
+
+        // No catalog answered: `null`, not four zeroes. A zeroed object reads as
+        // "everything verified", which a walk-based audit never established.
+        let walk = report.with_scrub(None);
+        assert!(
+            walk.to_json(None).contains("\"scrub\":null"),
+            "{}",
+            walk.to_json(None)
+        );
+    }
+
+    #[test]
     fn the_copy_floor_is_the_one_the_schema_can_express() {
         // A configurable per-tier floor needs a schema column the catalog does not have;
         // until then the only honest floor is "at least one copy survives". Pinning it here
@@ -1641,6 +1756,7 @@ mod tests {
             scanned: 3,
             healthy: 0,
             tiers: None,
+            scrub: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/cold/a.bin"),
