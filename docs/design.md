@@ -817,10 +817,6 @@ Still open, and honestly so:
   next `catalog sync`, and until then `audit` tells a restore-in-progress from a true duplicate.
 - **Every file is hashed on every sync.** Correct, because identity is the hash, but not
   cheap; there is no digest cache keyed on size and mtime yet.
-- **One unreadable file aborts the sync** rather than being skipped: a catalog built by
-  silently ignoring a file would be a catalog that disagrees with the tree. The mover's
-  rule that one failure never stops a sweep has no catalog equivalent yet.
-
 - **Journal records carry a size, not a digest.** Recovery refuses to link a name to a
   copy whose size does not match what the move promised, which is the strongest check
   available without hashing every file before every move. A same-size-but-corrupt copy
@@ -1014,6 +1010,21 @@ code, or deliberate limits that stay recorded (the fault seam's reach, the atime
 fallback, the hard-link-at-the-journal-name gap, root-owned files, the absent catalog-only
 audit and digest cache, the per-root journal, single-copy catalog audit, and the
 reconcile/scrub scheduling bounds).
+Closed by #53: a `catalog sync` no longer aborts on the first unreadable file. Each file
+whose bytes could not be read is reported per file — its path and the error, under an
+`unreadable:` line kept apart from `differences:` — and the rest of the tree is ingested in
+the one transaction, so the cost of one locked file is a named hole, not an un-built
+catalog. A sync in which any file failed exits non-zero (rule 7 applied to the catalog),
+exactly as one with a difference does; a clean sync still exits `0`. The pass infers
+nothing from the failure: the file is recorded neither as vanished nor as a missing
+location nor as empty — "could not read" is the only thing said about it — so the catalog
+can never claim a deletion it did not see. A later sync, once the file can be read, ingests
+it and the finding clears. `tests/catalog.rs` drives the real binary for both halves: one
+locked file beside a readable one (the readable file ingested, the report naming the locked
+one, a non-zero exit, then zero after `chmod` restores readability and the file is
+ingested), and a file already in the catalog going unreadable (reported unreadable, *not*
+re-reported as name-vanished or location-missing, its rows kept). Deliberately not done, as
+§9 already names: a privileged re-read for a root-owned file a non-root sync cannot open.
 
 ## 10. Non-goals
 

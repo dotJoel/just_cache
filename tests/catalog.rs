@@ -445,6 +445,118 @@ fn a_freshly_created_catalog_is_private_to_its_user() {
     );
 }
 
+/// One unreadable file among readable ones: the pass reports it and ingests everything
+/// else. Before #53 the first failed read aborted the whole sync, so a single locked file
+/// left the entire catalog un-ingested — the mover's rule 7 has no business stopping at
+/// the catalog's door.
+///
+/// The unreadable file is a mode-000 regular file. The walk stats it fine (stat needs no
+/// read permission), so it is the read-back hash that fails, which is exactly the window
+/// this issue is about. A process with `CAP_DAC_OVERRIDE` (root) cannot be blocked this
+/// way; CI runs unprivileged, and if that ever changes this test fails loudly on the
+/// exit-code assertion rather than passing quietly.
+#[test]
+fn sync_continues_past_an_unreadable_file_and_ingests_the_rest() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("readable.bin"), b"read me").unwrap();
+    fs::write(hot.join("locked.bin"), b"cannot read me").unwrap();
+    fs::set_permissions(hot.join("locked.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = sync(&hot, &cold);
+    // Non-zero: a catalog with a hole in it is a finding cron must see (rule 7 applied to
+    // the catalog), even though the rest of the tree was ingested.
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("unreadable: locked.bin"),
+        "the report must name the unreadable file:\n{text}"
+    );
+    assert!(
+        text.contains("Permission denied") || text.contains("os error 13"),
+        "the report must carry the error:\n{text}"
+    );
+
+    let catalog = catalog_at(&hot);
+    // The readable file went in despite the failure — the whole point of the change.
+    assert!(
+        catalog.object_for_path("readable.bin").unwrap().is_some(),
+        "a sibling failure must not cost the readable file its ingest"
+    );
+    assert_eq!(catalog.name_count().unwrap(), 1);
+    // Nothing was inferred about the file that could not be read: no name, and it is not
+    // reported as vanished or missing either.
+    assert!(catalog.object_for_path("locked.bin").unwrap().is_none());
+    assert!(!text.contains("name-vanished: locked.bin"), "{text}");
+    assert!(!text.contains("location-missing: locked.bin"), "{text}");
+
+    // Make it readable: the next sync ingests it and the catalog is clean again.
+    fs::set_permissions(hot.join("locked.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+    let healed = sync(&hot, &cold);
+    assert_exit(&healed, 0);
+    assert!(
+        stdout(&healed).contains("no differences"),
+        "the hole is filled:\n{}",
+        stdout(&healed)
+    );
+    let catalog = catalog_at(&hot);
+    assert!(catalog.object_for_path("locked.bin").unwrap().is_some());
+    assert_eq!(catalog.name_count().unwrap(), 2);
+}
+
+/// A file the catalog already knows, made unreadable: it must be reported as unreadable
+/// and *not* re-reported as a vanished name or a missing location. A read failure is not
+/// evidence of a deletion, and inventing one would corrupt the catalog's account of the
+/// tree (issue #53). The rows themselves are kept either way.
+#[test]
+fn an_unreadable_file_is_not_recorded_as_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("readable.bin"), b"read me").unwrap();
+    fs::write(hot.join("locked.bin"), b"cannot read me").unwrap();
+
+    assert_exit(&sync(&hot, &cold), 0);
+    assert_eq!(catalog_at(&hot).name_count().unwrap(), 2);
+
+    fs::set_permissions(hot.join("locked.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+    let output = sync(&hot, &cold);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(text.contains("unreadable: locked.bin"), "{text}");
+    assert!(
+        !text.contains("name-vanished"),
+        "an unreadable file is not a vanished one:\n{text}"
+    );
+    assert!(
+        !text.contains("location-missing"),
+        "an unreadable file is not a missing location:\n{text}"
+    );
+
+    let catalog = catalog_at(&hot);
+    assert!(
+        catalog.object_for_path("locked.bin").unwrap().is_some(),
+        "the row survives a failed read"
+    );
+    assert_eq!(catalog.name_count().unwrap(), 2);
+
+    fs::set_permissions(hot.join("locked.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+    let healed = sync(&hot, &cold);
+    assert_exit(&healed, 0);
+    assert!(
+        stdout(&healed).contains("no differences"),
+        "{}",
+        stdout(&healed)
+    );
+}
+
 fn canonical(path: &Path) -> String {
     fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
