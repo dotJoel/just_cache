@@ -1240,10 +1240,20 @@ pub fn migrate_to_object(
                         &obj_key,
                     )
                 } else {
-                    false
+                    Err("no catalog was given for this sweep".to_string())
                 };
 
-                if recorded {
+                if let Err(record_failed) = recorded {
+                    // The copy is uploaded and verified but the catalog does not
+                    // know it. The source stays — retiring it now would be an
+                    // unrecorded copy, which by §3 is data loss the tool caused.
+                    // The next sweep re-verifies the upload and records it.
+                    FileOutcome::Failed(format!(
+                        "upload verified but could not record the object-tier \
+                         copy in the catalog: {record_failed} — the source is \
+                         kept; run the sweep again to retry"
+                    ))
+                } else {
                     // Remove the source — no symlink, no local representation.
                     match std::fs::remove_file(&entry.path) {
                         Ok(()) => {
@@ -1276,13 +1286,6 @@ pub fn migrate_to_object(
                             ))
                         }
                     }
-                } else {
-                    FileOutcome::Failed(
-                        "upload verified but could not record in the catalog \
-                         (the catalog is required for object-tier moves; run \
-                         `catalog sync` first to ensure objects are ingested)"
-                            .to_string(),
-                    )
                 }
             }
             Err(err) => FileOutcome::Failed(err.to_string()),
@@ -1390,11 +1393,9 @@ fn record_object_in_catalog(
     size: u64,
     config: &crate::object_store::ObjectTierConfig,
     obj_key: &str,
-) -> bool {
-    let catalog = match crate::catalog::Catalog::open(catalog_path) {
-        Ok(cat) => cat,
-        Err(_) => return false,
-    };
+) -> Result<(), String> {
+    let catalog = crate::catalog::Catalog::open(catalog_path)
+        .map_err(|e| format!("cannot open the catalog: {e}"))?;
 
     // Ensure the object row exists. The digest is both the identity and the
     // checksum — the same way `catalog sync` ingests it.
@@ -1402,26 +1403,38 @@ fn record_object_in_catalog(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Every step's failure is a refusal to retire, not a warning: the caller
+    // removes the source only when this returns true, and a row that failed to
+    // write is exactly the unrecorded copy this function exists to prevent.
+    // (The source stays on disk; the next sweep re-verifies and records.)
     catalog
         .ensure_object(digest_bytes, size as i64, digest_bytes, "offloaded", now)
-        .ok();
-    // The object row may already exist from a prior `catalog sync` with state
-    // `present`. After an object-tier move the source is gone: the state must
-    // be `offloaded` because the only copy is in the object store.
-    let _ = catalog.set_object_state(digest_bytes, "offloaded");
-
-    // Record the location row: the tier is the configured tier name, and the
-    // storage key is the S3 object key. This is the catalogue record that
-    // `locate`, `explain`, `restore`, and `audit` query to find the copy.
-    let _ = catalog.record_replica(
-        digest_bytes,
-        &config.name,
-        obj_key,
-        true,               // verified: the download-and-verify already passed
-        Some(digest_bytes), // checksum: the same digest
-    );
-
-    true
+        .map_err(|e| format!("catalog ensure_object: {e}"))
+        .and_then(|_| {
+            // The object row may already exist from a prior `catalog sync` with
+            // state `present`. After an object-tier move the source is gone:
+            // the state must be `offloaded` because the only copy is in the
+            // object store.
+            catalog
+                .set_object_state(digest_bytes, "offloaded")
+                .map_err(|e| format!("catalog set_object_state: {e}"))
+        })
+        .and_then(|_| {
+            // Record the location row: the tier is the configured tier name, and
+            // the storage key is the S3 object key. This is the catalogue record
+            // that `locate`, `explain`, `restore`, and `audit` query to find the
+            // copy.
+            catalog
+                .record_replica(
+                    digest_bytes,
+                    &config.name,
+                    obj_key,
+                    true,               // verified: the download-and-verify already passed
+                    Some(digest_bytes), // checksum: the same digest
+                )
+                .map(|_| ())
+                .map_err(|e| format!("catalog record_replica: {e}"))
+        })
 }
 
 #[cfg(test)]
@@ -1448,6 +1461,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let journal = Journal::at(tmp.path().join("journal")).unwrap();
         (tmp, journal)
+    }
+
+    /// A catalog write that cannot happen must read as "not recorded", because the
+    /// caller removes the source only when this answers Ok — a success on a failed
+    /// write is the unrecorded-copy defect this function exists to prevent.
+    #[test]
+    fn a_catalog_that_cannot_open_is_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory in place of the catalog file: `Catalog::open` refuses it.
+        let not_a_catalog = tmp.path().join("catalog-dir");
+        std::fs::create_dir(&not_a_catalog).unwrap();
+        assert!(record_object_in_catalog(
+            &not_a_catalog,
+            &[0u8; 32],
+            1,
+            &crate::object_store::ObjectTierConfig {
+                name: "offsite".into(),
+                endpoint: "s3.example.com".into(),
+                bucket: "bucket".into(),
+                prefix: None,
+                region: "us-east-1".into(),
+                credentials: crate::object_store::CredentialSource::Env("VAR".into()),
+                chunk_size: crate::object_store::CHUNK_SIZE,
+                insecure: false,
+                encryption_key: crate::object_store::CredentialSource::Env("KEY".into()),
+            },
+            "key",
+        )
+        .is_err());
     }
 
     #[test]

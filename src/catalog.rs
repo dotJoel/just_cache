@@ -2244,7 +2244,7 @@ impl Catalog {
         self.conn.execute(
             "INSERT OR IGNORE INTO lifecycle
                  (object_id, last_access, accesses, pinned_until, rule)
-             VALUES (?1, ?4, 0, NULL, NULL)",
+             VALUES (?1, ?2, 0, NULL, NULL)",
             params![id, created_at],
         )?;
         Ok(())
