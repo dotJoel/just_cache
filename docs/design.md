@@ -428,6 +428,20 @@ Each phase ships something usable alone: P0 is a better standalone mover; P1 mak
 trustworthy; P2 removes the symlink breakage; P3 completes the S3 analogy; P4 is the
 part nothing else does.
 
+**Where the MCP server lands.** Exposing the catalog-backed commands to agents (#137) is
+deliberately not a phase: nothing in P3 or P4 waits on it, so a phase slot would imply a
+gate that does not exist. It is scheduled for **after P3**, because P3 is both what makes
+it worth having and what settles its interface. Once a remote tier exists, "where does
+this file live" is a question the filesystem cannot answer at all, and a recall is
+something that can cost egress, a wait, or a human inserting a volume — exactly the
+decisions an agent should be able to consult before it acts. Those are also the semantics
+the tool surface has to express, and they do not exist yet: tool names and schemas are as
+much a public API as the CLI is, and agents get pinned by the prompts they are written
+into, so designing them ahead of the drivers buys a rewrite rather than a head start.
+Waiting costs nothing in rework — the CLI's `--json` output is already the contract an
+adapter would wrap. If a concrete need to drive the tool from an agent appears while P3
+is in flight, that is the evidence to pull it forward; speculation is not.
+
 ## 9. Known gaps (tracked, not hidden)
 
 Each fix that lands adds a "Closed by #NN" paragraph to this section. A new entry is
@@ -1484,6 +1498,11 @@ name still go through to the cold copy in place; recall is read-only opens.
   deliberately not the mechanism: it would need a restart policy, log rotation and a pid
   file for a job that is one command, and cron already exists on every host that would run
   this.
+- **An MCP server is a client-driven adapter, not that daemon by another name.** It starts
+  with its client, answers requests and exits with it: no timer, no scheduled pass, no
+  autonomous mutation. The read-only tools (`locate`, `explain`, `audit`, `scrub --dry-run`)
+  are the default surface; recall and `restore` are separate tools the operator opts into,
+  because both move bytes and `restore` writes. §8 records when it lands and why.
 - **Ongoing verification of copies that are present is not reconcile's job either.** It
   stats each recorded location — one stat answers "is this copy absent", which is all it
   exists to ask — and leaves the read-back of present copies to `scrub`, the only place
