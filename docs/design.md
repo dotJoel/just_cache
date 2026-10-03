@@ -407,6 +407,18 @@ preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of 
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
 
+Closed in P1 by issue #72: `audit`, `scrub`, and `reconcile` no longer turn a location row's
+`tier` and `storage_key` into a filesystem path blindly. A sync records the canonical watch
+and destination roots in the catalog; readers prove the tier is one of those roots and reject
+an absolute key or any key with a `..` component before stat, hash, create, or replace. A
+refused row is reported as `malformed-catalog`, and the outside path is not touched. The
+integration test edits the catalog directly to reproduce absolute-key, parent-component,
+and unknown-tier rows; it asserts the outside sentinel and the would-be reconcile target
+remain unchanged/nonexistent. A catalog from before root tracking fails closed until a
+successful `catalog sync` records independently observed roots. This prevents a path-escape
+through a location row, not an operator who edits both the location and trusted-root rows
+consistently; the catalog is not a tamper-proof trust store.
+
 Closed in P1 by `just_cache restore` through the catalog (#18): restoring an object now
 verifies the bytes it writes against the object's **recorded checksum**, not against the
 cold copy's own bytes. The open-if-present rule the rest of the tool uses applies: a
@@ -697,5 +709,9 @@ Still open, and honestly so:
   state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
   volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
 - Multi-user quotas/permissions: single-trust-domain system.
+- **The catalog is not a tamper-proof trust store.** Row-path validation rejects an edited
+  `location` row against the roots recorded by sync (or supplied to `audit`); protecting
+  against an actor who edits both the location and the root table is outside the threat
+  model. Protect the catalog file with the same access controls as the data it describes.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.

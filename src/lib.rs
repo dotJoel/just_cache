@@ -27,8 +27,8 @@ pub use audit::{
     VerdictKind, COPY_FLOOR, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
-    Catalog, CatalogError, Difference, DifferenceKind, LocationRecord, ObjectRecord, ScrubSummary,
-    ScrubTarget, SyncReport, CATALOG_NAME,
+    resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind, LocationRecord,
+    MalformedRow, ObjectRecord, RowPathError, ScrubSummary, ScrubTarget, SyncReport, CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{
