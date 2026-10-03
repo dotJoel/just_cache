@@ -28,6 +28,7 @@
 //!   — no source, no copy — are kept and reported every run, because nothing on disk
 //!   remains for `audit` to find.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -843,8 +844,11 @@ fn destination_partials(destination: Option<&Path>) -> Vec<PathBuf> {
 
 // ---------------------------------------------------------------------------------------
 // Encoding. JSON lines, written and read by hand because this crate carries no JSON
-// dependency; the escape handling is tested with paths that contain the awkward characters,
-// since a journal that mangles a path would send recovery to the wrong file.
+// dependency; the escape handling is tested with paths that contain the awkward characters
+// — and with a name that is not valid UTF-8 — since a journal that mangles a path would
+// send recovery to the wrong file. Paths are encoded from their raw `OsStr` bytes, never
+// through `to_string_lossy`, so a byte-for-byte round trip holds even for a name the
+// filesystem allows and UTF-8 does not.
 // ---------------------------------------------------------------------------------------
 
 fn encode_record(record: &Record) -> String {
@@ -859,46 +863,92 @@ fn encode_record(record: &Record) -> String {
     line
 }
 
+/// The raw bytes of a path, without the lossy UTF-8 round trip `to_string_lossy` performs.
+///
+/// On Unix a path is a byte string that need not be valid UTF-8, and `to_string_lossy`
+/// would replace each invalid byte with U+FFFD — journaling a name that is not the file's
+/// name, so recovery resolves against the wrong path.
+fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Cow::Borrowed(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
+/// Rebuild a path from the bytes `escape` produced.
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 fn escape(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let mut out = String::with_capacity(text.len() + 2);
+    let bytes = path_bytes(path);
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            control if control.is_control() => out.push_str(&format!("\\u{:04x}", control as u32)),
-            other => out.push(other),
+    for &byte in bytes.iter() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            // Printable ASCII is left as-is; every other byte — a control character or a
+            // byte that is not valid UTF-8 — becomes one `\xNN` escape, so no byte is lost
+            // and the encoding is reversible byte-for-byte.
+            0x20..=0x7e => out.push(byte as char),
+            other => out.push_str(&format!("\\x{other:02x}")),
         }
     }
     out.push('"');
     out
 }
 
-fn unescape(text: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(text.len());
+/// Decode one quoted string field body into the bytes it names.
+///
+/// Byte-oriented, not char-oriented: a `\xNN` escape names one raw byte, which need not be
+/// valid UTF-8, while the literal characters of a journal written before this encoder still
+/// contribute their UTF-8 bytes — so an older journal and a newer one both parse.
+fn unescape(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(text.len());
     let mut characters = text.chars();
     while let Some(character) = characters.next() {
         if character != '\\' {
-            out.push(character);
+            let mut buffer = [0u8; 4];
+            out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
             continue;
         }
         match characters.next() {
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
+            Some('"') => out.push(b'"'),
+            Some('\\') => out.push(b'\\'),
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('x') => {
+                let digits: String = characters.by_ref().take(2).collect();
+                let byte = u8::from_str_radix(&digits, 16)
+                    .map_err(|_| format!("bad byte escape \\x{digits}"))?;
+                out.push(byte);
+            }
             Some('u') => {
                 let digits: String = characters.by_ref().take(4).collect();
                 let code = u32::from_str_radix(&digits, 16)
                     .map_err(|_| format!("bad unicode escape \\u{digits}"))?;
                 let decoded = char::from_u32(code)
                     .ok_or_else(|| format!("\\u{digits} is not a character"))?;
-                out.push(decoded);
+                let mut buffer = [0u8; 4];
+                out.extend_from_slice(decoded.encode_utf8(&mut buffer).as_bytes());
             }
             other => return Err(format!("bad escape \\{}", other.unwrap_or(' '))),
         }
@@ -907,7 +957,7 @@ fn unescape(text: &str) -> Result<String, String> {
 }
 
 fn parse_record(line: &str) -> Result<Record, String> {
-    match field(line, "stage")?.as_str() {
+    match field_text(line, "stage")?.as_str() {
         "intent" => {}
         // Written by an earlier version of this module, when a finished move recorded
         // itself as well. Read as a record rather than an error so an upgrade does not
@@ -915,9 +965,9 @@ fn parse_record(line: &str) -> Result<Record, String> {
         "linked" => {}
         other => return Err(format!("unknown stage {other:?}")),
     }
-    let relative = PathBuf::from(field(line, "rel")?);
-    let destination = optional_field(line, "dest").map(PathBuf::from);
-    let size = optional_field(line, "size")
+    let relative = path_from_bytes(field_bytes(line, "rel")?);
+    let destination = optional_field(line, "dest").map(path_from_bytes);
+    let size = optional_text(line, "size")
         .map(|value| {
             value
                 .parse::<u64>()
@@ -925,7 +975,7 @@ fn parse_record(line: &str) -> Result<Record, String> {
         })
         .transpose()?
         .unwrap_or(0);
-    let at = optional_field(line, "at")
+    let at = optional_text(line, "at")
         .map(|value| {
             value
                 .parse::<u64>()
@@ -942,12 +992,22 @@ fn parse_record(line: &str) -> Result<Record, String> {
     })
 }
 
-/// Pull one string field out of a record line. Deliberately not a general JSON parser.
-fn field(line: &str, key: &str) -> Result<String, String> {
+/// Pull one raw field out of a record line. Deliberately not a general JSON parser.
+fn field_bytes(line: &str, key: &str) -> Result<Vec<u8>, String> {
     optional_field(line, key).ok_or_else(|| format!("missing field {key:?}"))
 }
 
-fn optional_field(line: &str, key: &str) -> Option<String> {
+/// Pull one field out of a record line and decode it as UTF-8, for the fields that name no
+/// path (`stage`, `size`, `at`).
+fn field_text(line: &str, key: &str) -> Result<String, String> {
+    optional_text(line, key).ok_or_else(|| format!("missing field {key:?}"))
+}
+
+fn optional_text(line: &str, key: &str) -> Option<String> {
+    String::from_utf8(optional_field(line, key)?).ok()
+}
+
+fn optional_field(line: &str, key: &str) -> Option<Vec<u8>> {
     let needle = format!("\"{key}\":");
     let start = line.find(&needle)? + needle.len();
     let rest = &line[start..];
@@ -970,7 +1030,7 @@ fn optional_field(line: &str, key: &str) -> Option<String> {
         return None;
     }
     let end = rest.find([',', '}']).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    Some(rest.as_bytes()[..end].to_vec())
 }
 
 #[cfg(test)]
@@ -1040,6 +1100,41 @@ mod tests {
         assert_eq!(unfinished.len(), 1);
         assert_eq!(unfinished[0].relative, awkward);
         assert_eq!(unfinished[0].size, 7);
+    }
+
+    /// A name the filesystem allows and UTF-8 does not must survive encode/parse
+    /// byte-for-byte. `to_string_lossy` would replace the 0xFF with U+FFFD, journaling a
+    /// name that is not the file's — the round trip is not identity, and recovery resolves
+    /// against the wrong path.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_round_trips_byte_for_byte() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let (tmp, mut journal) = temp_journal();
+        let raw_name = b"a-\xff-quote\"-tab\tbyte.bin".to_vec();
+        let relative = PathBuf::from(OsString::from_vec(raw_name.clone()));
+        journal
+            .intent(&relative, &tmp.path().join("cold/x.bin"), 11)
+            .unwrap();
+
+        let reopened = Journal::in_tree(tmp.path()).unwrap();
+        let unfinished = reopened.unfinished();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].relative, relative);
+        assert_eq!(
+            unfinished[0].relative.as_os_str().as_bytes(),
+            raw_name.as_slice(),
+            "the name must survive byte-for-byte, not as U+FFFD"
+        );
+        let on_disk = fs::read(tmp.path().join(JOURNAL_NAME)).unwrap();
+        assert!(
+            !on_disk
+                .windows(3)
+                .any(|window| window == [0xef, 0xbf, 0xbd]),
+            "the journal must carry no U+FFFD substitution"
+        );
     }
 
     #[test]
