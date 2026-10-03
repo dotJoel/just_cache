@@ -52,6 +52,40 @@ fn catalog_at(watch: &Path) -> Catalog {
     Catalog::open(watch.join(CATALOG_NAME)).expect("catalog opens")
 }
 
+/// The four numbers in the readable `scrub:` line — locations, verified, never scrubbed,
+/// damaged — read from the text a human sees, not recomputed from the report.
+fn readable_scrub_counts(text: &str) -> (usize, usize, usize, usize) {
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("scrub:"))
+        .unwrap_or_else(|| panic!("no `scrub:` line in:\n{text}"));
+    let mut numbers = line
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty());
+    let mut next = || {
+        numbers
+            .next()
+            .unwrap_or_else(|| panic!("too few numbers in `{line}`"))
+            .parse()
+            .unwrap()
+    };
+    (next(), next(), next(), next())
+}
+
+/// The integer after `"<field>":` in the hand-written document. Field order and surrounding
+/// keys are not asserted here, so the JSON can stay additive.
+fn json_number(json: &str, field: &str) -> usize {
+    let marker = format!("\"{field}\":");
+    let (_, rest) = json
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("no {marker} in:\n{json}"));
+    rest.chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("{marker} is not an integer in:\n{json}"))
+}
+
 /// A tree the mover left healthy, then broken by hand. Every catalog-mode verdict the
 /// issue asks for should be reported, and the exit code must stay `1`.
 #[test]
@@ -314,4 +348,111 @@ fn the_report_names_its_source() {
         }
     );
     assert_eq!(report.count(VerdictKind::UnknownPath), 1);
+}
+
+/// The acceptance test for #55: `audit --catalog --json` carries the scrub section, and its
+/// counts are exactly the ones the readable output prints for the same catalog — before a
+/// scrub (nothing verified) and after one (both copies verified).
+#[test]
+fn json_carries_the_scrub_counts_the_readable_output_prints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    // A hot-only file and a migrated one: three recorded locations in total is not needed —
+    // two is enough to show the counts move off zero independently of the structural audit.
+    fs::write(watch.join("live.bin"), b"hot payload").unwrap();
+    fs::write(cold.join("moved.bin"), b"cold payload").unwrap();
+    link(Path::new("../cold/moved.bin"), &watch.join("moved.bin"));
+    assert!(sync(&watch, &cold).status.success());
+
+    let catalog_path = watch.join(CATALOG_NAME);
+    let catalog_arg = catalog_path.to_str().unwrap();
+
+    // Nothing has been scrubbed yet, so the section must say so rather than implying the
+    // catalog vouches for unread bytes.
+    let readable = audit(&watch, &cold, &["--catalog", catalog_arg]);
+    assert_eq!(readable.status.code(), Some(0), "{}", stdout(&readable));
+    let readable_text = stdout(&readable);
+    let (locations, verified, never, damaged) = readable_scrub_counts(&readable_text);
+    assert_eq!(verified, 0, "{readable_text}");
+    assert_eq!(
+        never, locations,
+        "every recorded copy is unverified before a scrub:\n{readable_text}"
+    );
+    assert_eq!(damaged, 0, "{readable_text}");
+
+    let machine = audit(&watch, &cold, &["--catalog", catalog_arg, "--json"]);
+    assert_eq!(machine.status.code(), Some(0), "{}", stdout(&machine));
+    let json = stdout(&machine);
+    assert_eq!(json_number(&json, "locations"), locations, "{json}");
+    assert_eq!(json_number(&json, "verified"), verified, "{json}");
+    assert_eq!(json_number(&json, "never-scrubbed"), never, "{json}");
+    assert_eq!(json_number(&json, "damaged"), damaged, "{json}");
+
+    // A scrub then advances the counts; the two renderings must still agree, so the
+    // agreement test cannot pass on a hard-coded zero in both.
+    let scrubbed = bin()
+        .arg("scrub")
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .output()
+        .unwrap();
+    assert!(
+        scrubbed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scrubbed.stderr)
+    );
+
+    let readable_after = stdout(&audit(&watch, &cold, &["--catalog", catalog_arg]));
+    let (locations_after, verified_after, never_after, damaged_after) =
+        readable_scrub_counts(&readable_after);
+    let json_after = stdout(&audit(&watch, &cold, &["--catalog", catalog_arg, "--json"]));
+    assert_eq!(
+        json_number(&json_after, "locations"),
+        locations_after,
+        "{json_after}"
+    );
+    assert_eq!(
+        json_number(&json_after, "verified"),
+        verified_after,
+        "{json_after}"
+    );
+    assert_eq!(
+        json_number(&json_after, "never-scrubbed"),
+        never_after,
+        "{json_after}"
+    );
+    assert_eq!(
+        json_number(&json_after, "damaged"),
+        damaged_after,
+        "{json_after}"
+    );
+    assert!(
+        verified_after > 0 && never_after == 0,
+        "the scrub must show up in the counts:\n{readable_after}"
+    );
+}
+
+/// Without a catalog no stored bytes were read back, so the JSON carries `null` — not a
+/// zeroed object that a consumer would read as "everything verified".
+#[test]
+fn json_scrub_is_null_for_a_walk_based_audit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("live.bin"), b"hot").unwrap();
+
+    assert!(
+        !watch.join(CATALOG_NAME).exists(),
+        "precondition: no catalog"
+    );
+    let output = audit(&watch, &cold, &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let json = stdout(&output);
+    assert!(json.contains("\"source\":\"walk\""), "{json}");
+    assert!(json.contains("\"scrub\":null"), "{json}");
 }
