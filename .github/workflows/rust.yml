@@ -20,6 +20,12 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+    # `git init` — which checkout runs on a fresh runner — prints ten lines of advice about
+    # the initial branch name on every run. Nothing here depends on that name, so set it
+    # and stop the output being read as a finding.
+    - name: Set the initial branch name
+      run: git config --global init.defaultBranch main
+
     - uses: actions/checkout@v7
 
     - name: Cache cargo registry and build
