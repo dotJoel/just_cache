@@ -32,8 +32,16 @@
 //! * A name whose bytes resolve but whose file is gone — an unmounted tier — answers
 //!   `EIO`, never a zero-length file. A directory the catalog says holds files never
 //!   silently reads as empty while the daemon is alive.
-//! * `unlink`/`rmdir` answer `EROFS`: deletion is a catalog transition with
-//!   reference counting (§3), and this issue deliberately does not implement it.
+//! * `unlink` of a catalogued name is a catalog delete (issue #128,
+//!   [`Catalog::delete_name`]): the transition commits before any stored copy is
+//!   unlinked, an object with another name keeps its copies, and a delete the catalog
+//!   refuses (pinned, damaged copy, unmounted tier) answers an errno and changes nothing.
+//!   Any overlay copy is dropped once the transition commits. An uncatalogued regular
+//!   file (created through the mount, not yet synced) is simply unlinked; an
+//!   uncatalogued symlink is refused with `EROFS`, because it is the mover's output and
+//!   removing it would orphan a cold copy no row records.
+//! * `rmdir` removes a real directory only when no catalogued name lies beneath it;
+//!   one that still holds names answers `ENOTEMPTY`.
 //! * A rename of a name whose bytes are on a cold tier answers `EROFS`. The mount
 //!   cannot rewrite the catalog, so renaming the cold copy would leave the mount
 //!   unable to see the name it just moved; refusing is the honest boundary (§9).
@@ -66,7 +74,7 @@ use fuser::{
 use rustix::fs::OFlags;
 
 use crate::cache::Overlay;
-use crate::catalog::{Catalog, CatalogError};
+use crate::catalog::{Catalog, CatalogError, DeleteError, DeleteRefusal};
 use crate::namespace::{Entry, Namespace, NamespaceError};
 use crate::observe::AccessLog;
 
@@ -534,6 +542,68 @@ impl MountFs {
                 let _ = catalog.drop_cache_residency(overlay.name(), path);
             }
         }
+    }
+
+    /// `unlink`: a catalog delete for a catalogued name, a plain unlink for a file the
+    /// catalog does not know. The errno is the kernel's answer; the refusal's reason goes
+    /// to stderr, because an errno alone cannot say *which* rule refused.
+    fn unlink_path(&self, path: &str) -> Result<(), Errno> {
+        if !self.namespace.names_file(path) {
+            let disk = self.watch.join(path);
+            let metadata = fs::symlink_metadata(&disk).map_err(|err| errno_from_io(&err))?;
+            if metadata.is_dir() {
+                return Err(Errno::EISDIR);
+            }
+            if metadata.file_type().is_symlink() {
+                return Err(Errno::EROFS);
+            }
+            self.invalidate(path);
+            return fs::remove_file(&disk).map_err(|err| errno_from_io(&err));
+        }
+        let result = {
+            let mut catalog = self.catalog.lock().unwrap();
+            catalog.delete_name(&self.watch, path)
+        };
+        match result {
+            Ok(outcome) => {
+                self.namespace.forget(path);
+                // After the commit, not before: a refused delete keeps a perfectly good
+                // cache copy, and a committed one must leave no overlay serving bytes for
+                // a name that no longer exists.
+                self.invalidate(path);
+                for removal in &outcome.removals {
+                    if let crate::catalog::RemovalOutcome::Kept { path, reason }
+                    | crate::catalog::RemovalOutcome::Failed { path, reason } = removal
+                    {
+                        eprintln!(
+                            "just_cache: delete committed but {} was not removed: {reason}",
+                            path.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("just_cache: unlink {path}: {err}");
+                Err(match err {
+                    DeleteError::Refused(DeleteRefusal::NotNamed { .. }) => Errno::ENOENT,
+                    DeleteError::Refused(DeleteRefusal::Pinned { .. }) => Errno::EPERM,
+                    DeleteError::Refused(_) | DeleteError::Catalog(_) => Errno::EIO,
+                })
+            }
+        }
+    }
+
+    /// `rmdir`: a directory still holding catalogued names is not empty, whatever the
+    /// disk says — removing the directory would not delete those names.
+    fn rmdir_path(&self, path: &str) -> Result<(), Errno> {
+        if self.namespace.names_file(path) {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.namespace.has_children(path) {
+            return Err(Errno::ENOTEMPTY);
+        }
+        fs::remove_dir(self.watch.join(path)).map_err(|err| errno_from_io(&err))
     }
 
     /// The bytes path for a file, or the reason it cannot be served.
@@ -1102,15 +1172,34 @@ impl Filesystem for MountFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        // Deletion is a catalog transition with reference counting across names and
-        // copies (§3); this provider does not implement it, and EROFS says so without
-        // pretending the mount is read-only.
-        reply.error(Errno::EROFS);
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent_path) = self.path_of(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.unlink_path(&Self::join(&parent_path, name)) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent_path) = self.path_of(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.rmdir_path(&Self::join(&parent_path, name)) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
@@ -1133,5 +1222,130 @@ fn errno_from_io(err: &io::Error) -> Errno {
         io::ErrorKind::DirectoryNotEmpty => Errno::ENOTEMPTY,
         io::ErrorKind::InvalidInput => Errno::EINVAL,
         _ => Errno::EIO,
+    }
+}
+
+/// `unlink`/`rmdir` exercised on the handler's own logic, without a kernel.
+///
+/// The limit, named: these call the same methods the FUSE callbacks call, but no
+/// `/dev/fuse` is involved, so they prove the transition, the overlay drop and the
+/// errnos — not the kernel round-trip. That round-trip is covered only by the gated
+/// real-mount test in `tests/fuse_mount.rs` (docs/design.md §9).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiers::{CacheConfig, PromoteOn};
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        hot: PathBuf,
+        cold: PathBuf,
+        ram: PathBuf,
+    }
+
+    fn fixture() -> (Fixture, MountFs) {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot");
+        let cold = dir.path().join("cold");
+        let ram = dir.path().join("ram");
+        for d in [hot.join("shows"), cold.join("shows"), ram.clone()] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(cold.join("shows/moved.mkv"), b"movie bytes").unwrap();
+        std::os::unix::fs::symlink("../../cold/shows/moved.mkv", hot.join("shows/moved.mkv"))
+            .unwrap();
+        fs::write(hot.join("keep.bin"), b"kept").unwrap();
+        let mut catalog = Catalog::open(hot.join(crate::catalog::CATALOG_NAME)).unwrap();
+        catalog.sync(&hot, std::slice::from_ref(&cold)).unwrap();
+        let namespace = Namespace::new(&catalog).unwrap();
+        let fs_ = MountFs::new(catalog, namespace, hot.canonicalize().unwrap());
+        let overlay = Overlay::open(
+            CacheConfig {
+                name: "ram".into(),
+                over: "cold".into(),
+                kind: "fs".into(),
+                path: ram.clone(),
+                max_size: 1 << 20,
+                promote_on: PromoteOn {
+                    accesses: 1,
+                    window: Duration::from_secs(86_400),
+                },
+            },
+            &cold,
+        )
+        .unwrap();
+        fs_.overlays.lock().unwrap().push(overlay);
+        (
+            Fixture {
+                _dir: dir,
+                hot,
+                cold,
+                ram,
+            },
+            fs_,
+        )
+    }
+
+    #[test]
+    fn unlink_deletes_through_the_catalog_and_drops_the_overlay_copy() {
+        let (fx, mount) = fixture();
+        let bytes = mount.file_bytes("shows/moved.mkv").unwrap();
+        let served = mount.read_source("shows/moved.mkv", bytes.clone());
+        assert_ne!(served, bytes, "the read was promoted into the overlay");
+        assert!(mount.overlays.lock().unwrap()[0].is_resident("shows/moved.mkv"));
+
+        mount.unlink_path("shows/moved.mkv").unwrap();
+
+        assert!(!mount.overlays.lock().unwrap()[0].is_resident("shows/moved.mkv"));
+        assert!(!served.exists(), "the overlay file itself was removed");
+        assert!(!mount.namespace.names_file("shows/moved.mkv"));
+        assert_eq!(mount.resolve("shows/moved.mkv").err(), Some(Errno::ENOENT));
+        assert!(fs::symlink_metadata(fx.hot.join("shows/moved.mkv")).is_err());
+        assert!(!fx.cold.join("shows/moved.mkv").exists());
+        let catalog = mount.catalog.lock().unwrap();
+        assert!(catalog
+            .record_for_path("shows/moved.mkv")
+            .unwrap()
+            .is_none());
+        assert!(fx.ram.is_dir());
+    }
+
+    #[test]
+    fn a_refused_unlink_changes_nothing_and_keeps_the_cache() {
+        let (fx, mount) = fixture();
+        mount
+            .catalog
+            .lock()
+            .unwrap()
+            .set_pin("shows/moved.mkv", i64::from(u32::MAX))
+            .unwrap();
+        let bytes = mount.file_bytes("shows/moved.mkv").unwrap();
+        mount.read_source("shows/moved.mkv", bytes);
+
+        assert_eq!(mount.unlink_path("shows/moved.mkv"), Err(Errno::EPERM));
+        assert!(mount.overlays.lock().unwrap()[0].is_resident("shows/moved.mkv"));
+        assert!(mount.namespace.names_file("shows/moved.mkv"));
+        assert_eq!(
+            fs::read(fx.cold.join("shows/moved.mkv")).unwrap(),
+            b"movie bytes"
+        );
+    }
+
+    #[test]
+    fn rmdir_refuses_a_directory_that_still_holds_names() {
+        let (fx, mount) = fixture();
+        assert_eq!(mount.rmdir_path("shows"), Err(Errno::ENOTEMPTY));
+        mount.unlink_path("shows/moved.mkv").unwrap();
+        mount.rmdir_path("shows").unwrap();
+        assert!(!fx.hot.join("shows").exists());
+    }
+
+    #[test]
+    fn an_uncatalogued_file_is_unlinked_plainly() {
+        let (fx, mount) = fixture();
+        fs::write(fx.hot.join("fresh.bin"), b"new").unwrap();
+        mount.unlink_path("fresh.bin").unwrap();
+        assert!(!fx.hot.join("fresh.bin").exists());
+        assert_eq!(mount.unlink_path("fresh.bin"), Err(Errno::ENOENT));
     }
 }

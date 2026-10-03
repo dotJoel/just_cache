@@ -45,6 +45,10 @@
 //!   This is the window in which removing the source would delete the last verified copy
 //!   because the name no longer resolves to what was read. `N` is unused (the seam fires
 //!   once); it exists because the value grammar is uniform.
+//! * `delete-after-commit=N` — a catalog delete (issue #128) aborts the process right
+//!   after its transition commits and before any released byte is unlinked: the crash
+//!   window `pending_removal` exists to make recoverable. `N` is ignored (one delete per
+//!   process); write `1`.
 //! * `relatime=N` — every read-only open the tool makes for its own hashing
 //!   (`digest::open_for_hashing`) that did *not* get `O_NOATIME` stamps the file's atime to
 //!   now, as a `relatime` mount would on that first read. This makes "the tool never marks
@@ -69,6 +73,7 @@ pub(crate) enum FaultMode {
     PartialModeMidCopy,
     ReplaceVerifiedDest,
     Relatime,
+    DeleteAfterCommit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +99,7 @@ impl Fault {
             "partial-mode-mid-copy" => FaultMode::PartialModeMidCopy,
             "replace-verified-dest" => FaultMode::ReplaceVerifiedDest,
             "relatime" => FaultMode::Relatime,
+            "delete-after-commit" => FaultMode::DeleteAfterCommit,
             other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
         };
         let at = ordinal

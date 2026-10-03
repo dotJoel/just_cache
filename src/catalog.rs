@@ -61,7 +61,11 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
 
 use crate::digest;
+
+#[path = "catalog_delete.rs"]
+mod delete;
 use crate::disk_management::{self, DiskError};
+pub use delete::{DeleteError, DeleteOutcome, DeleteRefusal, RemovalOutcome};
 
 /// Name of the catalog inside (beside) the watched root. It shares the journal's
 /// `.just_cache` prefix so the walk skips it: the catalog must never become a move
@@ -185,6 +189,21 @@ CREATE TABLE IF NOT EXISTS root (
 -- losing the whole table costs a sync its time, not its correctness. `CREATE TABLE IF
 -- NOT EXISTS` is the whole migration, so a catalog written before this gains it on the
 -- next open with no `ALTER TABLE` and no window in which a half-upgraded schema is read.
+-- Bytes a committed delete (issue #128) released and that are not yet unlinked. Written
+-- in the same transaction that drops the name and location rows, so the window between
+-- the commit and the unlink is recorded rather than silent: a process that dies inside it
+-- leaves rows here, and the next delete or sync finishes the job (after re-checking the
+-- file is still the bytes that were released) before it observes anything. Without it a
+-- crashed delete's leftover file would be re-ingested by the next sync — the deleted name
+-- resurrected, or a cold copy counted as an orphaned object nobody asked to keep.
+-- `kind` is 'bytes' (a regular file that must still be `object_id`'s bytes) or 'link'
+-- (the symlink a migrated name was). No foreign key: the object row is already gone.
+CREATE TABLE IF NOT EXISTS pending_removal (
+    path       TEXT PRIMARY KEY,
+    object_id  BLOB NOT NULL,
+    size       INTEGER NOT NULL,
+    kind       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS digest_cache (
     path        TEXT PRIMARY KEY,      -- canonical path the digest was computed at
     size        INTEGER NOT NULL,
@@ -1091,6 +1110,10 @@ impl Catalog {
     /// its path and the error) as [`DifferenceKind::Unreadable`], the rest of the tree is
     /// ingested, and nothing is inferred about the file itself (issue #53).
     pub fn sync(&mut self, watch: &Path, dests: &[PathBuf]) -> Result<SyncReport, CatalogError> {
+        // A delete that died between its commit and its unlinks left files no row vouches
+        // for. Finish it before observing, or the walk below would re-ingest them — the
+        // deleted name back, or its cold copy as an unasked-for orphan (issue #128).
+        self.finish_pending_removals(true)?;
         let mut cache = self.load_digest_cache()?;
         if self.force_rehash {
             // Drop what we would have trusted, not what we know: the updated rows below
@@ -1164,6 +1187,12 @@ impl Catalog {
         dests: &[PathBuf],
         apply: bool,
     ) -> Result<ResolveReport, CatalogError> {
+        // As in `sync`: an interrupted delete is finished before the tree is read, so its
+        // leftovers are not mistaken for evidence. Report-only mode writes nothing, so it
+        // leaves them (and may report them) rather than unlink on a dry run.
+        if apply {
+            self.finish_pending_removals(true)?;
+        }
         // `resolve` re-observes exactly as `sync` does, so it reads the same digest cache: an
         // unchanged file is trusted rather than hashed a second time, and a rewrite the key
         // cannot see is missed here for the same reason it is missed by a sync (#50). The

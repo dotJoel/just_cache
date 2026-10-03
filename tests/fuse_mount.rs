@@ -484,6 +484,11 @@ fn a_real_mount_serves_bytes_and_unmounts_cleanly() {
         .unwrap()
         .is_file());
 
+    assert_eq!(
+        fs::read(mountpoint.join("shows/live.bin")).unwrap(),
+        b"still hot"
+    );
+
     // write: lands on the tier of record's bytes, in place.
     let hot_file = tree.hot.join("shows/live.bin");
     fs::write(mountpoint.join("shows/live.bin"), b"rewritten").unwrap();
@@ -495,17 +500,37 @@ fn a_real_mount_serves_bytes_and_unmounts_cleanly() {
     fs::rename(mountpoint.join("new.bin"), mountpoint.join("renamed.bin")).unwrap();
     assert!(tree.hot.join("renamed.bin").is_file());
 
+    // unlink is a catalog delete (issue #128): the name's only copy is released.
+    fs::remove_file(mountpoint.join("renamed.bin")).unwrap();
+    assert!(!tree.hot.join("renamed.bin").exists());
+    // Read moved.mkv's bytes above, so the access log has a pending entry for it; the
+    // delete must still go through, and the cold copy must go with the last name.
+    let cold_copy = tree.cold.join("shows/moved.mkv");
+    fs::remove_file(mountpoint.join("shows/moved.mkv")).unwrap();
+    assert!(
+        !cold_copy.exists(),
+        "the last name's cold copy was released"
+    );
+    assert!(fs::metadata(mountpoint.join("shows/moved.mkv")).is_err());
+
     // Unmount is clean: the daemon exits, nothing partial is left behind.
     unmount(&mountpoint);
     reap(child);
 
     // Access observation (issue #43): the read through the mount was recorded as an open,
-    // by the provider, and the write created no lifecycle transition.
+    // by the provider, and the write created no lifecycle transition. Checked on
+    // live.bin, read below before its rewrite, because moved.mkv has since been deleted.
     let catalog = tree.open();
-    let moved = catalog.record_for_path("shows/moved.mkv").unwrap().unwrap();
-    assert!(moved.access_observed, "the provider recorded the read");
-    assert!(moved.accesses.unwrap_or(0) >= 1, "{moved:?}");
+    assert!(
+        catalog
+            .record_for_path("shows/moved.mkv")
+            .unwrap()
+            .is_none(),
+        "the name deleted through the mount is gone from the catalog"
+    );
     let live = catalog.record_for_path("shows/live.bin").unwrap().unwrap();
+    assert!(live.access_observed, "the provider recorded the read");
+    assert!(live.accesses.unwrap_or(0) >= 1, "{live:?}");
     assert_eq!(
         live.rule, None,
         "a write through the mount is not a transition"

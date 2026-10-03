@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::catalog::{self, Catalog};
 
@@ -112,11 +113,10 @@ impl From<catalog::CatalogError> for NamespaceError {
 /// against. Built once at mount time; a mount does not observe catalog changes, so a
 /// `catalog sync` while the daemon runs is picked up on the next mount.
 pub struct Namespace {
-    /// Namespace path -> object id, hex-encoded, in path order.
-    names: BTreeMap<String, String>,
-    /// The canonical roots `catalog sync` recorded: the watch root and every tier.
-    /// Every row is resolved against exactly these, so the mount can never write
-    /// outside them.
+    /// Behind a lock so a delete through the mount (issue #128) can retire a name the
+    /// moment its catalog transition commits: an index frozen at mount time would keep
+    /// answering a name the catalog no longer holds, and serve bytes nobody vouches for.
+    names: RwLock<BTreeMap<String, String>>,
     roots: Vec<PathBuf>,
 }
 
@@ -128,7 +128,10 @@ impl Namespace {
             .into_iter()
             .collect::<BTreeMap<String, String>>();
         let roots = catalog.roots()?;
-        Ok(Self { names, roots })
+        Ok(Self {
+            names: RwLock::new(names),
+            roots,
+        })
     }
 
     /// The trusted roots every location row is resolved against. Empty for a catalog
@@ -140,12 +143,23 @@ impl Namespace {
 
     /// Whether the catalog names this path as a file.
     pub fn names_file(&self, path: &str) -> bool {
-        self.names.contains_key(path)
+        self.names.read().unwrap().contains_key(path)
+    }
+
+    /// Forget a name after the catalog transition that deleted it has committed.
+    pub fn forget(&self, path: &str) {
+        self.names.write().unwrap().remove(&normalize(path));
+    }
+
+    /// True when some catalogued name sits below `dir`, i.e. the directory is not empty
+    /// as far as the catalog is concerned.
+    pub fn has_children(&self, dir: &str) -> bool {
+        !self.children(&normalize(dir)).is_empty()
     }
 
     /// The recorded object id for a catalogued path, hex-encoded.
-    pub fn object_id(&self, path: &str) -> Option<&str> {
-        self.names.get(path).map(String::as_str)
+    pub fn object_id(&self, path: &str) -> Option<String> {
+        self.names.read().unwrap().get(path).cloned()
     }
 
     /// Resolve a namespace-relative path. `""` is the mount root.
@@ -159,7 +173,7 @@ impl Namespace {
             return Ok(Entry::Directory { path, children });
         }
 
-        if self.names.contains_key(&path) {
+        if self.names_file(&path) {
             return self.file_entry(catalog, &path);
         }
 
@@ -181,7 +195,7 @@ impl Namespace {
             format!("{dir}/")
         };
         let mut children = BTreeSet::new();
-        for name in self.names.keys() {
+        for name in self.names.read().unwrap().keys() {
             if let Some(rest) = name.strip_prefix(&prefix) {
                 if rest.is_empty() {
                     continue;

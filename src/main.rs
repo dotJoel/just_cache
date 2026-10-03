@@ -340,6 +340,30 @@ enum CatalogCommand {
     /// conclusion: conclude a rename, a delete or a replacement only when the object it
     /// touches still survives elsewhere. Report-only unless `--apply` is given.
     Resolve(CatalogResolveArgs),
+    /// Delete a name. The name row — and, when it was the object's last name, every
+    /// location row — is released in one committed transition before any byte is
+    /// unlinked. An object with another name keeps its copies. Refuses, changing
+    /// nothing, when the object is pinned, a copy is damaged, or a tier is not mounted.
+    Delete(CatalogDeleteArgs),
+}
+
+/// Everything `catalog delete` needs. No `--dest`: the catalog already records every
+/// root a released copy can live under, and the delete acts on rows, not on a walk.
+#[derive(Debug, Args)]
+struct CatalogDeleteArgs {
+    /// The name to delete, as the namespace path the catalog recorded (relative to
+    /// `--watch`).
+    #[arg(value_name = "PATH")]
+    path: String,
+
+    /// The watch root the name lives under.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// It must already exist; `delete` never creates one.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -989,6 +1013,7 @@ fn run_catalog(args: CatalogArgs) -> ExitCode {
     match args.command {
         CatalogCommand::Sync(sync) => run_catalog_sync(sync),
         CatalogCommand::Resolve(resolve) => run_catalog_resolve(resolve),
+        CatalogCommand::Delete(delete) => run_catalog_delete(delete),
     }
 }
 
@@ -1083,6 +1108,81 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
 /// a difference remains, whether it was refused as irreconcilable or merely reported by a
 /// dry run. `2` on a bad invocation or a catalog that cannot be read. A report-only pass
 /// names what it would resolve but writes nothing, so it is safe to run from cron.
+/// Delete one name through the catalog (issue #128).
+///
+/// Exit contract: `0` when the transition committed and every released file was removed
+/// (or was already gone), `1` when it was refused (nothing changed) or committed but a
+/// released file was kept or could not be unlinked, `2` on a bad invocation.
+fn run_catalog_delete(args: CatalogDeleteArgs) -> ExitCode {
+    use catalog::RemovalOutcome;
+    if !args.watch.is_dir() {
+        eprintln!(
+            "just_cache: --watch {} is not a directory",
+            args.watch.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
+    if !catalog_path.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            catalog_path.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let mut catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = match catalog.delete_name(&args.watch, &args.path) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("just_cache: delete {}: {err}", args.path);
+            return ExitCode::from(EXIT_FINDINGS);
+        }
+    };
+    if outcome.names_left == 0 {
+        println!(
+            "deleted {} (object {}, its last name; {} location(s) released)",
+            outcome.path, outcome.object, outcome.locations_released
+        );
+    } else {
+        println!(
+            "deleted {} (object {} kept: {} other name(s); {} location(s) released)",
+            outcome.path, outcome.object, outcome.names_left, outcome.locations_released
+        );
+    }
+    let mut clean = true;
+    for removal in &outcome.removals {
+        match removal {
+            RemovalOutcome::Removed(path) => println!("  removed {}", path.display()),
+            RemovalOutcome::AlreadyGone(path) => println!("  already gone {}", path.display()),
+            RemovalOutcome::Kept { path, reason } => {
+                clean = false;
+                eprintln!("  kept {}: {reason}", path.display());
+            }
+            RemovalOutcome::Failed { path, reason } => {
+                clean = false;
+                eprintln!(
+                    "  could not remove {}: {reason} (retried by the next delete or sync)",
+                    path.display()
+                );
+            }
+        }
+    }
+    if clean {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_FINDINGS)
+    }
+}
+
 fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
     if !args.watch.is_dir() {
         eprintln!(

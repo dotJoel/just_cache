@@ -199,8 +199,18 @@ Consequences:
   an offloaded object names the volume needed ("insert drawer-07") — never a bare
   ENOENT.
 - **Deletion is a catalog transition** with reference counting across names and
-  copies; the physical delete happens only when no name references the object and the
-  durability floor allows it.
+  copies (#128, `catalog delete`, and `unlink` through the mount). Deleting a name drops
+  its `name` row; the object's copies are released only when that was its **last** name,
+  and then every `location` row, the `object` and its `lifecycle` go with it. An object
+  with another name keeps its copies, losing only the deleted name's own entry in the
+  watch tree (its hot file or its symlink). The rows and a `pending_removal` record of
+  every released file commit in one transaction **before** any byte is unlinked, so a
+  crash leaves either nothing changed or a catalog that no longer vouches for the bytes
+  plus a durable list of what to finish — the next delete or `catalog sync` finishes it
+  (re-hashing first, so a file rewritten since is kept) before it observes anything. A
+  delete that cannot finish — the object is pinned, a released copy is marked damaged,
+  its tier is not mounted, a row does not resolve under a recorded root — is refused
+  before anything is written.
 - **Audit is a query**: names whose primary location is missing, copies failing
   checksum, objects below their tier's copy floor, symlinks pointing at nothing.
 - **Cache residency is not a location.** A copy in a promotion target (§2.1) is never
@@ -1375,6 +1385,41 @@ with the sweep's provider-stamp lookup removed. That the FUSE handlers call the 
 asserted only in the `JUST_CACHE_TEST_FUSE=1` mount test, which CI does not run. What to *do*
 with an observed access is the policy engine's (§5), not this change's.
 
+Closed by #128: an object can be deleted through the catalog. `just_cache catalog delete
+<PATH> --watch W` and `unlink` through the mount both call `Catalog::delete_name`
+(`src/catalog_delete.rs`), which in one `IMMEDIATE` transaction drops the name row and —
+only when it was the object's last name — every location, scrub and damage row, the
+lifecycle row and the object; it records every file it released (the cold copies, the hot
+file, the name's symlink) in a new `pending_removal` table in the same commit, and unlinks
+only after the commit. Reference counting is by object: with another name left, only the
+deleted name's own hot copy is released, and a delete that would leave the remaining names
+with no copy is refused. Refusals are decided before any write and named: not catalogued,
+pinned, a released copy marked damaged, its tier not mounted (root directory absent), a row
+that does not resolve under a recorded root, a `--watch` that is not a recorded root.
+**Crash recovery**: a process that dies between the commit and the unlinks leaves rows in
+`pending_removal`; `catalog sync`, `catalog resolve --apply` and the next delete finish them
+before observing the tree, re-hashing each regular file first, so a file rewritten at a
+released path since is kept rather than removed on the strength of an old transaction.
+Without that step the next sync would re-ingest the leftovers — the deleted name back, its
+cold copy as an orphaned object. Through the mount, `unlink` of a catalogued name performs
+that transition, forgets the name from the mount's index (now behind a lock — the one
+exception to "indexed once"), and drops any overlay copy *after* the commit, so a refused
+delete keeps its cache; refusals map to `EPERM` (pinned) or `EIO`, the reason on stderr. An
+uncatalogued regular file is unlinked plainly; an uncatalogued symlink is refused (`EROFS`),
+because removing it would orphan a cold copy no row records. `rmdir` answers `ENOTEMPTY`
+while a catalogued name lies beneath the directory. Tests: `tests/catalog_delete.rs` deletes
+one of two names, the last name, both names in turn, each refusal (rows and bytes
+unchanged), and opens the crash window with `JUST_CACHE_FAULT=delete-after-commit=1`
+(aborts after the commit): the catalog no longer locates the name, the bytes are still
+there, and the next sync removes them and ingests nothing — shown to fail with the sync's
+recovery step removed; a second fault test proves a rewritten file survives recovery.
+`src/fuse.rs` unit tests drive the handler's `unlink`/`rmdir` logic against a real catalog
+and overlay. **Still open, and named**: those do not cross the kernel — this host has no
+`/dev/fuse` — so the real round-trip is only in the `JUST_CACHE_TEST_FUSE=1` mount test,
+which CI does not run either; empty directories a delete leaves on a cold tier are not
+pruned; deleting from a tier that is not mounted (the vault model) and a garbage collector
+for bytes no delete reaches remain out of scope (P3).
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
@@ -1484,9 +1529,9 @@ with an observed access is the policy engine's (§5), not this change's.
   observed. Three consequences are deliberate and named rather than hidden. **Rename is
   confined to the watch root**: the mount can move a hot name (the disk overlay shows it
   afterwards) but a name whose bytes are on a cold tier answers `EROFS`, because renaming the
-  cold copy would leave a name the mount cannot serve and no catalog row to update. **Deletion
-  is not implemented**: `unlink`/`rmdir` answer `EROFS` — deletion is a catalog transition with
-  reference counting across names and copies (§3), and is a separate issue. And **recall is
+  cold copy would leave a name the mount cannot serve and no catalog row to update. (Deletion,
+  once listed here, landed with #128: `unlink` is a catalog delete — the one row write the
+  mount makes besides access observation — see §9.) And **recall is
   not here**: a read of an offloaded object does not pull it one tier up (§4), so the mount is
   the lookup/list/stat/read/write/rename over copies that are present. (Access observation,
   once listed here, landed with #43: the mount writes `lifecycle.last_access`/`accesses`,
