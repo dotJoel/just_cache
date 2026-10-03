@@ -403,15 +403,22 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   the journal and startup recovery; CI running the EXDEV path. P0 is closed.)*
 - **P1 — catalog**: SQLite catalog ingesting the current mover's state (it already
   leaves an auditable pattern); `explain`, `locate`, `restore`; two-disk replication
-  within a tier; scrubbing. *(Two-disk replication has shipped as `sweep --copies N`
-  with verify-before-delete, a recorded per-tier floor, and `under-replicated` /
-  `replica-lost` reporting; the copy is same-host — see §9 and §10. The filesystem half
-  of `explain` has shipped in the symlink provider: it reports the mover's own decision
-  and carries the seam the catalog slots into; the catalog-backed
-  `explain`/`locate`/`restore` land with the catalog itself.)*
+  within a tier; scrubbing. *(Done: the catalog is the source of truth for where files
+  live, ingested by `catalog sync` (#16); `explain`/`locate`/`restore` work through it
+  (#17, #18); `audit` reads the catalog instead of walking both sides (#19); two-disk
+  replication shipped as `sweep --copies N` with verify-before-delete, a recorded
+  per-tier floor, and `under-replicated`/`replica-lost` reporting (#20); scrub repairs
+  from a sibling (#21); reconcile rebuilds a missing replica (#24). The copy is
+  same-host — see §9 and §10. P1 is closed.)*
 - **P2 — FUSE namespace provider**: observe accesses properly; streaming recall;
   pins/restore semantics; gateway (S3/WebDAV) provider; cache overlays (§2.1) — a RAM
   promotion target first, since the same construct later fronts the HDD pool with SSD.
+  *(Done: the catalog mounts as a FUSE namespace and accesses drive a lifecycle table
+  (#42, #43); offloaded files recall inline on read, streaming into the caller (#44);
+  pins and explicit restore are enforced (#45); a RAM cache overlay fronts a tier as a
+  promotion target (#46); an S3/WebDAV gateway provider serves the catalog (#47);
+  tiers and lifecycle rules configure via `tiers.toml` and `policy.toml` (#40, #41).
+  P2 is closed.)*
 - **P3 — remote tiers**: object-store driver (chunked, resumable, encrypted);
   LAN-peer driver; offline-volume driver with vault tracking and insert-prompt recall.
 - **P4 — cost-aware policy**: per-tier cost models, placement reports, rule
