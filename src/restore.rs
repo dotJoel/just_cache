@@ -59,7 +59,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -71,6 +71,20 @@ use crate::disk_management;
 pub enum RestoreError {
     #[error("{path} is not inside the watched tree {watch}")]
     OutsideWatch { path: PathBuf, watch: PathBuf },
+
+    #[error(
+        "{path} contains a `..` component; refusing to act on a path whose real location \
+         this command has not resolved (name the path as the filesystem spells it, or the \
+         symlink target the mover left)"
+    )]
+    ParentComponent { path: PathBuf },
+
+    #[error(
+        "refusing to remove the cold copy {copy} for {path}: it does not sit under any \
+         configured --dest root, so this command cannot vouch that it is a cold copy and \
+         not a file it must leave alone"
+    )]
+    RemoveCopyOutsideDests { path: PathBuf, copy: PathBuf },
 
     #[error("no cold copy found for {path} under any of the {} destination(s)", dests.len())]
     NoColdCopy { path: PathBuf, dests: Vec<PathBuf> },
@@ -254,6 +268,19 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         }
     };
 
+    // `absolute()` is lexical and does not resolve `..`, so the `strip_prefix` above can be
+    // satisfied by a path that leaves the tree (`T/../escaped.bin` strips to
+    // `../escaped.bin`). Resolving the `..` would mean canonicalizing, which loses the
+    // symlink state restore exists to see, so the only safe answer is to refuse: the
+    // operator names the path as the filesystem spells it, and this never reaches a lookup,
+    // a copy, or a delete.
+    if relative
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(RestoreError::ParentComponent { path });
+    }
+
     // The catalog's answer, when there is one, is the digest every check below compares
     // against. Resolved once, up front: a catalog that does not name the path fails here,
     // before anything is opened or copied.
@@ -288,6 +315,11 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                 // verify-before-delete is satisfied by the digest comparison just above.
                 // Without it there is nothing to do at all — this is the idempotent no-op.
                 if request.remove_copy {
+                    // `locate` already keeps only candidates under a `--dest`, but this is
+                    // the one delete that cannot be undone, so the containment is tested
+                    // again here, immediately before it, rather than trusted across the
+                    // distance to `locate`.
+                    ensure_removable(&cold, request.dests, &path)?;
                     let cold_metadata =
                         fs::metadata(&cold).map_err(|error| RestoreError::Stat {
                             path: cold.clone(),
@@ -317,6 +349,9 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                     dests: request.dests.to_vec(),
                 }
             })?;
+            if request.remove_copy {
+                ensure_removable(&cold, request.dests, &path)?;
+            }
             restore_from(&path, &cold, request.remove_copy, recorded.as_ref())
         }
     }
@@ -358,19 +393,27 @@ fn recorded_checksum(
 fn locate(hot: &Path, relative: &Path, dests: &[PathBuf]) -> Result<Option<PathBuf>, RestoreError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // A resolving symlink at the path names the copy the mover left, wherever it is.
+    // A resolving symlink at the path names the copy the mover left — but only when its
+    // target really is a copy under a `--dest` root. A link is writable by anyone who can
+    // write the tree, so an unchecked target is an arbitrary path the operator can read:
+    // without this containment a `--remove-copy` restore deletes it and a plain restore
+    // copies it into the watched tree. Canonicalizing before the test means a target that
+    // reaches a destination through `..` or its own symlinks still counts, while one that
+    // escapes every root is a foreign link and is dropped.
     if let Ok(target) = fs::read_link(hot) {
         let resolved = resolve_link(hot, &target);
-        if is_regular_file(&resolved) {
+        if is_regular_file(&resolved) && under_any_dest(&resolved, dests) {
             candidates.push(resolved);
         }
     }
 
     // The mirrored layout: each tier holds the file at its path relative to the watched
     // root, so a broken link — or a name that vanished entirely — is still recoverable.
+    // The containment is the same one the link target gets: a name under a tier that is
+    // itself a symlink out of it is no more a cold copy than a link target that escapes.
     for dest in dests {
         let mirrored = dest.join(relative);
-        if is_regular_file(&mirrored) {
+        if is_regular_file(&mirrored) && under_any_dest(&mirrored, dests) {
             candidates.push(mirrored);
         }
     }
@@ -739,6 +782,40 @@ fn is_regular_file(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.is_file())
         .unwrap_or(false)
+}
+
+/// True when `candidate` resolves to a path inside one of the `dests`.
+///
+/// Both sides are canonicalized, so this is real containment rather than the lexical
+/// prefix test `strip_prefix` does: a path that reaches a destination through `..` or a
+/// further symlink still counts, while one that leaves every root on the way — or whose
+/// root cannot be canonicalized because it is not there — does not. This is the same test
+/// `audit::resolve_target` applies to a watched symlink (src/audit.rs).
+fn under_any_dest(candidate: &Path, dests: &[PathBuf]) -> bool {
+    let Ok(canonical) = fs::canonicalize(candidate) else {
+        return false;
+    };
+    dests.iter().any(|dest| {
+        fs::canonicalize(dest)
+            .map(|root| canonical.starts_with(&root))
+            .unwrap_or(false)
+    })
+}
+
+/// Refuse `--remove-copy` on a path the command cannot prove is a cold copy.
+///
+/// `locate` already returns only candidates under a `--dest`, so this is belt-and-braces:
+/// the delete it guards is the one step in the command that cannot be undone, and the
+/// containment was proved some distance away, so it is repeated here rather than assumed.
+fn ensure_removable(copy: &Path, dests: &[PathBuf], path: &Path) -> Result<(), RestoreError> {
+    if under_any_dest(copy, dests) {
+        Ok(())
+    } else {
+        Err(RestoreError::RemoveCopyOutsideDests {
+            path: path.to_path_buf(),
+            copy: copy.to_path_buf(),
+        })
+    }
 }
 
 /// Resolve a symlink's raw text against the directory holding the link.
