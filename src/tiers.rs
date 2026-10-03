@@ -160,11 +160,12 @@ impl TierKind {
         }
     }
 
-    /// True when a transport driver for this kind exists. The parse refuses a kind without
-    /// one, so this is the single place to flip as drivers land — and the tests that pin the
-    /// refusals are the reminder to flip it.
+    /// True when a transport driver for this kind exists. `fs`, `object` and `peer` are
+    /// served; `offline` is the one kind the design names that no driver serves yet. The
+    /// parse refuses a kind without one, so this is the single place to flip as drivers
+    /// land — and the tests that pin the refusals are the reminder to flip it.
     pub fn is_served(self) -> bool {
-        matches!(self, TierKind::Fs | TierKind::Object)
+        matches!(self, TierKind::Fs | TierKind::Object | TierKind::Peer)
     }
 
     /// §2 rule 2: "anything crossing the machine boundary is encrypted first." The envelope
@@ -193,12 +194,13 @@ impl std::fmt::Display for TierKind {
 pub struct Tier {
     /// The table key: `[tiers.ssd]` gives the name `ssd`. This is what commands print.
     pub name: String,
-    /// Which transport driver serves this tier. Only `TierKind::Fs` exists today; a config
-    /// naming another kind is refused rather than served as a local directory.
+    /// Which transport driver serves this tier: `fs`, `object` and `peer` are served;
+    /// a config naming another kind (`offline`) is refused rather than served as a
+    /// local directory.
     pub kind: TierKind,
     /// The filesystem root this tier's bytes sit under. For `kind = "fs"` this is the
-    /// tier root; for `kind = "object"` this is a local scratch directory for
-    /// downloads and partial upload buffers.
+    /// tier root; for `kind = "object"` or `kind = "peer"` this is a local scratch
+    /// directory for downloads and partial upload buffers.
     pub path: PathBuf,
     pub volatility: Volatility,
     pub recall: Recall,
@@ -208,8 +210,10 @@ pub struct Tier {
     /// acts on it yet — placement decisions are P4 — but it is part of the tier's honest
     /// description and printing it is how a reader checks it was parsed.
     pub cost: Option<String>,
-    /// The object-store configuration, present only when `kind == Object`. Kept here
-    /// so callers that match on `kind` can reach the config without a second lookup.
+    /// The object-store configuration, present when `kind == Object` or `kind == Peer`.
+    /// Both kinds are served by the same S3-compatible driver (a peer runs the
+    /// object-server, so its client config is the object-store config). Kept here so
+    /// callers that match on `kind` can reach the config without a second lookup.
     pub object_config: Option<crate::object_store::ObjectTierConfig>,
 }
 
@@ -740,8 +744,8 @@ impl RawTier {
         // landing changes — and the test that pins this refusal is the reminder.
         if !kind.is_served() {
             return Err(invalid(format!(
-                "line {}: tier `{name}` kind `{}` has no transport driver yet; `fs` is the \
-                 only kind that exists, so this tier cannot be a file's home",
+                "line {}: tier `{name}` kind `{}` has no transport driver yet; `fs`, \
+                 `object` and `peer` are served, so this tier cannot be a file's home",
                 line_at(text, self.kind.span().start),
                 kind
             )));
@@ -795,12 +799,15 @@ impl RawTier {
         });
         let cost = cost.filter(|cost| !cost.trim().is_empty());
 
-        // Object-tier validation (#141): require the object fields when kind == Object,
-        // and leave object_config as None for fs tiers.
-        let object_config = if kind == TierKind::Object {
+        // Object-tier validation (#141, extended by #142): require the remote-store
+        // fields when kind is Object or Peer (a peer runs the object-server, so it is
+        // the same S3-compatible driver and the same config shape), and leave
+        // object_config as None for fs tiers.
+        let object_config = if matches!(kind, TierKind::Object | TierKind::Peer) {
             let endpoint = self.endpoint.ok_or_else(|| {
                 invalid(format!(
-                    "line {}: tier `{name}` kind `object` requires `endpoint` (the S3-compatible endpoint host)", 
+                    "line {}: tier `{name}` kind `{kind}` requires `endpoint` (the \
+                     S3-compatible endpoint host the driver connects to)",
                     line_at(text, self.kind.span().start)
                 ))
             })?;
@@ -814,7 +821,7 @@ impl RawTier {
 
             let bucket = self.bucket.ok_or_else(|| {
                 invalid(format!(
-                    "line {}: tier `{name}` kind `object` requires `bucket`",
+                    "line {}: tier `{name}` kind `{kind}` requires `bucket`",
                     line_at(text, self.kind.span().start)
                 ))
             })?;
@@ -826,23 +833,36 @@ impl RawTier {
                 )));
             }
 
-            let region = self.region.ok_or_else(|| {
-                invalid(format!(
-                    "line {}: tier `{name}` kind `object` requires `region` (the AWS region for SigV4 signing)", 
-                    line_at(text, self.kind.span().start)
-                ))
-            })?;
-            let region_str = region.get_ref().trim().to_string();
-            if region_str.is_empty() {
-                return Err(invalid(format!(
-                    "line {}: tier `{name}` region is empty",
-                    line_at(text, region.span().start)
-                )));
-            }
+            // A region is required for a cloud bucket (it signs every request); a peer
+            // has no meaningful region — the object-server derives the signing region
+            // from the request's credential scope, so the value only has to be
+            // self-consistent, and the driver defaults it to `peer`.
+            let region_str = if kind == TierKind::Object {
+                let region = self.region.ok_or_else(|| {
+                    invalid(format!(
+                        "line {}: tier `{name}` kind `object` requires `region` (the AWS \
+                         region for SigV4 signing)",
+                        line_at(text, self.kind.span().start)
+                    ))
+                })?;
+                let region_str = region.get_ref().trim().to_string();
+                if region_str.is_empty() {
+                    return Err(invalid(format!(
+                        "line {}: tier `{name}` region is empty",
+                        line_at(text, region.span().start)
+                    )));
+                }
+                region_str
+            } else {
+                self.region
+                    .map(|r| r.get_ref().trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| "peer".to_string())
+            };
 
             let credential_source = self.credential_source.ok_or_else(|| {
                 invalid(format!(
-                    "line {}: tier `{name}` kind `object` requires `credential_source` \
+                    "line {}: tier `{name}` kind `{kind}` requires `credential_source` \
                      (a file path or an environment variable prefixed with `$`)",
                     line_at(text, self.kind.span().start)
                 ))
@@ -856,7 +876,7 @@ impl RawTier {
 
             let encryption_key = self.encryption_key.ok_or_else(|| {
                 invalid(format!(
-                    "line {}: tier `{name}` kind `object` requires `encryption_key` \
+                    "line {}: tier `{name}` kind `{kind}` requires `encryption_key` \
                          (a file path or an environment variable prefixed with `$`; the key is \
                          64 hex characters, 32 bytes — docs/design.md §2 rule 2)",
                     line_at(text, self.kind.span().start)
@@ -887,8 +907,15 @@ impl RawTier {
                 None => crate::object_store::CHUNK_SIZE,
             };
 
+            let remote_kind = match kind {
+                TierKind::Object => crate::object_store::RemoteKind::S3,
+                TierKind::Peer => crate::object_store::RemoteKind::Peer,
+                _ => unreachable!("object_config is built only for object and peer tiers"),
+            };
+
             Some(crate::object_store::ObjectTierConfig {
                 name: name.to_string(),
+                remote_kind,
                 endpoint: endpoint_str,
                 bucket: bucket_str,
                 prefix,

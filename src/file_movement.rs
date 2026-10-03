@@ -1262,10 +1262,7 @@ pub fn migrate_to_object(
                             }
                             report.records.push(MigrationRecord {
                                 path: entry.path.clone(),
-                                destination: Some(PathBuf::from(format!(
-                                    "s3://{}/{}",
-                                    config.bucket, obj_key
-                                ))),
+                                destination: Some(PathBuf::from(config.display_key(&obj_key))),
                                 outcome: FileOutcome::Moved,
                                 size: entry.size,
                                 rule: candidate.rule.clone(),
@@ -1478,6 +1475,7 @@ mod tests {
             1,
             &crate::object_store::ObjectTierConfig {
                 name: "offsite".into(),
+                remote_kind: crate::object_store::RemoteKind::S3,
                 endpoint: "s3.example.com".into(),
                 bucket: "bucket".into(),
                 prefix: None,

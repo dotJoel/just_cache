@@ -56,11 +56,32 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// file the mover would touch).
 pub const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
 
-/// Configuration for one object tier, parsed from `tiers.toml`.
+/// Which remote a tier's driver config points at. `S3` is a cloud or S3-compatible
+/// endpoint; `Peer` is a LAN box running `just_cache object-server` (#142). Both speak
+/// the same S3-compatible subset — the peer driver *is* the object-store client aimed
+/// at a peer — so they share one config type and one wire path. The differences the
+/// driver honours: a peer has no meaningful `region` (the server derives the signing
+/// region from the request's credential scope, so the value only has to be
+/// self-consistent), and a peer accepts single-object PUT/GET/HEAD/DELETE only (no
+/// multipart), so uploads to a peer never use the multipart/resume path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    /// A cloud or S3-compatible endpoint (`kind = "object"`).
+    S3,
+    /// A LAN box running `just_cache object-server` (`kind = "peer"`).
+    Peer,
+}
+
+/// Configuration for one object-store tier, parsed from `tiers.toml`. Serves both
+/// `kind = "object"` (a cloud bucket) and `kind = "peer"` (a LAN box running the
+/// object-server), because a peer speaks the same S3-compatible subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectTierConfig {
     /// The tier name (the `[tiers.<name>]` key).
     pub name: String,
+    /// Which remote this config drives. Set from the tier's `kind`; every display
+    /// string and the multipart decision branch on it.
+    pub remote_kind: RemoteKind,
     /// The S3-compatible endpoint host (e.g. `s3.us-east-1.amazonaws.com`).
     pub endpoint: String,
     /// The bucket name.
@@ -84,6 +105,25 @@ pub struct ObjectTierConfig {
 }
 
 impl ObjectTierConfig {
+    /// The URL scheme for this remote, for display and error strings: `s3` for a
+    /// cloud/S3-compatible endpoint, `peer` for a LAN box.
+    pub fn scheme(&self) -> &'static str {
+        match self.remote_kind {
+            RemoteKind::S3 => "s3",
+            RemoteKind::Peer => "peer",
+        }
+    }
+
+    /// Where an object key lives on this remote, as a display string:
+    /// `s3://bucket/key` or `peer://endpoint/bucket/key`. Used in reports and error
+    /// messages so a reader can tell a cloud bucket from a LAN peer apart.
+    pub fn display_key(&self, key: &str) -> String {
+        match self.remote_kind {
+            RemoteKind::S3 => format!("s3://{}/{}", self.bucket, key),
+            RemoteKind::Peer => format!("peer://{}/{}/{}", self.endpoint, self.bucket, key),
+        }
+    }
+
     /// Load the envelope encryption key as a hex string (64 hex chars) and convert to
     /// a 32-byte key. Errors name the source, never the key value.
     pub fn load_encryption_key(&self) -> Result<envelope::Key, ObjectStoreError> {
@@ -438,27 +478,23 @@ fn sign_request(
     let amz_date = format_amz_date(now);
     let date_stamp = &amz_date[..8];
 
-    // Canonical request
+    // Canonical request. The caller supplies `host` and `x-amz-content-sha256` with
+    // their real values; only the request date is added here. (This used to re-push
+    // `host` and `x-amz-content-sha256`, doubling both, and sign `host` as empty —
+    // the fake S3 never verified signatures so it slipped through, and a real
+    // endpoint answers 403.)
     let mut canonical_headers = String::new();
     let mut signed_headers = String::new();
     let mut header_map: Vec<(&str, &str)> = headers.to_vec();
-    header_map.push(("host", "")); // will be filled in
-    header_map.push(("x-amz-content-sha256", ""));
     header_map.push(("x-amz-date", &amz_date));
     header_map.sort_by_key(|(k, _)| *k);
 
     for (key, value) in &header_map {
-        let val = match *key {
-            "host" => "", // filled by caller
-            "x-amz-content-sha256" => &hex_body_sha256(body),
-            "x-amz-date" => &amz_date,
-            _ => value,
-        };
         if !signed_headers.is_empty() {
             signed_headers.push(';');
         }
         signed_headers.push_str(key);
-        canonical_headers.push_str(&format!("{}:{}\n", key, val));
+        canonical_headers.push_str(&format!("{}:{}\n", key, value));
     }
 
     let canonical_request = format!(
@@ -842,13 +878,13 @@ pub fn upload(
     // (configurable, default 8 MiB), so we buffer several envelope chunks into
     // one S3 part.
     let mut encrypted_parts: Vec<Vec<u8>> = Vec::new();
+    let mut encrypted_buf: Vec<u8> = Vec::new();
     {
         let mut source_file = File::open(source).map_err(|e| ObjectStoreError::LocalRead {
             path: source.to_path_buf(),
             source: e,
         })?;
 
-        let mut encrypted_buf = Vec::new();
         envelope::encrypt_all(key, &mut source_file, &mut encrypted_buf).map_err(|source| {
             ObjectStoreError::Envelope {
                 tier: config.name.clone(),
@@ -867,6 +903,35 @@ pub fn upload(
     if total_parts == 0 {
         // Empty file: upload a single empty part.
         encrypted_parts.push(Vec::new());
+    }
+
+    // A peer tier accepts single-object PUT/GET/HEAD/DELETE only — the object-server
+    // (#155) has no multipart endpoints, and its PUT model (Content-Length + atomic
+    // rename) is exactly a single PUT. The whole encrypted file is already buffered,
+    // so a single PUT costs nothing extra; the trade is that a large upload to a peer
+    // interrupted mid-flight restarts from scratch on the next sweep rather than
+    // resuming — the source is kept until the read-back verifies, so nothing is lost,
+    // only re-sent (this is the #142 §9 gap).
+    if config.remote_kind == RemoteKind::Peer {
+        let (status, _) = s3_request(
+            config,
+            &credentials,
+            "PUT",
+            &format!("/{}/{}", config.bucket, obj_key),
+            "",
+            &encrypted_buf,
+        )?;
+        if status >= 400 {
+            return Err(ObjectStoreError::Http {
+                host: config.endpoint.clone(),
+                port: 443,
+                method: "PUT".to_string(),
+                path: format!("/{}/{}", config.bucket, obj_key),
+                status,
+                body: String::new(),
+            });
+        }
+        return Ok((obj_key, source_len));
     }
 
     // For files small enough to fit in one chunk, use a simple PUT.
@@ -1169,6 +1234,7 @@ mod tests {
     fn object_key_with_and_without_prefix() {
         let config_no_prefix = ObjectTierConfig {
             name: "test".to_string(),
+            remote_kind: RemoteKind::S3,
             endpoint: "s3.example.com".to_string(),
             bucket: "my-bucket".to_string(),
             prefix: None,
