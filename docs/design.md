@@ -82,6 +82,11 @@ Hard rules:
 2. **Every tier edge is a different transport.** fs→fs is copy + fsync; fs→object is
    chunked upload with resumable state; fs→offline is export-to-volume plus a
    catalog handshake; anything crossing the machine boundary is encrypted first.
+   **As implemented (#140)**: the crossing form is `src/envelope.rs` — versioned header,
+   fresh random per-object nonce, chunked XChaCha20-Poly1305 with the chunk index as
+   additional data. Keys come from a file or the environment (never only argv), are
+   zeroized on drop and never printed; the recorded digest stays the plaintext BLAKE3, so
+   a remote copy verifies like a local one and "cannot decrypt" never reads as bitrot.
 3. **Recall latency is honest.** A parked pool is not "fast when idle"; it is `recall =
    s`, and recall-aware consumers get that answer before the read is attempted.
 
@@ -1520,6 +1525,39 @@ serves is refused for the kind (`fs` is the only kind a volatile tier can be wri
 and a `[[cache]]` overlay's own `kind` is still validated by the cache parser with its own
 message (`only fs exists`) rather than through `TierKind` — the two paths to "a kind nothing
 serves" do not share one message yet.
+
+Closed by #140: the envelope for bytes that cross the machine boundary — §2 rule 2 — is now
+a real format in `src/envelope.rs`, decided here rather than with the first driver so the
+drivers start from a seam instead of growing one. **Format**: `JCV` + version byte + the
+plaintext length + a fresh random 24-byte nonce prefix, then chunks — 64 KiB of plaintext
+each, sealed with XChaCha20-Poly1305 under a per-chunk nonce (prefix[0..12] ∥ chunk index
+LE) with the chunk index as additional data. The version byte is the "stored object names
+the scheme it was written with": a future format changes it and refuses older ones by name,
+not by a migration guess. Fresh random nonces per object mean two encryptions of one
+plaintext differ, and no counter state survives an interrupted upload to reuse.
+**Key source** (`Key::from_hex`): 64 hex characters, accepted from a file path or an
+environment variable — never only argv, where every process on the host reads it. The key
+is `Debug`-hidden (`Key(hidden)`), zeroized on drop, and no error path prints it: every
+message names the stage ("chunk 3 of the copy", "the header"), never the material. The
+three decisions rule 2 left open are thus: key from file/env with a named refusal when a
+boundary-crossing tier has none (that refusal is wired by the driver issues, which own the
+point of use); the format above; and the digest contract below. **The digest contract**:
+what a tier of record stores is ciphertext, but the catalog's recorded digest is the
+BLAKE3 of the *plaintext*, so a remote copy verifies exactly the way a local one does —
+decrypt, read back, hash. A chunk that fails its tag is "cannot decrypt" and a decrypted
+read-back that hashes wrong is "wrong bytes": `EnvelopeError` and the scrub path report
+them separately, so a wrong or missing key never reads as bitrot. Chunks bind their index
+as AAD, so a re-ordered stream is corrupt rather than shuffled-plaintext; the header's
+length catches a cut at a chunk boundary, where no tag exists to fail. The seam is
+deliberately not wired into any command yet — a driver that consumes it does not exist
+(#141/#142/#143), and the issue scoped the wiring to those PRs; `encrypt_all` takes a
+seekable source because the header must lead the stream and the length is not known
+before it, and drivers read from files, which are seekable. **Still open, and named**: the
+key-refusal-at-point-of-use is enforced by the driver issues (nothing here can refuse a
+tier no command touches yet); one key per config, no rotation or KMS (the issue's out of
+scope); and the format has no streaming-encrypt-from-a-pipe form, which would need a
+trailer and a different header — a want, not a need, until a driver pipes instead of
+reading a file.
 
 ## 10. Non-goals
 

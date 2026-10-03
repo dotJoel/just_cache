@@ -6,8 +6,8 @@ pub mod audit;
 pub mod cache;
 pub mod catalog;
 pub mod digest;
-
 pub mod disk_management;
+pub mod envelope;
 pub mod explain;
 // The FUSE namespace provider (issue #42). Unix-only: it is the only module that
 // links `fuser`, and the only path into it is the `mount` subcommand, so a build on a
