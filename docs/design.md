@@ -516,6 +516,21 @@ unprivileged test can win, and one that `SQLITE_OPEN_NOFOLLOW` narrows for the d
 itself. What is *not* fixed here is a catalog an earlier version already created 0644: this
 change fixes creation, not the mode of a file already on disk (§10).
 
+Closed by the symlink-location hardening (security review, #76): a symlink at a stored
+location is no longer accepted as a copy. `scrub`'s `check_location` used `fs::metadata`,
+which follows the final component, so a link to a byte-identical target statted as a
+regular file, hashed clean, and was recorded verified in `scrub_state`;
+`replication::place` rejected only a directory and then hashed through the link, so a
+symlink whose own target text happened to be the source's size was `Adopted` and counted
+toward the floor — letting the source be retired over a name whose target can be removed
+without the catalog noticing (the invariant-6 shape). Both now stat with
+`symlink_metadata` and require `metadata.is_file()`, matching `reconcile` and `restore`,
+which already refused a non-regular location. A link is reported `Unreadable` by scrub and
+`Failed` by place, is never recorded verified, and does not satisfy the floor; the source
+is kept. `tests/scrub.rs` and the `replication` module's tests both drive a link to a
+byte-identical target — with the link's own length equal to the source's, so the old
+length check waved it through — and fail when either guard is reverted.
+
 Still open, and honestly so:
 
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears

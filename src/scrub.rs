@@ -487,7 +487,12 @@ fn check_location(
     limiter: &mut RateLimiter,
 ) -> Check {
     let path = target.path();
-    match fs::metadata(&path) {
+    // `symlink_metadata`, not `metadata`: a symlink at a recorded location is not a copy.
+    // `metadata` follows the final component, so a link to a byte-identical target would
+    // stat as a regular file, hash clean, and be recorded verified — a name the tool
+    // vouches for while the bytes it points at can be removed without the catalog
+    // noticing, which is the invariant-6 shape.
+    match fs::symlink_metadata(&path) {
         Err(_) => Check::Missing,
         Ok(metadata) if !metadata.is_file() => {
             Check::Unreadable(format!("not a regular file: {}", path.display()))
