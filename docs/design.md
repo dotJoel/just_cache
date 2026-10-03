@@ -1729,3 +1729,12 @@ atomicity, DELETE, Content-MD5 mismatch, and bind safety.
   catalog knows it. Neither is a correctness hole — every read is still answered from a root
   the catalog proved, and every row that cannot be resolved still refuses — but a long-lived
   mount is a snapshot of the catalog it opened, not a live view of it.
+- **The object-server speaks to exactly one credential pair, and in the clear unless the
+ operator wires TLS.** `just_cache object-server` (#155) verifies one SigV4 credential
+ pair — no tenants, no per-root credentials, no IAM — because a peer tier is a machine the
+ same person owns on both ends; anything richer is cloud-provider work. Transport
+ encryption is likewise out of scope for it: the *content* is always sealed by the
+ envelope (§2 rule 2), the loopback fake and a trusted-LAN peer may run plain HTTP, and a
+ non-loopback bind without TLS refuses unless `--insecure` is given explicitly, with a
+ warning naming the exposure. Server-side TLS (the client already speaks it via `rustls`)
+ is the peer-tier wiring work that follows.
