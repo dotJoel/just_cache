@@ -358,6 +358,17 @@ part nothing else does.
 
 ## 9. Known gaps (tracked, not hidden)
 
+Each fix that lands adds a "Closed by #NN" paragraph to this section. A new entry is
+**appended after the last existing entry, at the end of the list** — the
+`Still open, and honestly so:` headings are fixed anchors that are never an insert
+point. Using the heading as the anchor made every branch in a parallel wave insert at
+the same line, so the second branch to land always conflicted on this file; appending
+at the moving tail of the list means entries land in the order they merge, and a
+branch that rebases onto landed entries re-appends after them. Two branches still
+fanned off the same base do meet at the tail — the conflict, when it happens, is the
+trivial "keep both, in order" one, resolved by appending in merge order rather than
+re-inserting at the heading.
+
 Closed in P0: metadata/sparseness loss on cross-device copies; size-only adoption;
 the open-file/hardlink gap (the open-descriptor half is now backed by a per-candidate
 `/proc` re-scan immediately before each move — #77 — with the residual window named
