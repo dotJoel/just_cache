@@ -1,30 +1,309 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>just_cache</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.6; }
-    code { background: color-mix(in srgb, currentColor 10%, transparent); padding: .1em .3em; border-radius: 4px; }
-    a { color: inherit; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>just_cache — tiered storage for the files you're not using</title>
+<meta name="description" content="Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink behind, so every existing path keeps working.">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --bg-soft: #10161d;
+    --panel: #131a22;
+    --border: #1e2833;
+    --border-strong: #2b3947;
+    --text: #d7e0e8;
+    --text-dim: #8fa1b3;
+    --text-faint: #5f7385;
+    --accent: #5ad1e6;
+    --accent-dim: #2f7d8f;
+    --good: #6fdc9a;
+    --warn: #e6b45a;
+    --mono: "SF Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* subtle terminal-grid backdrop */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background:
+      linear-gradient(rgba(90, 209, 230, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(90, 209, 230, 0.025) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 40%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  main { position: relative; z-index: 1; max-width: 860px; margin: 0 auto; padding: 0 24px 80px; }
+
+  /* header */
+  header { padding: 88px 0 56px; }
+  .wordmark { display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 14px; color: var(--text-dim); }
+  .wordmark .prompt { color: var(--accent); }
+  .wordmark .sep { color: var(--text-faint); }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(2.4rem, 6vw, 3.6rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    margin: 18px 0 14px;
+  }
+  h1 .dot { color: var(--accent); }
+  .lede { font-size: 1.18rem; max-width: 56ch; color: var(--text-dim); }
+
+  /* terminal card */
+  .term {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    margin: 32px 0 16px;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-soft);
+  }
+  .term-bar .light { width: 10px; height: 10px; border-radius: 50%; background: #33404d; }
+  .term-bar .light.r { background: #e05252; }
+  .term-bar .light.y { background: #e0b352; }
+  .term-bar .light.g { background: #4ec07c; }
+  .term-bar .title { font-family: var(--mono); font-size: 12px; color: var(--text-faint); margin-left: 8px; }
+  .term pre { padding: 18px 20px 20px; overflow-x: auto; font-size: 13.5px; }
+  .term code { font-family: var(--mono); }
+  .term .cm { color: var(--text-faint); }
+  .term .ps { color: var(--accent); }
+  .term .ok { color: var(--good); }
+  .term .dim { color: var(--text-dim); }
+
+  /* sections */
+  section { margin-top: 64px; }
+  .kicker { font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+  h2 { font-family: var(--mono); font-size: 1.55rem; font-weight: 650; letter-spacing: -0.02em; margin: 10px 0 14px; }
+  p.lead { color: var(--text-dim); max-width: 62ch; margin-bottom: 22px; }
+
+  h3 { font-family: var(--mono); font-size: 1.02rem; font-weight: 600; color: var(--text); margin: 28px 0 10px; }
+  p { margin-bottom: 14px; color: var(--text); }
+  ul, ol { margin: 0 0 18px 22px; }
+  li { margin-bottom: 8px; }
+  strong { color: #eef4f9; }
+
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); }
+  a:hover { color: #8fe4f2; border-bottom-color: var(--accent); }
+
+  code.inline {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 6px;
+    color: #b7e6ef;
+    white-space: nowrap;
+  }
+
+  /* use-case grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-top: 8px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 20px 18px;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+  .card h4 { font-family: var(--mono); font-size: 0.95rem; margin-bottom: 8px; color: #eef4f9; }
+  .card p { font-size: 0.92rem; color: var(--text-dim); margin: 0 0 12px; }
+  .card .cmd { font-family: var(--mono); font-size: 12px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 9px 11px; white-space: normal; word-break: break-word; line-height: 1.5; }
+  .card .cmd .ps { color: var(--accent); }
+
+  /* feature rows */
+  .features { display: flex; flex-direction: column; gap: 14px; }
+  .feat { display: grid; grid-template-columns: 150px 1fr; gap: 18px; align-items: baseline; padding: 14px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+  .feat .name { font-family: var(--mono); font-size: 13px; color: var(--accent); white-space: nowrap; }
+  .feat p { margin: 0; font-size: 0.95rem; color: var(--text-dim); }
+
+  .note { border-left: 3px solid var(--warn); background: rgba(230, 180, 90, 0.06); padding: 12px 16px; border-radius: 0 8px 8px 0; font-size: 0.92rem; color: var(--text-dim); margin: 18px 0; }
+
+  footer { border-top: 1px solid var(--border); margin-top: 80px; padding-top: 28px; display: flex; flex-wrap: wrap; gap: 8px 20px; font-family: var(--mono); font-size: 13px; color: var(--text-faint); }
+  footer a { color: var(--text-dim); }
+
+  @media (max-width: 640px) {
+    header { padding: 56px 0 40px; }
+    .feat { grid-template-columns: 1fr; gap: 4px; }
+    .feat .name { white-space: normal; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .card:hover { transform: none; }
+  }
+</style>
 </head>
 <body>
-  <h1>just_cache</h1>
-  <p>Moves cold, rarely used files off a fast disk onto slower ones, and leaves a symlink behind so every existing path keeps working.</p>
-  <p>
-    Point it at a directory and one or more cold-storage roots. On each sweep it walks the
-    tree, asks the filesystem when each file was last <em>used</em>, and moves the files that
-    have gone untouched onto the cold tier, replacing them with a symlink to the new location.
+<main>
+
+<header>
+  <div class="wordmark"><span class="prompt">$</span> <span>~/storage</span> <span class="sep">::</span> <span>tiered&nbsp;mover</span></div>
+  <h1>just_cache<span class="dot">.</span></h1>
+  <p class="lede">Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink behind, so every existing path keeps working.</p>
+</header>
+
+<div class="term">
+  <div class="term-bar">
+    <span class="light r"></span><span class="light y"></span><span class="light g"></span>
+    <span class="title">just_cache — one sweep</span>
+  </div>
+  <pre><code><span class="cm"># sweep once, move anything idle 60+ days, cap 25 files per tier</span>
+<span class="ps">$</span> just_cache \
+<span class="dim">    --watch</span> /mnt/cache/media \
+<span class="dim">    --dest</span> /mnt/disk-slow/media \
+<span class="dim">    --dest</span> /mnt/disk-archive/media \
+<span class="dim">    --min-idle-days</span> 60 \
+<span class="dim">    --limit</span> 25
+<span class="ok">moved</span> <span class="dim">/mnt/cache/media/shows/s1/ep1.mkv -&gt; /mnt/disk-slow/media/shows/s1/ep1.mkv</span>
+<span class="dim">pass 1: 340 files scanned, 3 moved, 0 in use, 0 failed, 12 GiB onto the cold tiers</span></code></pre>
+</div>
+
+<section id="why">
+  <div class="kicker">The problem</div>
+  <h2>Fast disks are the wrong place for old files</h2>
+  <p class="lead">
+    Your fastest disk fills up with things nobody has opened in months — media libraries, build caches,
+    old snapshots, VM images. Deleting them loses data. Leaving them costs you the disk's speed and space.
   </p>
-  <pre><code>just_cache \
-  --watch /mnt/cache/media \
-  --dest /mnt/disk-slow/media \
-  --dest /mnt/disk-archive/media \
-  --min-idle-days 60 \
-  --limit 25</code></pre>
-  <p>Documentation lives in <a href="readme.md">readme.md</a> and the design rationale in <a href="design.md">design.md</a>.</p>
+  <p>
+    Conventional tiering asks your applications to change: move the file, update every config, every path,
+    every script. <strong>just_cache skips that part.</strong> It moves the file and leaves a <em>symlink</em>
+    at the original path — so every program, mount and muscle memory keeps working, and the bytes live on the
+    slower tier where they belong.
+  </p>
+  <p>
+    That single trick is what makes tiered storage something you can actually run on a homelab or a workstation:
+    the hot tier stays hot because cold files keep drifting down to slower disks, and nothing above the
+    filesystem has to know it happened.
+  </p>
+</section>
+
+<section id="quickstart">
+  <div class="kicker">Quick start</div>
+  <h2>Get from fast to slow in one command</h2>
+  <p class="lead">Build it, point it at a tree and a cold root, run a sweep. Nothing is deleted, nothing is configured, and the paths your apps already use do not change.</p>
+
+  <h3>1. Build</h3>
+  <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">build</span></div><pre><code><span class="ps">$</span> cargo build --release</code></pre></div>
+
+  <h3>2. First sweep — check the plan without touching anything</h3>
+  <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">dry run</span></div><pre><code><span class="ps">$</span> just_cache \
+<span class="dim">    --watch</span> /mnt/cache/media \
+<span class="dim">    --dest</span> /mnt/disk-slow/media \
+<span class="dim">    --min-idle-days</span> 30 \
+<span class="dim">    --dry-run</span></code></pre></div>
+
+  <h3>3. Do it for real — continuously</h3>
+  <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">sweep every hour</span></div><pre><code><span class="ps">$</span> just_cache \
+<span class="dim">    --watch</span> /mnt/cache/media \
+<span class="dim">    --dest</span> /mnt/disk-slow/media \
+<span class="dim">    --interval</span> 3600   <span class="cm"># seconds between sweeps</span></code></pre></div>
+
+  <div class="note"><strong>One rule first:</strong> the destination must already exist. just_cache never creates one — an unmounted slow disk must not silently become a directory on the wrong filesystem.</div>
+</section>
+
+<section id="usecases">
+  <div class="kicker">Use case examples</div>
+  <h2>What people point it at</h2>
+  <div class="grid">
+    <div class="card">
+      <h4>Media library</h4>
+      <p>Old episodes and movies nobody has opened this quarter leave the NVMe for a spinning disk; Plex still finds them through the symlink.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --min-idle-days 60</div>
+    </div>
+    <div class="card">
+      <h4>Build directories</h4>
+      <p>Vendor trees, build caches and old targets that outlive their usefulness. Exclude what is still live, keep everything else honest.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /opt/builds --dest /mnt/cold/builds --exclude '*/target' --min-size 1MiB</div>
+    </div>
+    <div class="card">
+      <h4>Strict scope</h4>
+      <p>Manage only the trees you say, never touch anything else. Scope is checked before every other rule and again before bytes move.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /srv/data --dest /mnt/cold --include 'media/**' --include 'scratch/**' --exclude '*.part'</div>
+    </div>
+    <div class="card">
+      <h4>Replication</h4>
+      <p>A durability floor: N verified copies on N distinct disks before the source is removed. Checksummed, never guessed.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache --dest /mnt/disk-a --dest /mnt/disk-b --copies 2 --min-idle-days 30 --once</div>
+    </div>
+    <div class="card">
+      <h4>Backups &amp; archives</h4>
+      <p>Anything written once and read rarely — ISOs, VM images, old project snapshots — flows to cheap bulk storage and stays reachable.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/fast/archive --dest /mnt/bulk/archive --min-idle-days 90</div>
+    </div>
+    <div class="card">
+      <h4>Never a full disk</h4>
+      <p>Each destination keeps a free-space floor. A tier that is out of room reports <em>waiting for room</em> and picks the file up next sweep.</p>
+      <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache --dest /mnt/disk-slow --min-free-gb 50 --limit 10</div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="kicker">How it works</div>
+  <h2>Cold is measured, not guessed</h2>
+  <p class="lead">A file moves only when every gate passes — and the tool tells you which gate stopped it.</p>
+  <div class="features">
+    <div class="feat"><div class="name">Last use</div><p>Idle time comes from the filesystem's access time, not from a name or a size. A file read yesterday is warm; one untouched for months is a candidate.</p></div>
+    <div class="feat"><div class="name">In use = not cold</div><p>A file held open by another process, or hardlinked elsewhere, is skipped and counted separately — never moved out from under a reader.</p></div>
+    <div class="feat"><div class="name">Scope is law</div><p><code class="inline">--include</code> / <code class="inline">--exclude</code> and the size window are the outermost gate, checked before every other rule and again right before bytes move.</p></div>
+    <div class="feat"><div class="name">Verify before delete</div><p>A copy is hashed and matched to the source before the original is removed. Same size is not enough; a mismatch is refused.</p></div>
+    <div class="feat"><div class="name">Survives a crash</div><p>Every move writes an fsynced intent record first. Recovery asks the filesystem what actually happened and never deletes the only copy.</p></div>
+    <div class="feat"><div class="name">One file never stops a sweep</div><p>Failures are per-file and reported; a sweep keeps going, and <code class="inline">--once</code> exits non-zero if anything failed.</p></div>
+  </div>
+</section>
+
+<section id="more">
+  <div class="kicker">The rest of the toolbox</div>
+  <h2>Beyond moving files</h2>
+  <p class="lead">The mover is the core; a small set of read-only commands keeps the whole picture honest.</p>
+  <div class="features">
+    <div class="feat"><div class="name">explain</div><p>Why is <em>this one file</em> still here? Answers one path in the mover's own evaluation order, read-only.</p></div>
+    <div class="feat"><div class="name">catalog</div><p>Records where every object lives, keyed by content hash, in a SQLite catalog — identity survives a rename.</p></div>
+    <div class="feat"><div class="name">audit</div><p>Walks both sides and classifies every path: healthy, duplicate, dangling, orphaned. Exit code 1 on any finding, so cron can alert.</p></div>
+    <div class="feat"><div class="name">locate</div><p>"Where does this live?" answered from the catalog, even when the tier holding it is not mounted.</p></div>
+    <div class="feat"><div class="name">restore</div><p>Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
+    <div class="feat"><div class="name">scrub</div><p>Reads every stored copy back and checks it against the recorded checksum; repairs rot from a verified sibling.</p></div>
+    <div class="feat"><div class="name">reconcile</div><p>Rebuilds copies a re-added disk is missing, each one proved against the catalog before it is recorded.</p></div>
+  </div>
+</section>
+
+<section id="vision">
+  <div class="kicker">Where this goes</div>
+  <h2>One namespace over every tier you own</h2>
+  <p class="lead">
+    The mover is one piece of a larger design: SSD, spinning disks, a LAN peer, cloud object storage, an
+    offline disk in a drawer — one namespace over all of it, with a fast cache overlay in front and
+    placement driven by observed use, in the spirit of S3 storage classes. The mover in this repo is the
+    symlink namespace provider and the hot→cold driver of that design. <a href="design.md">The full design sketch is in design.md.</a>
+  </p>
+</section>
+
+<footer>
+  <span><a href="readme.md">readme.md</a></span>
+  <span><a href="design.md">design.md</a></span>
+  <span><a href="https://github.com/dotJoel/just_cache">github.com/dotJoel/just_cache</a></span>
+  <span>MIT</span>
+</footer>
+
+</main>
 </body>
 </html>
