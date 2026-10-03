@@ -775,15 +775,20 @@ Still open, and honestly so:
   resolution step: deciding a vanished name was a rename might be a human command, but it
   does not exist yet, so a difference repeats on every sync. That is deliberately louder
   than auto-healing in the wrong direction, and it is the honest state of #16.
-- **The copy floor is not in the schema, so `audit` can only enforce one.** §6 wants a
-  *per-tier* `copies` floor the scheduler maintains; the catalog shipped without a floor
-  column, and adding one needs a versioned migration (an `ALTER TABLE` a `CREATE TABLE IF
-  NOT EXISTS` schema never reaches), which is more than the small, honest change #19
-  allowed. The audit therefore enforces the only floor the schema expresses — every object
-  must keep at least one existing location — and reports an object whose every copy is gone
-  as `copy-floor`. A per-tier floor is later work.
+- **The copy floor is recorded per tier; a catalog-mode `audit` still checks only the one-copy
+  floor.** §6 wants a *per-tier* `copies` floor the scheduler maintains. The schema now holds
+  one — the `tier` table's `copies` column, added with the table by #20 — and `catalog sync`
+  records it: each configured tier's `copies` from `tiers.toml`, or an explicit `--copies N`,
+  wins for every `--dest` root. A sync then reports an offloaded object with fewer verified
+  copies than the recorded floor as `under-replicated`, naming the disks it is missing from,
+  and the walk-based `audit --copies N` reports the filesystem-only view of the same shortfall
+  as `replica-lost`. What is still single-copy is the *catalog-mode* audit itself: it hashes
+  each object's copies against `COPY_FLOOR` (one surviving location) and does not read the
+  `tier` floors, so an object whose every copy is gone is still `copy-floor`. Nothing schedules
+  a replication pass to repair a shortfall — a sync reports the gap, it does not fill it, and a
+  hot object is exempt because replication is a property of offloaded bytes.
 - **`audit` verifies the copy of record, not every replica.** Hashing both a hot and a cold
-  copy of a `restoring` object (or of a replicated tier, once that exists) on every audit is
+  copy of a `restoring` object, or both copies of a replicated one, on every audit is
   the scrub §6 describes, and it would double the I/O an audit costs. Catalog mode hashes
   the primary location and only *stats* the others, so a corrupt non-primary replica is not
   caught by an audit; catching it is the scrubber's job.
@@ -792,18 +797,24 @@ Still open, and honestly so:
   which is also what lets it see a path the catalog does not know. An answer with no
   filesystem at all (a catalog for a tier that is not mounted) is a thing the schema could
   support and no command does yet.
-- **Catalog-mode `repair` marks for resync in its report, not in a row.** A durable per-row
-  `needs_resync` flag would need the same migration the copy floor needs; until then the mark
-  is the printed outcome plus the non-zero exit, and the operator runs `catalog sync` to
-  re-record the tree.
+- **Catalog-mode `repair` marks for resync in its report, not in a row.** There is still no
+  durable per-row `needs_resync` flag. The copy floor's growth to a per-tier value did not
+  need a versioned migration, because it landed as a *new table* (`tier`, which `CREATE TABLE
+  IF NOT EXISTS` creates on the next open); a flag on an existing row is the case that needs an
+  `ALTER TABLE` the current schema never performs. Until then the mark is the printed outcome
+  plus the non-zero exit, and the operator runs `catalog sync` to re-record the tree.
 - **Only the symlink provider's flat mirrored layout is understood.** Two-disk replication
-  within a tier, remote/object tiers, and offline volumes are later work; the `volume`
-  table ships empty.
-- **`lifecycle` is ingested, not maintained.** `last_access` is filled at first ingest
-  from atime; nothing updates it yet because proper access observation is the namespace
-  provider's job (§4, P2). A `restoring` state is recorded when both a hot and a cold copy
-  exist, but no command drives a restore to completion; `audit` remains the tool that
-  tells a restore-in-progress from a true duplicate.
+  has shipped as `sweep --copies N` (across distinct `--dest` roots, with the per-tier floor
+  above); replicating across multiple disks *inside* one tier (§2's `copies = 2`), remote or
+  object tiers, and offline volumes are later work, and the `volume` table ships empty.
+- **`lifecycle` keeps the rule, but its usage columns are ingest-only.** A sweep that moves a
+  path the catalog already names writes the deciding rule to `lifecycle.rule`
+  (`Catalog::record_lifecycle_rule`, #41), so the "which rule fired" half is maintained.
+  `last_access` is still filled only at first ingest from atime and `accesses` stays 0;
+  nothing updates them because proper access observation is the namespace provider's job
+  (§4, P2). The `state` column is likewise derived at sync from whether a hot and a cold copy
+  both exist, not written by `restore`: a completed restore only becomes `present` after the
+  next `catalog sync`, and until then `audit` tells a restore-in-progress from a true duplicate.
 - **Every file is hashed on every sync.** Correct, because identity is the hash, but not
   cheap; there is no digest cache keyed on size and mtime yet.
 - **One unreadable file aborts the sync** rather than being skipped: a catalog built by
@@ -815,14 +826,17 @@ Still open, and honestly so:
   available without hashing every file before every move. A same-size-but-corrupt copy
   would still be linked; the catalog's digests (P1) are what close that, and the mover
   already checksums destinations it *adopts*, so the hole is narrow and named.
-- **No read-back verification of freshly copied bytes.** A torn copy is caught by the
-  short-copy and source-changed guards, not by re-reading what was written while the copy
-  runs: re-reading a 40 GB copy doubles I/O. Deliberate verification is now `scrub`'s job
-  (#21), which reads stored copies back on a schedule the operator controls and inside an
-  I/O budget; the mover still does not hash what it just wrote. The old half of this note —
-  "hashing a sparse file means materializing its holes" — was wrong about *reading*: it is
-  a non-hole-preserving *copy* that materializes holes, and `copy_contents` already
-  preserves them. `tests/scrub.rs` measures it.
+- **A single-copy move does not hash what it wrote; a replicated copy is read back.** The
+  plain sweep's torn copy is caught by the short-copy and source-changed guards, not by
+  re-reading the freshly written file — re-reading a 40 GB copy doubles I/O — so a
+  single-copy offload still leaves byte verification to `scrub` (#21), which reads stored
+  copies back on a schedule the operator controls and inside an I/O budget. With
+  `--copies N`, though, each *placed* copy is read back and hashed against the source before
+  it counts toward the floor (`replication::place`): a copy that only returned from write is
+  not a copy the mover can vouch for, and an unverified copy never retires the source. The
+  old half of this note — "hashing a sparse file means materializing its holes" — was wrong
+  about *reading*: it is a non-hole-preserving *copy* that materializes holes, and
+  `copy_contents` already preserves them. `tests/scrub.rs` measures it.
 - **A restore without a catalog still has no independent digest.** With a catalog, restore
   verifies against the recorded checksum and a pre-corrupt cold copy is refused (above).
   Without one, the cold copy is the only digest available: the read-back catches a torn
@@ -979,6 +993,27 @@ binary. It points at `src/faults.rs` and `tests/fault_injection.rs` (whose
 `the_hook_is_inert_when_unset` is the control test) as the concrete pattern, so the rule is
 actionable from the repository alone. No code changed; retrofitting the two existing seams
 is a §10 non-goal.
+Closed by #54: the open §9 entries were checked against the code and the six the code had
+outgrown were corrected in place. The copy-floor entry no longer says the floor is absent
+from the schema: `tier.copies` (`catalog.rs`) holds it, `catalog sync` records each
+configured tier's `copies` or an explicit `--copies N` (`main.rs`) and reports a shortfall
+as `under-replicated` (`Catalog::under_replicated`), and the walk audit's `--copies N`
+reports `replica-lost` (`audit::audit_with_copies`) — only the catalog-mode audit's
+`COPY_FLOOR` of one is unchanged. The resync entry's premise that a durable flag "would
+need the same migration the copy floor needs" is gone; the floor was added as a new table,
+which `CREATE TABLE IF NOT EXISTS` reaches, whereas a column on an existing row would need
+an `ALTER TABLE` the schema never performs. The layout entry no longer calls two-disk
+replication later work (`sweep --copies N` ships it); replicating across multiple disks
+*inside* one tier, remote/object tiers and offline volumes still are. The `lifecycle` entry
+now records that `lifecycle.rule` is written by a transition while `last_access`/`accesses`
+stay ingest-only and `state` is derived at sync. The read-back entry is scoped: a
+single-copy move does not hash what it wrote, a `--copies N` copy is read back before it
+counts (`replication::place`). One aside in the copy-of-record entry (`once that exists`)
+went with it. The remaining entries were checked and left as they stand — still true in the
+code, or deliberate limits that stay recorded (the fault seam's reach, the atime→mtime
+fallback, the hard-link-at-the-journal-name gap, root-owned files, the absent catalog-only
+audit and digest cache, the per-root journal, single-copy catalog audit, and the
+reconcile/scrub scheduling bounds).
 
 ## 10. Non-goals
 
