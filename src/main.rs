@@ -524,6 +524,11 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A pattern that cannot match anything is reported before the sweep starts: an
+    // `--exclude` that protects nothing is exactly when the user most needs to know.
+    for warning in scope.warnings() {
+        eprintln!("just_cache: warning: {warning}");
+    }
     if scope.is_empty_window() {
         eprintln!(
             "just_cache: warning: --min-size is above --max-size ({} vs {}), so nothing can qualify",
@@ -839,6 +844,9 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    for warning in scope.warnings() {
+        eprintln!("just_cache: warning: {warning}");
+    }
     if scope.is_empty_window() {
         eprintln!(
             "just_cache: warning: --min-size is above --max-size ({} vs {}), so nothing can qualify",
