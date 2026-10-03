@@ -15,6 +15,7 @@ pub mod file_movement;
 pub mod journal;
 pub mod locate;
 pub mod opened;
+pub mod policy;
 pub mod reconcile;
 pub mod replication;
 pub mod restore;
@@ -38,7 +39,7 @@ pub use disk_management::{
 };
 pub use explain::{
     explain, explain_with, CatalogAnswer, ExplainContext, Explanation, GuardsReport, PolicyReport,
-    ScopeReport, Verdict as ExplainVerdict,
+    RuleReport, ScopeReport, Verdict as ExplainVerdict,
 };
 pub use file_movement::{
     log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
@@ -46,6 +47,9 @@ pub use file_movement::{
 };
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
+pub use policy::{
+    DownDecision, DownRule, Lifecycle, PolicyError, Rule, RuleSet, UpRule, POLICY_FILE_NAME,
+};
 pub use reconcile::{
     reconcile, ReconcileError, ReconcileOutcome, ReconcileRecord, ReconcileReport, ReconcileRequest,
 };

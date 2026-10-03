@@ -908,14 +908,41 @@ sync` records each configured tier's `copies` as the floor the `tier` table alre
 is missing or malformed is a usage error that names the line, never a silent fallback;
 with no file the tool behaves exactly as before — a destination root's path is its own
 tier name, and `locate`'s output is byte-for-byte what it was. What the config deliberately
-does not yet do is named rather than implied: nothing evaluates lifecycle rules against the
-tiers (#41), nothing acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1)
+does not yet do is named rather than implied: nothing acts on `recall` or `cost` beyond
+reporting them, cache overlays (§2.1)
 are a later issue, and only the `fs` driver exists — `object`, `offline`, and `peer` tiers
 parse and are named but no driver moves bytes for them. `tests/tiers.rs` drives the real
 binary for the accepted behaviours: two tiers named in `locate`/`audit` output with their
 recall classes, a volatile tier refused as `--dest` by both `sweep` and `catalog sync`, a
 malformed config naming its line (a syntax error and a bad enum alike), and no config
 meaning today's behaviour and creating nothing.
+
+Closed by #41: lifecycle rules are evaluated. `policy.toml` — read from `--policy <FILE>`,
+or from `policy.toml` beside the watch root **only when it is already there**, the same
+open-if-present rule `tiers.toml` uses — holds `[[rule]]` tables, each with a `match` glob,
+a `down = { after_idle, from, to }` transition, optional `pins`, and an optional
+`up = { on_access }`. Rules are resolved per file against the tier the file sits on: a pin
+wins over policy, the *last* matching rule that names the file's tier wins over an earlier
+one (so a per-path rule overrides a catch-all), and only then does the idle gate apply. A
+rule's `to` tier must be a configured tier that is also a `--dest` root this sweep was
+given, and `down` must go *slower*; a rule naming an unconfigured tier, a `volatile` tier
+(§2.1), an unparseable duration or an `up` with no `down`, or a `policy.toml` with rules
+but no `tiers.toml`, is a usage error naming the rule — never a silent skip. Every
+transition records the rule that fired in `lifecycle.rule`, and `show`/`explain` name it,
+so `just_cache explain <path>` answers "which rule fired or which exclusion stopped it",
+including "no `policy.toml`" when there is none — with no policy the flag-driven
+`--min-idle-days` decision stands unchanged. A rule's `to` is what routes the move: with a
+policy the sweep no longer pours candidates into the fastest disk with room, it sends each
+file to the tier its rule names (`--copies` still replicates across the destinations).
+Two deliberate bounds are named rather than implied: a multi-step chain (`ssd →
+hdd_parked → offsite`) is written as one rule per step, because the §5 snippet above
+repeats the `down` key and TOML forbids that — a later issue may accept a `down` array;
+and `up` is *reported*, not performed, because promotion is the recall path's job (§8, P2).
+`tests/policy.rs` drives the real binary for the accepted behaviours: a rule moving on its
+idle gate with the rule recorded and named by `explain`, a pin protecting a file, a
+per-path override beating a catch-all, a config file in the watched tree left alone, an
+explicit `--policy` naming a file elsewhere, no policy meaning the flags still decide, and
+refusals (unconfigured tier, volatile target, bad duration) naming their rule.
 
 ## 10. Non-goals
 
@@ -973,9 +1000,18 @@ meaning today's behaviour and creating nothing.
 - **The tier config describes tiers; it does not yet drive them.** #40 makes a tier a
   configured object — a name, a driver, a recall class, a volatility, a copy floor, a cost
   — and lets `locate`/`audit` speak in those names, and refuses a volatile tier as a
-  destination. Nothing evaluates lifecycle rules against the tiers (that is #41), nothing
+  destination. Lifecycle rules are evaluated by #41 (above); nothing
   acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1) are a later
   issue, and the only driver implemented is the existing `fs` symlink mover: an `object`,
   `offline`, or `peer` tier parses and is named, but no bytes move to or from it. A
   config that named such a tier as a `--dest` would be accepted only because the destination
   still has to exist as a local directory — the driver half is P3.
+
+- **Promoting a recalled file is not the mover's job.** #41 evaluates `up = { on_access }`
+  and `explain` names the rule that would promote, but no sweep performs a promotion:
+  recall is the namespace provider's job (§8, P2), and a `down` engine that also moved
+  bytes back up on every read would be a cache with no policy boundary. The `up` half is
+  reported, not acted on, and named here rather than left implied.
+- **Cost-aware placement is a later phase.** §5's cost model — reporting (and optionally
+  acting on) the delta of keeping each subtree where it is — is not part of #41, which
+  evaluates rules that name tiers by name and does not read a tier's `cost`.

@@ -1524,6 +1524,22 @@ impl Catalog {
             .map_err(Into::into)
     }
 
+    /// Record which lifecycle rule decided a path's transition (§5: every transition
+    /// records the rule that fired). `false` when the path is not named — a sweep that
+    /// moved a file the catalog has not ingested yet has nothing to attach the rule to,
+    /// and the next `catalog sync` brings the name in.
+    ///
+    /// The object id is resolved in SQL (`name -> object_id`) so the rule is written
+    /// against the object's identity, not the path a rename could move.
+    pub fn record_lifecycle_rule(&self, path: &str, rule: &str) -> Result<bool, CatalogError> {
+        let changed = self.conn.execute(
+            "UPDATE lifecycle SET rule = ?1
+             WHERE object_id = (SELECT object_id FROM name WHERE path = ?2)",
+            params![rule, path],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// One object, by the namespace path it answers to. `None` when the path is not
     /// named — which is an answer: the catalog, not the filesystem, is the source of
     /// truth for "does this object exist" (§3).

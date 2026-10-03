@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use crate::disk_management::{self, DiskError, FileEntry, MoveOutcome};
 use crate::journal::Journal;
 use crate::opened::{Guards, InUse};
+use crate::policy::{DownDecision, Lifecycle};
 use crate::scope::{Rejected, Scope};
 
 /// What we know about one tracked file.
@@ -138,6 +139,33 @@ pub enum SkipReason {
     Hardlinked {
         links: u64,
     },
+    /// A lifecycle rule (`policy.toml`) governs this sweep, and no rule's `match` covers
+    /// the path. The file is outside every policy — an exclusion, not a "not yet".
+    RuleNoMatch,
+    /// A rule matched but one of its pins protects the file. Pin wins over policy.
+    RulePinned {
+        rule: String,
+        pattern: String,
+    },
+    /// The path is not on any configured tier, so no rule's `from` can match.
+    RuleNoTier,
+    /// The matching rule has no `down` transition from the tier the file is on.
+    RuleNoDown {
+        rule: String,
+        tier: String,
+    },
+    /// The rule applies, but the file has not been idle long enough yet.
+    RuleTooWarm {
+        rule: String,
+    },
+    /// The matching rule names a `to` tier this sweep was not given as a `--dest` root.
+    RuleTargetNotSwept {
+        rule: String,
+        tier: String,
+    },
+    /// A `policy.toml` / `tiers.toml` this sweep reads. Never a move candidate: moving the
+    /// rules that govern a sweep would change them behind the operator's back.
+    ConfigFile,
 }
 
 impl From<InUse> for SkipReason {
@@ -183,6 +211,27 @@ impl std::fmt::Display for SkipReason {
             SkipReason::Hardlinked { links } => {
                 write!(f, "hardlinked elsewhere ({links} links)")
             }
+            SkipReason::RuleNoMatch => write!(f, "no policy rule matches this path"),
+            SkipReason::RulePinned { rule, pattern } => {
+                write!(f, "pinned by policy rule `{rule}` (pattern `{pattern}`)")
+            }
+            SkipReason::RuleNoTier => {
+                write!(f, "not on any configured tier, so no rule `from` can match")
+            }
+            SkipReason::RuleNoDown { rule, tier } => {
+                write!(f, "policy rule `{rule}` has no down from tier `{tier}`")
+            }
+            SkipReason::RuleTooWarm { rule } => {
+                write!(f, "not idle enough for policy rule `{rule}`")
+            }
+            SkipReason::RuleTargetNotSwept { rule, tier } => write!(
+                f,
+                "policy rule `{rule}` targets tier `{tier}`, which is not a --dest this sweep"
+            ),
+            SkipReason::ConfigFile => write!(
+                f,
+                "a configuration file this sweep reads, never a move candidate"
+            ),
         }
     }
 }
@@ -199,6 +248,27 @@ pub struct MoveContext<'a> {
     pub scope: &'a Scope,
     pub guards: &'a Guards,
     pub journal: &'a mut Journal,
+    /// The lifecycle rules (`policy.toml`), when one governs this sweep. `None` is the
+    /// fallback: the flag-driven decision, exactly what the tool did before rules existed.
+    pub lifecycle: Option<&'a Lifecycle<'a>>,
+    /// The `(configured tier name, destination root)` pairs this sweep may move onto.
+    /// Empty without a tier config. A rule's `to` tier is looked up here, which is how a
+    /// rule chooses *which* disk a file goes to rather than the fastest one with room.
+    pub dest_tiers: &'a [(String, PathBuf)],
+}
+
+/// One file a sweep chose, with the lifecycle rule that chose it when one did.
+///
+/// A candidate carries its target tier name because a rule decides *which* disk a file
+/// goes to, not merely whether it may move. With no `policy.toml` both fields are `None`
+/// and the mover falls back to the destination order, exactly as before.
+#[derive(Debug, Clone)]
+pub struct Candidate<'a> {
+    pub entry: &'a FileEntry,
+    /// The lifecycle rule that selected this file, recorded in `lifecycle.rule`.
+    pub rule: Option<String>,
+    /// The configured tier the rule names as this file's destination.
+    pub tier: Option<String>,
 }
 
 /// The files a sweep would move, oldest use first, capped at [`Policy::limit`].
@@ -207,18 +277,36 @@ pub struct MoveContext<'a> {
 /// remaining exclusions are returned alongside so the run can explain itself. Scope
 /// (§[`crate::scope`]) is checked first, so a file this tool is not allowed to manage
 /// can never be picked up by a policy that later grows more eager.
+///
+/// When `context.lifecycle` is set, the idle gate and the destination come from the
+/// matching rule (`policy.toml`, §5) instead of `--min-idle-days`; with no rules the
+/// flag-driven decision stands, which is the acceptance criterion "no `policy.toml` means
+/// today's behaviour".
 pub fn select_candidates<'a>(
     entries: &'a [FileEntry],
     tracker: &UsageTracker,
     context: &MoveContext<'_>,
     now: SystemTime,
-) -> (Vec<&'a FileEntry>, Vec<(&'a FileEntry, SkipReason)>) {
+) -> (Vec<Candidate<'a>>, Vec<(&'a FileEntry, SkipReason)>) {
+    if let Some(lifecycle) = context.lifecycle {
+        return select_by_rules(entries, tracker, context, lifecycle, now);
+    }
     let (policy, scope, guards) = (context.policy, context.scope, context.guards);
     let mut eager: Vec<(&FileEntry, SystemTime)> = Vec::new();
     let mut skipped: Vec<(&FileEntry, SkipReason)> = Vec::new();
 
     for entry in entries {
         if entry.is_symlink {
+            continue;
+        }
+        // A config the sweep reads is not user data. This is checked before scope and
+        // before any rule, because moving `policy.toml` or `tiers.toml` on a later pass
+        // would change the rules governing this very sweep.
+        if context
+            .lifecycle
+            .is_some_and(|lifecycle| lifecycle.is_config_file(&entry.path))
+        {
+            skipped.push((entry, SkipReason::ConfigFile));
             continue;
         }
         if let Err(rejected) = scope.allows(entry) {
@@ -263,7 +351,97 @@ pub fn select_candidates<'a>(
             skipped.push((entry, SkipReason::BeyondLimit));
             continue;
         }
-        candidates.push(entry);
+        candidates.push(Candidate {
+            entry,
+            rule: None,
+            tier: None,
+        });
+    }
+
+    (candidates, skipped)
+}
+
+/// The rule-driven half of [`select_candidates`].
+///
+/// Scope, empty-file and the guards are unchanged — they are safety gates, not policy —
+/// but the idle decision and the destination now come from the rule that matches the
+/// path. The flag-driven observed-access pin still applies: a file seen being read during
+/// the run is not cold, and that is a safety fact rather than a policy one.
+fn select_by_rules<'a>(
+    entries: &'a [FileEntry],
+    tracker: &UsageTracker,
+    context: &MoveContext<'_>,
+    lifecycle: &Lifecycle<'_>,
+    now: SystemTime,
+) -> (Vec<Candidate<'a>>, Vec<(&'a FileEntry, SkipReason)>) {
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let mut eager: Vec<(&FileEntry, SystemTime, String, String)> = Vec::new();
+    let mut skipped: Vec<(&FileEntry, SkipReason)> = Vec::new();
+
+    for entry in entries {
+        if entry.is_symlink {
+            continue;
+        }
+        if lifecycle.is_config_file(&entry.path) {
+            skipped.push((entry, SkipReason::ConfigFile));
+            continue;
+        }
+        if let Err(rejected) = scope.allows(entry) {
+            skipped.push((entry, SkipReason::from(rejected)));
+            continue;
+        }
+        if entry.size == 0 {
+            skipped.push((entry, SkipReason::EmptyFile));
+            continue;
+        }
+        if let Err(in_use) = guards.check(entry) {
+            skipped.push((entry, SkipReason::from(in_use)));
+            continue;
+        }
+        let accesses = tracker.observed_accesses(&entry.path);
+        if policy.observed_access_pin > 0 && accesses >= policy.observed_access_pin {
+            skipped.push((entry, SkipReason::RecentlyAccessed(accesses)));
+            continue;
+        }
+
+        let last_access = tracker.last_access(&entry.path, entry.last_access);
+        let idle = now.duration_since(last_access).unwrap_or(Duration::ZERO);
+        let current_tier = lifecycle.current_tier(&entry.path);
+        match lifecycle.evaluate_down(&entry.relative, current_tier, idle) {
+            DownDecision::Down { rule, to, .. } => {
+                if !context.dest_tiers.iter().any(|(name, _)| name == &to) {
+                    skipped.push((entry, SkipReason::RuleTargetNotSwept { rule, tier: to }));
+                    continue;
+                }
+                eager.push((entry, last_access, rule, to));
+            }
+            DownDecision::TooWarm { rule, .. } => {
+                skipped.push((entry, SkipReason::RuleTooWarm { rule }));
+            }
+            DownDecision::Pinned { rule, pattern } => {
+                skipped.push((entry, SkipReason::RulePinned { rule, pattern }));
+            }
+            DownDecision::NoRule => skipped.push((entry, SkipReason::RuleNoMatch)),
+            DownDecision::NotOnManagedTier => skipped.push((entry, SkipReason::RuleNoTier)),
+            DownDecision::NoDownFrom { rule, from } => {
+                skipped.push((entry, SkipReason::RuleNoDown { rule, tier: from }));
+            }
+        }
+    }
+
+    eager.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+
+    let mut candidates = Vec::new();
+    for (index, (entry, _, rule, to)) in eager.into_iter().enumerate() {
+        if index >= policy.limit {
+            skipped.push((entry, SkipReason::BeyondLimit));
+            continue;
+        }
+        candidates.push(Candidate {
+            entry,
+            rule: Some(rule),
+            tier: Some(to),
+        });
     }
 
     (candidates, skipped)
@@ -301,6 +479,9 @@ pub struct MigrationRecord {
     /// Size of the file at the time it was considered, so byte totals do not need a
     /// second look at a tree that has already changed.
     pub size: u64,
+    /// The lifecycle rule that decided this transition, when a `policy.toml` governed the
+    /// sweep. This is what `lifecycle.rule` records and what `explain` names (§5).
+    pub rule: Option<String>,
 }
 
 /// Everything a sweep did, in the order it did it.
@@ -371,7 +552,9 @@ impl MigrationReport {
     }
 
     /// Files left alone because of scope or the size window — i.e. not this tool's to
-    /// move in the first place, as opposed to "not cold yet".
+    /// move in the first place, as opposed to "not cold yet". Rule-driven exclusions (no
+    /// matching rule, a pin, a tier the rule does not reach) count here too: those are
+    /// "outside every policy", not "not yet".
     pub fn excluded(&self) -> usize {
         self.count(|outcome| {
             matches!(
@@ -379,6 +562,12 @@ impl MigrationReport {
                 FileOutcome::Skipped(SkipReason::OutOfScope)
                     | FileOutcome::Skipped(SkipReason::TooSmall { .. })
                     | FileOutcome::Skipped(SkipReason::TooLarge { .. })
+                    | FileOutcome::Skipped(SkipReason::RuleNoMatch)
+                    | FileOutcome::Skipped(SkipReason::RulePinned { .. })
+                    | FileOutcome::Skipped(SkipReason::RuleNoTier)
+                    | FileOutcome::Skipped(SkipReason::RuleNoDown { .. })
+                    | FileOutcome::Skipped(SkipReason::RuleTargetNotSwept { .. })
+                    | FileOutcome::Skipped(SkipReason::ConfigFile)
             )
         })
     }
@@ -433,7 +622,12 @@ impl MigrationReport {
                     FileOutcome::Skipped(reason) => format!("skipped: {reason}"),
                     FileOutcome::Failed(err) => format!("FAILED: {err}"),
                 };
-                format!("{} {}{}", what, record.path.display(), where_to)
+                let by_rule = record
+                    .rule
+                    .as_ref()
+                    .map(|rule| format!(" (rule `{rule}`)"))
+                    .unwrap_or_default();
+                format!("{} {}{}{}", what, record.path.display(), where_to, by_rule)
             })
             .collect()
     }
@@ -456,7 +650,7 @@ pub fn migrate_least_used<F>(
     mut choose_destination: F,
 ) -> MigrationReport
 where
-    F: FnMut(&FileEntry) -> Result<Option<PathBuf>, DiskError>,
+    F: FnMut(&Candidate) -> Result<Option<PathBuf>, DiskError>,
 {
     let (candidates, skipped) = select_candidates(entries, tracker, context, now);
     // The copy fields are read out before the journal is borrowed mutably below: the
@@ -471,10 +665,12 @@ where
             destination: None,
             outcome: FileOutcome::Skipped(reason),
             size: entry.size,
+            rule: None,
         });
     }
 
-    for entry in candidates {
+    for candidate in candidates {
+        let entry = candidate.entry;
         // Re-checked here, immediately before bytes move: the sweep's snapshot cannot see
         // a descriptor opened after it was taken, so this second open-file scan is the one
         // that catches a file opened during the walk (invariant 3).
@@ -484,6 +680,7 @@ where
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
                 size: entry.size,
+                rule: candidate.rule.clone(),
             });
             continue;
         }
@@ -493,11 +690,12 @@ where
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
                 size: entry.size,
+                rule: candidate.rule.clone(),
             });
             continue;
         }
 
-        let destination = match choose_destination(entry) {
+        let destination = match choose_destination(&candidate) {
             Ok(Some(destination)) => destination,
             Ok(None) => {
                 report.records.push(MigrationRecord {
@@ -505,6 +703,7 @@ where
                     destination: None,
                     outcome: FileOutcome::NoRoom,
                     size: entry.size,
+                    rule: candidate.rule.clone(),
                 });
                 continue;
             }
@@ -514,6 +713,7 @@ where
                     destination: None,
                     outcome: FileOutcome::Failed(err.to_string()),
                     size: entry.size,
+                    rule: candidate.rule.clone(),
                 });
                 continue;
             }
@@ -565,6 +765,7 @@ where
             destination: Some(destination.join(&entry.relative)),
             outcome,
             size: entry.size,
+            rule: candidate.rule.clone(),
         });
     }
 
@@ -609,10 +810,12 @@ pub fn migrate_replicated(
             destination: None,
             outcome: FileOutcome::Skipped(reason),
             size: entry.size,
+            rule: None,
         });
     }
 
-    for entry in candidates {
+    for candidate in candidates {
+        let entry = candidate.entry;
         // Same belt-and-braces re-check as the single-copy path: a fresh open-file scan
         // immediately before the copy, because the sweep's snapshot predates the walk.
         if let Err(rejected) = scope.allows(entry) {
@@ -621,6 +824,7 @@ pub fn migrate_replicated(
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
                 size: entry.size,
+                rule: candidate.rule.clone(),
             });
             continue;
         }
@@ -630,16 +834,22 @@ pub fn migrate_replicated(
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
                 size: entry.size,
+                rule: candidate.rule.clone(),
             });
             continue;
         }
+
+        // A rule decides which tier the file belongs on, so that tier's destination root
+        // is tried first and the rest follow to meet the floor. Without a policy this is
+        // exactly `dests` in the order given.
+        let ordered = ordered_dests(dests, context.dest_tiers, candidate.tier.as_deref());
 
         // The intent names the first destination before anything moves (invariant 5). On
         // this path the copy step never touches the source, so the record only has to be
         // right for the window *after* the copies exist — where the destination the move
         // actually retires to is whichever copy verified, which need not be the first one
         // tried. It is corrected to that copy below, before the source is removed.
-        let intent_destination = dests.first().map(|dest| dest.join(&entry.relative));
+        let intent_destination = ordered.first().map(|dest| dest.join(&entry.relative));
 
         if policy.dry_run {
             report.records.push(MigrationRecord {
@@ -647,6 +857,7 @@ pub fn migrate_replicated(
                 destination: intent_destination,
                 outcome: FileOutcome::Planned,
                 size: entry.size,
+                rule: candidate.rule.clone(),
             });
             continue;
         }
@@ -656,7 +867,7 @@ pub fn migrate_replicated(
             None => false,
         };
 
-        let outcome = crate::replication::replicate(entry, dests, floor, min_free);
+        let outcome = crate::replication::replicate(entry, &ordered, floor, min_free);
 
         // The copy recovery would link to is the one that verified, not necessarily the
         // destination the intent guessed at. Record it now, *before* the source is
@@ -730,10 +941,40 @@ pub fn migrate_replicated(
             destination: retire_to.or(intent_destination),
             outcome: result,
             size: entry.size,
+            rule: candidate.rule.clone(),
         });
     }
 
     report
+}
+
+/// The destination order for one candidate: the rule's `to` tier first, then the rest.
+///
+/// A rule names the tier a file belongs on; the floor still has to be met, so any other
+/// `--dest` roots follow as replication targets. With no tier name (no policy, or a rule
+/// whose tier is not one of this sweep's destinations) this is `dests` unchanged.
+fn ordered_dests(
+    dests: &[PathBuf],
+    dest_tiers: &[(String, PathBuf)],
+    tier: Option<&str>,
+) -> Vec<PathBuf> {
+    let Some(tier) = tier else {
+        return dests.to_vec();
+    };
+    let mut ordered: Vec<PathBuf> = dest_tiers
+        .iter()
+        .filter(|(name, _)| name == tier)
+        .map(|(_, path)| path.clone())
+        .collect();
+    if ordered.is_empty() {
+        return dests.to_vec();
+    }
+    for dest in dests {
+        if !ordered.contains(dest) {
+            ordered.push(dest.clone());
+        }
+    }
+    ordered
 }
 
 /// Replace a source file with a symlink to a verified replica.
@@ -822,12 +1063,14 @@ mod tests {
                 scope: &Scope::everything(),
                 guards: &Guards::permissive(),
                 journal: &mut journal,
+                lifecycle: None,
+                dest_tiers: &[],
             },
             now,
         );
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].path, Path::new("/watch/cold.bin"));
+        assert_eq!(candidates[0].entry.path, Path::new("/watch/cold.bin"));
         assert_eq!(skipped.len(), 1);
         assert!(matches!(skipped[0].1, SkipReason::IdleFor(_)));
     }
@@ -855,11 +1098,13 @@ mod tests {
                 scope: &Scope::everything(),
                 guards: &Guards::permissive(),
                 journal: &mut journal,
+                lifecycle: None,
+                dest_tiers: &[],
             },
             now,
         );
 
-        let picked: Vec<_> = candidates.iter().map(|e| e.path.clone()).collect();
+        let picked: Vec<_> = candidates.iter().map(|e| e.entry.path.clone()).collect();
         assert_eq!(
             picked,
             vec![PathBuf::from("/watch/a.bin"), PathBuf::from("/watch/c.bin")]
@@ -897,6 +1142,8 @@ mod tests {
                 scope: &Scope::everything(),
                 guards: &Guards::permissive(),
                 journal: &mut journal,
+                lifecycle: None,
+                dest_tiers: &[],
             },
             now,
         );
@@ -945,6 +1192,8 @@ mod tests {
                 scope: &Scope::everything(),
                 guards: &Guards::permissive(),
                 journal: &mut journal,
+                lifecycle: None,
+                dest_tiers: &[],
             },
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
@@ -1009,6 +1258,8 @@ mod tests {
                 scope: &Scope::everything(),
                 guards: &guards,
                 journal: &mut journal,
+                lifecycle: None,
+                dest_tiers: &[],
             },
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
