@@ -24,6 +24,13 @@
 //!   bytes, a location's file vanished or was replaced — are **reported**, and the
 //!   catalog rows are left exactly as they were. A human decides what the move means.
 //!
+//! A file the pass cannot read is neither: it is reported per file, with its path and the
+//! error, and the rest of the tree is ingested anyway. Stopping at the first unreadable
+//! file would make the whole catalog all-or-nothing, and the mover's rule 7 — one file
+//! failing never stops a sweep — has no reason not to apply here (issue #53). The failure
+//! is *listed*, never inferred on: nothing is recorded as gone, missing or empty because a
+//! read failed, so a hole in the catalog is visible instead of a lie.
+//!
 //! ## Transactionality, and why it is the whole point
 //!
 //! Every write of one sync happens inside one SQLite transaction, committed only at the
@@ -31,7 +38,10 @@
 //! warning and it is right: a half-applied ingest would look like a complete one to
 //! everything downstream that trusts the catalog. An interrupted `sync` therefore leaves
 //! the catalog byte-for-byte as it was, which is the same guarantee `journal.rs` gives a
-//! move.
+//! move. A file that could not be read is reported and excluded from the observation
+//! *before* the transaction opens, so "the readable subset committed" and "the whole thing
+//! rolled back" stay the only two outcomes — never a catalog half-written because the walk
+//! died in the middle.
 //!
 //! ## Cache residency is not a location (§2.1)
 //!
@@ -220,8 +230,13 @@ pub enum CatalogError {
 
 /// How a name or a location disagrees with what the catalog recorded.
 ///
-/// Every one of these is "the tree changed under the catalog". Each is reported and the
+/// Most of these are "the tree changed under the catalog". Each is reported and the
 /// affected rows are left alone; none of them is silently reconciled away.
+///
+/// [`DifferenceKind::Unreadable`] is the one entry that is not a disagreement: it is a
+/// file the pass could not read, so the pass has no fact about it at all. It is reported
+/// through the same channel — never silently dropped — but the code that would infer a
+/// vanish or a missing location from the file's absence must not run for it (issue #53).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DifferenceKind {
     /// A name the catalog had is absent from the tree: moved or deleted by hand.
@@ -244,6 +259,10 @@ pub enum DifferenceKind {
     /// A location the mover wrote but no digest has vouched for. It counts toward no
     /// floor until a sync hashes it — unknown, not assumed good.
     ReplicaUnknown,
+    /// A file the pass could not read, so nothing about it was ingested. The `detail` is
+    /// the error. This is not a statement that the file is missing or empty — only that
+    /// this run could not observe it (issue #53).
+    Unreadable,
 }
 
 impl DifferenceKind {
@@ -258,6 +277,7 @@ impl DifferenceKind {
             DifferenceKind::UnexpectedTarget => "unexpected-target",
             DifferenceKind::UnderReplicated => "under-replicated",
             DifferenceKind::ReplicaUnknown => "replica-unknown",
+            DifferenceKind::Unreadable => "unreadable",
         }
     }
 }
@@ -568,7 +588,10 @@ impl SyncReport {
 
     /// The readable summary. The wording says out loud that a difference was *not*
     /// reconciled, because "N differences" alone reads like the sync failed rather than
-    /// like it refused to guess.
+    /// like it refused to guess. Unreadable files are split out from disagreements: a
+    /// disagreement is about a fact the tree contradicts, an unreadable file is a fact
+    /// this pass could not obtain at all, and merging the two would blur the catalog's
+    /// hole into a claim about the tree (issue #53).
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "catalog sync: {} -> {}",
@@ -588,12 +611,29 @@ impl SyncReport {
             lines.push("no differences: the catalog agrees with the tree".to_string());
             return lines;
         }
-        lines.push(format!(
-            "differences: {} (left unresolved; the catalog was NOT rewritten to match)",
-            self.differences.len()
-        ));
-        for difference in &self.differences {
-            lines.push(difference.describe());
+
+        let (unreadable, disagreements): (Vec<&Difference>, Vec<&Difference>) = self
+            .differences
+            .iter()
+            .partition(|difference| difference.kind == DifferenceKind::Unreadable);
+
+        if !disagreements.is_empty() {
+            lines.push(format!(
+                "differences: {} (left unresolved; the catalog was NOT rewritten to match)",
+                disagreements.len()
+            ));
+            for difference in disagreements {
+                lines.push(difference.describe());
+            }
+        }
+        if !unreadable.is_empty() {
+            lines.push(format!(
+                "unreadable: {} file(s) not ingested (reported, not guessed: the catalog records nothing about them)",
+                unreadable.len()
+            ));
+            for difference in unreadable {
+                lines.push(difference.describe());
+            }
         }
         lines
     }
@@ -617,8 +657,17 @@ pub(crate) struct Observation {
     /// `--dest`. Persisted so a later reader can re-check that a row's tier is real
     /// instead of trusting the stored string (issue #72).
     pub(crate) roots: BTreeSet<String>,
-    /// Structural problems found while walking, independent of the catalog.
+    /// Structural problems found while walking, independent of the catalog. Carries the
+    /// per-file [`DifferenceKind::Unreadable`] reports too: a file that could not be read
+    /// is a fact about this pass that must reach the operator, never a silent skip.
     pub(crate) differences: Vec<Difference>,
+    /// Namespace keys whose bytes could not be read this pass. Absence alone would make
+    /// the name look vanished; a read failure is not evidence of a vanish, so the
+    /// vanished-name report is suppressed for these (issue #53).
+    pub(crate) unreadable_names: BTreeSet<String>,
+    /// Location keys whose bytes could not be read this pass, for the same reason: a
+    /// location we could not read is not a location observed to be missing.
+    pub(crate) unreadable_locations: BTreeSet<LocationKey>,
 }
 
 /// The catalog's prior contents, loaded once per sync to compare against.
@@ -736,6 +785,10 @@ impl Catalog {
 
     /// Ingest the current state of `watch` and `dests`, reporting — never reconciling —
     /// anything that contradicts what the catalog already recorded.
+    ///
+    /// A file that cannot be read does not stop the pass: it is reported per file (with
+    /// its path and the error) as [`DifferenceKind::Unreadable`], the rest of the tree is
+    /// ingested, and nothing is inferred about the file itself (issue #53).
     pub fn sync(&mut self, watch: &Path, dests: &[PathBuf]) -> Result<SyncReport, CatalogError> {
         let observation = observe(watch, dests)?;
         let existing = self.load_state()?;
@@ -931,14 +984,18 @@ impl Catalog {
         // 3. A name the catalog had that is no longer in the tree. Left in place: the
         //    bytes may still be on a tier, and only a human knows whether the path moved
         //    or the file is gone (identity is the hash, so a rename is still this object).
+        //    A name whose bytes could not be read is excluded: absence from the
+        //    observation is a failed read, not a vanished file, and reporting it as
+        //    vanished would invent a deletion (issue #53).
         for (path, id) in &existing.names {
-            if !observation.names.contains_key(path) {
-                applied.differences.push(Difference {
-                    kind: DifferenceKind::NameVanished,
-                    path: PathBuf::from(path),
-                    detail: format!("catalog still records object {}", hex(id)),
-                });
+            if observation.names.contains_key(path) || observation.unreadable_names.contains(path) {
+                continue;
             }
+            applied.differences.push(Difference {
+                kind: DifferenceKind::NameVanished,
+                path: PathBuf::from(path),
+                detail: format!("catalog still records object {}", hex(id)),
+            });
         }
 
         // 4. Locations. Same rule as names: a new one is ingested, a changed one is
@@ -982,9 +1039,12 @@ impl Catalog {
         //     on disk and NOT observed as a copy of this object (otherwise it was
         //     upgraded above). It counts toward no floor: unknown, not assumed good.
         for (tier, key) in &existing.unverified {
-            let observed_here = observation
-                .locations
-                .contains_key(&(tier.clone(), key.clone()));
+            let observed_key = (tier.clone(), key.clone());
+            let observed_here = observation.locations.contains_key(&observed_key)
+                // An unreadable location is not one observed to be gone: a later sync can
+                // still read it and vouch for it, so recording "not found" now would be an
+                // inference from a failed read (issue #53).
+                || observation.unreadable_locations.contains(&observed_key);
             if !observed_here {
                 applied.differences.push(Difference {
                     kind: DifferenceKind::ReplicaUnknown,
@@ -1004,6 +1064,13 @@ impl Catalog {
         for ((tier, key), id) in &existing.locations {
             let observed_key = (tier.clone(), key.clone());
             if observation.locations.contains_key(&observed_key) {
+                continue;
+            }
+            // A location we could not read is not a location observed to be missing. Treat
+            // the unreadable file as still there: the row is kept either way, and only the
+            // report changes — it must not claim a disappearance the pass did not see
+            // (issue #53).
+            if observation.unreadable_locations.contains(&observed_key) {
                 continue;
             }
             let relocated = *tier == observation.watch_tier
@@ -1793,6 +1860,9 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
     // One hash per unique file: a symlink and the cold scan both see the same bytes, and
     // hashing a 40 GB file twice would be the tool's own worst enemy.
     let mut hashes: BTreeMap<PathBuf, ObjectId> = BTreeMap::new();
+    // Absolute paths already reported unreadable. A cold copy reached by the tier walk and
+    // again through the watched symlink that points at it is one broken file, not two.
+    let mut unreadable_seen: BTreeSet<PathBuf> = BTreeSet::new();
 
     for (root, tier) in &dest_roots {
         for entry in list(root)? {
@@ -1801,16 +1871,34 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
             if entry.is_symlink {
                 continue;
             }
-            let id = hash_path(&mut hashes, &entry.path)?;
-            record_object(
-                &mut observation,
-                &id,
-                entry.size,
-                access_epoch(&entry.last_access),
-            );
-            observation
-                .locations
-                .insert((tier.clone(), key_of(&entry.relative)), id);
+            match hash_path(&mut hashes, &entry.path) {
+                Ok(id) => {
+                    record_object(
+                        &mut observation,
+                        &id,
+                        entry.size,
+                        access_epoch(&entry.last_access),
+                    );
+                    observation
+                        .locations
+                        .insert((tier.clone(), key_of(&entry.relative)), id);
+                }
+                Err(error) => {
+                    // Failure is per file: name the location, report it, keep walking. The
+                    // read failure is not evidence the copy is gone, so the location is
+                    // marked unreadable rather than left for the missing-report to claim.
+                    observation
+                        .unreadable_locations
+                        .insert((tier.clone(), key_of(&entry.relative)));
+                    record_unreadable(
+                        &mut observation,
+                        &mut unreadable_seen,
+                        &entry.path,
+                        &entry.relative,
+                        error,
+                    )?;
+                }
+            }
         }
     }
 
@@ -1819,18 +1907,37 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
         if entry.is_symlink {
             match resolve_link(&entry.path, &dest_roots)? {
                 LinkState::Cold { target, key, tier } => {
-                    let id = hash_path(&mut hashes, &target)?;
-                    let size = fs::metadata(&target)
-                        .map(|metadata| metadata.len())
-                        .map_err(|source| CatalogError::Checksum {
-                            path: target.clone(),
-                            source,
-                        })?;
-                    record_object(&mut observation, &id, size, access);
-                    observation
-                        .names
-                        .insert(key_of(&entry.relative), id.clone());
-                    observation.locations.insert((tier, key), id);
+                    // The bytes are on a cold tier; a failed read there leaves neither the
+                    // name nor the cold location observable, so both are marked unreadable.
+                    let read = hash_path(&mut hashes, &target).and_then(|id| {
+                        let size = fs::metadata(&target)
+                            .map(|metadata| metadata.len())
+                            .map_err(|source| CatalogError::Checksum {
+                                path: target.clone(),
+                                source,
+                            })?;
+                        Ok((id, size))
+                    });
+                    match read {
+                        Ok((id, size)) => {
+                            record_object(&mut observation, &id, size, access);
+                            observation
+                                .names
+                                .insert(key_of(&entry.relative), id.clone());
+                            observation.locations.insert((tier, key), id);
+                        }
+                        Err(error) => {
+                            observation.unreadable_names.insert(key_of(&entry.relative));
+                            observation.unreadable_locations.insert((tier, key));
+                            record_unreadable(
+                                &mut observation,
+                                &mut unreadable_seen,
+                                &target,
+                                &entry.relative,
+                                error,
+                            )?;
+                        }
+                    }
                 }
                 LinkState::Dangling { target } => {
                     observation.differences.push(Difference {
@@ -1848,15 +1955,66 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
                 }
             }
         } else {
-            let id = hash_path(&mut hashes, &entry.path)?;
-            record_object(&mut observation, &id, entry.size, access);
-            let key = key_of(&entry.relative);
-            observation.names.insert(key.clone(), id.clone());
-            observation.locations.insert((watch_tier.clone(), key), id);
+            match hash_path(&mut hashes, &entry.path) {
+                Ok(id) => {
+                    record_object(&mut observation, &id, entry.size, access);
+                    let key = key_of(&entry.relative);
+                    observation.names.insert(key.clone(), id.clone());
+                    observation.locations.insert((watch_tier.clone(), key), id);
+                }
+                Err(error) => {
+                    // A watched file that could not be read. Its absence from the
+                    // observation must not read as a vanished name or a missing location —
+                    // the read failed, and that is all this pass knows (issue #53).
+                    let key = key_of(&entry.relative);
+                    observation.unreadable_names.insert(key.clone());
+                    observation
+                        .unreadable_locations
+                        .insert((watch_tier.clone(), key));
+                    record_unreadable(
+                        &mut observation,
+                        &mut unreadable_seen,
+                        &entry.path,
+                        &entry.relative,
+                        error,
+                    )?;
+                }
+            }
         }
     }
 
     Ok(observation)
+}
+
+/// Record one file this pass could not read, and carry on.
+///
+/// Rule 7 for the catalog: one unreadable file is a hole the report names, not a reason to
+/// leave the whole tree un-ingested. The report is deduplicated on the absolute path — a
+/// cold copy and the watched symlink that points at it are two views of the same unreadable
+/// bytes, and naming it twice would read as two broken files (issue #53).
+///
+/// Only a read failure is a per-file failure. Anything else is not something this pass can
+/// carry on from, so it still propagates and aborts the sync.
+fn record_unreadable(
+    observation: &mut Observation,
+    seen: &mut BTreeSet<PathBuf>,
+    absolute: &Path,
+    display: &Path,
+    error: CatalogError,
+) -> Result<(), CatalogError> {
+    match error {
+        CatalogError::Checksum { source, .. } => {
+            if seen.insert(canonical(absolute)) {
+                observation.differences.push(Difference {
+                    kind: DifferenceKind::Unreadable,
+                    path: display.to_path_buf(),
+                    detail: source.to_string(),
+                });
+            }
+            Ok(())
+        }
+        other => Err(other),
+    }
 }
 
 fn list(root: &Path) -> Result<Vec<disk_management::FileEntry>, CatalogError> {
@@ -2392,5 +2550,41 @@ mod tests {
         assert!(roots.contains(&canonical(&watch)), "roots: {roots:?}");
         assert!(roots.contains(&canonical(&cold_a)), "roots: {roots:?}");
         assert!(roots.contains(&canonical(&cold_b)), "roots: {roots:?}");
+    }
+
+    #[test]
+    fn a_sync_reports_an_unreadable_file_instead_of_failing() {
+        // The API half of #53: `sync` returns a report rather than an `Err` when a file
+        // cannot be read, and the report carries the path and the error. The end-to-end
+        // tests turn the report into the exit-code contract; this pins the shape.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold = tmp.path().join("cold");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold).unwrap();
+        fs::write(watch.join("readable.bin"), b"read me").unwrap();
+        fs::write(watch.join("locked.bin"), b"cannot read me").unwrap();
+        fs::set_permissions(watch.join("locked.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        let report = catalog
+            .sync(&watch, std::slice::from_ref(&cold))
+            .expect("an unreadable file must not fail the sync");
+        let unreadable: Vec<&Difference> = report
+            .differences
+            .iter()
+            .filter(|difference| difference.kind == DifferenceKind::Unreadable)
+            .collect();
+        assert_eq!(unreadable.len(), 1, "{:?}", report.differences);
+        assert_eq!(unreadable[0].path, PathBuf::from("locked.bin"));
+        assert!(
+            !unreadable[0].detail.is_empty(),
+            "the report must carry the error"
+        );
+
+        // The rest of the tree is in; nothing was inferred about the file that failed.
+        assert!(catalog.object_for_path("readable.bin").unwrap().is_some());
+        assert!(catalog.object_for_path("locked.bin").unwrap().is_none());
     }
 }
