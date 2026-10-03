@@ -12,7 +12,9 @@ filetime = "0.2"
 fs4 = "0.13"
 globset = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

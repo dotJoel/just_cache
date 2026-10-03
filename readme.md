@@ -80,12 +80,14 @@ LAN peers, cloud object storage and offline volumes — is not implemented yet. 
 
 ## Configuration
 
-Every option is a flag; there is no config file and nothing is hardcoded.
+Every option is a flag, and every tier is optional: with no `tiers.toml` a destination
+root's path is its own tier name, exactly as it always was. Nothing is hardcoded.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--watch <DIR>` | *required* | Tree to watch. Walked recursively. |
 | `--dest <DIR>` | *required* | Cold root, fastest tier first. Repeat for each slower disk. Must already exist. |
+| `--tiers <FILE>` | `tiers.toml` beside the watch root | Tier configuration: names each tier and describes it (see below). The default is read only when it already exists — never created. |
 | `--include <GLOB>` | *(whole tree)* | Only manage paths matching this glob. Repeatable. |
 | `--exclude <GLOB>` | *(nothing)* | Never manage paths matching this glob. Repeatable; wins over `--include`. |
 | `--min-size <SIZE>` | `0` | Ignore files smaller than this (e.g. `1MiB`). |
@@ -101,6 +103,40 @@ Every option is a flag; there is no config file and nothing is hardcoded.
 | `--dry-run` | | Report the plan, touch nothing. |
 | `-v` / `--verbose` | | Show every file considered, including why it was left alone. |
 | `-q` / `--quiet` | | Only problems. |
+
+### Tiers: naming the disks
+
+A tier is *configured*, not discovered (`docs/design.md` §2). `tiers.toml` gives each
+storage place a name and describes it by the driver that serves it, the latency a read
+pays, whether it survives a reboot, its durability floor, and what it costs:
+
+```toml
+[tiers.ssd]
+kind = "fs"
+path = "/mnt/nvme-pool"
+volatility = "persistent"
+recall = "ms"
+copies = 1
+
+[tiers.hdd]
+kind = "fs"
+path = "/mnt/hdd-pool"
+volatility = "persistent"
+recall = "s"
+copies = 2
+cost = "$0.02"
+```
+
+`locate` and `audit` then speak in those names, and `locate` states a copy's `recall`
+class even though nothing acts on it yet. A `volatile` tier (`recall = "us"`, for a RAM
+or SSD cache) is **refused as a `--dest`**: §2.1 — anything volatile is a mirror, never a
+home. `catalog sync` records each configured tier's `copies` as its floor.
+
+The default file lives beside the watch root and is read only when it is already there —
+a command never creates it. An explicitly named `--tiers` file is different: if it is
+missing or malformed the command refuses to run, naming the line it broke on, rather than
+silently falling back to path-as-tier-name. With no file the tool behaves exactly as
+before: a destination root's path is its own tier name.
 
 ### Scope: what this tool is allowed to touch
 
@@ -478,10 +514,11 @@ just_cache locate 8a623e5d \
 
 A query of at least eight hex characters is read as a digest prefix and matched against
 object ids; anything else is read as a name. `--json` reports which reading (`kind`) it
-chose. The answer names every copy and its tier, marks the tier of record (`[PRIMARY]`),
-and reports the object's state (`present` / `offloaded` / `restoring`); an offloaded copy
-is called out as needing its tier mounted to read. A prefix that matches several objects
-lists them all — never a guess at which one was meant.
+chose. The answer names every copy and its tier — by its configured name and recall class
+when a `tiers.toml` is present (see [Tiers](#tiers-naming-the-disks)) — marks the tier of
+record (`[PRIMARY]`), and reports the object's state (`present` / `offloaded` /
+`restoring`); an offloaded copy is called out as needing its tier mounted to read. A
+prefix that matches several objects lists them all — never a guess at which one was meant.
 
 Exit codes: `0` found, `1` nothing found (an answer, not an error), `2` a missing or
 unreadable catalog.

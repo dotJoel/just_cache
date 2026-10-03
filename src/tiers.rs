@@ -1,0 +1,537 @@
+//! `tiers.toml`: the configured description of every tier of storage.
+//!
+//! A tier in `docs/design.md` §2 is *configured*, not discovered: a place where bytes
+//! live, described by the driver that moves them (`kind`), the latency class a read pays
+//! (`recall`), whether it survives a reboot (`volatility`), the durability floor within it
+//! (`copies`), and what it costs (`cost`). The mover's filesystem roots are one driver's
+//! view of that; this module is the config half — it gives those roots names, and answers
+//! what class of tier a root is, so commands can speak in tier names instead of raw paths.
+//!
+//! ## Open-if-present, never created
+//!
+//! The default file lives beside the watch root. It is consulted only when it is already
+//! there: a sweep must never create anything in the watched tree it was not asked to
+//! (invariant 9), and a config conjured empty would answer "no tiers" for a tree whose
+//! operator meant something. An explicitly named `--tiers` file is different — the operator
+//! asked for *that* file, so a missing or malformed one is a usage error, never a silent
+//! fallback to path-as-tier-name. Every malformed-config error names the line, because a
+//! config error you cannot locate is indistinguishable from a tool that ignored you.
+//!
+//! ## Volatile tiers are mirrors, never homes
+//!
+//! §2.1 is explicit: anything volatile is a read cache in front of a durable tier, never
+//! the place a file lives. [`TierSet`] carries the volatility so the CLI can refuse a
+//! volatile tier as a `--dest` root (a destination is a home) and as a policy target;
+//! everything else — treating a volatile tier as a copy location, a floor, a scrub source
+//! — is later work, and named as out of scope rather than half-built here.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use thiserror::Error;
+
+/// The default file name, beside the watch root.
+pub const TIERS_FILE_NAME: &str = "tiers.toml";
+
+/// Whether a tier survives a reboot and a disk swap. §2.1: only a `persistent` tier can be
+/// a file's home; a `volatile` one is a promotion target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Volatility {
+    Persistent,
+    Volatile,
+}
+
+impl Volatility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Volatility::Persistent => "persistent",
+            Volatility::Volatile => "volatile",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "persistent" => Some(Volatility::Persistent),
+            "volatile" => Some(Volatility::Volatile),
+            _ => None,
+        }
+    }
+}
+
+/// The recall-latency class of a tier: how long serving one read takes. Ordered from
+/// fastest to slowest, so a policy can compare two tiers without a lookup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Recall {
+    Us,
+    Ms,
+    S,
+    Min,
+    Hours,
+}
+
+impl Recall {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Recall::Us => "us",
+            Recall::Ms => "ms",
+            Recall::S => "s",
+            Recall::Min => "min",
+            Recall::Hours => "hours",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "us" => Some(Recall::Us),
+            "ms" => Some(Recall::Ms),
+            "s" => Some(Recall::S),
+            "min" => Some(Recall::Min),
+            "hours" => Some(Recall::Hours),
+            _ => None,
+        }
+    }
+}
+
+/// One configured tier: §2's fields, with the name it was declared under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier {
+    /// The table key: `[tiers.ssd]` gives the name `ssd`. This is what commands print.
+    pub name: String,
+    /// Which transport driver serves this tier (`fs`, later `object`/`offline`/`peer`).
+    pub kind: String,
+    /// The filesystem root this tier's bytes sit under.
+    pub path: PathBuf,
+    pub volatility: Volatility,
+    pub recall: Recall,
+    /// Durability floor within the tier (§6): the copy count the engine maintains.
+    pub copies: usize,
+    /// Optional cost model ($/GB-month, a W-idle figure, …), kept as written. Nothing
+    /// acts on it yet — placement decisions are P4 — but it is part of the tier's honest
+    /// description and printing it is how a reader checks it was parsed.
+    pub cost: Option<String>,
+}
+
+impl Tier {
+    /// True when this tier is a home in the §2.1 sense: a destination root a file may
+    /// actually live on.
+    pub fn is_home(&self) -> bool {
+        self.volatility == Volatility::Persistent
+    }
+}
+
+/// Why a tier config could not be read.
+#[derive(Debug, Error)]
+pub enum TiersError {
+    #[error("cannot read the tier config at {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// An explicitly named file that is not there. Never a fallback: the operator asked
+    /// for this file, and silently answering from paths instead would answer a different
+    /// question.
+    #[error("--tiers {path} does not exist")]
+    Missing { path: PathBuf },
+    /// A syntax or type error. `toml`'s own rendering names the line and column, so the
+    /// message is passed through rather than replaced with a vaguer one.
+    #[error("malformed tier config {path}: {source}")]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    /// A syntactically valid file that says something impossible. The detail begins with
+    /// `line N` when the offending field's span is known.
+    #[error("invalid tier config {path}: {detail}")]
+    Invalid { path: PathBuf, detail: String },
+}
+
+/// A parsed `tiers.toml`: every configured tier, in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TierSet {
+    tiers: Vec<Tier>,
+}
+
+impl TierSet {
+    /// The default file beside a watch root.
+    pub fn default_path(watch: &Path) -> PathBuf {
+        watch.join(TIERS_FILE_NAME)
+    }
+
+    /// Read and parse an explicitly named config. A missing file is an error.
+    pub fn load(path: &Path) -> Result<TierSet, TiersError> {
+        let text = fs::read_to_string(path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                TiersError::Missing {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                TiersError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+        TierSet::parse(&text, path)
+    }
+
+    /// Read the default config beside `dir`, or `None` when it is not there. This is the
+    /// open-if-present path: it never creates the file, and a file that *is* there but is
+    /// malformed is still an error (a broken config is not the same as no config).
+    pub fn load_beside(dir: &Path) -> Result<Option<TierSet>, TiersError> {
+        let path = dir.join(TIERS_FILE_NAME);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        TierSet::load(&path).map(Some)
+    }
+
+    /// Parse the TOML text. Split out from [`load`] so the error paths are unit-testable
+    /// without a filesystem.
+    pub fn parse(text: &str, path: &Path) -> Result<TierSet, TiersError> {
+        let raw: RawFile = toml::from_str(text).map_err(|source| TiersError::Malformed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let mut tiers = Vec::with_capacity(raw.tiers.len());
+        for (name, tier) in raw.tiers {
+            tiers.push(tier.into_tier(&name, text, path)?);
+        }
+        Ok(TierSet { tiers })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tiers.is_empty()
+    }
+
+    pub fn tiers(&self) -> &[Tier] {
+        &self.tiers
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Tier> {
+        self.tiers.iter().find(|tier| tier.name == name)
+    }
+
+    /// The configured tier whose `path` is `root`, if any. Both sides are canonicalized
+    /// when they can be (a `--dest` root exists by the time this is asked; a tier's disk
+    /// may be unmounted, in which case the lexical path is the best answer available).
+    pub fn tier_for_root(&self, root: &Path) -> Option<&Tier> {
+        let wanted = canonical_or(root);
+        self.tiers
+            .iter()
+            .find(|tier| canonical_or(&tier.path) == wanted)
+    }
+
+    /// The name to print for a tier root: the configured name when the root is a tier,
+    /// and the raw path otherwise. With no config this is exactly the path-as-tier-name
+    /// behaviour the tool had before tiers existed.
+    pub fn name_for_root(&self, root: &Path) -> String {
+        match self.tier_for_root(root) {
+            Some(tier) => tier.name.clone(),
+            None => root.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// The name to print for a *recorded* tier string (a catalog `location.tier`, which is
+    /// a canonical path). The `file://`-free spelling is the same comparison as
+    /// [`name_for_root`]; a string that is not a configured path is returned unchanged.
+    pub fn name_for_tier_key(&self, key: &str) -> String {
+        match self.tier_for_root(Path::new(key)) {
+            Some(tier) => tier.name.clone(),
+            None => key.to_string(),
+        }
+    }
+
+    /// The recall class recorded for a tier key, if it is a configured tier.
+    pub fn recall_for_tier_key(&self, key: &str) -> Option<Recall> {
+        self.tier_for_root(Path::new(key)).map(|tier| tier.recall)
+    }
+
+    /// Every tier configured as volatile. The CLI refuses these as destination roots; this
+    /// is the set that refusal is made of.
+    pub fn volatile(&self) -> impl Iterator<Item = &Tier> {
+        self.tiers.iter().filter(|tier| !tier.is_home())
+    }
+
+    /// The readable description of the configured tiers, for `locate`/`audit` output.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!("tiers: {} configured", self.tiers.len())];
+        for tier in &self.tiers {
+            lines.push(format!("  {}", tier.describe()));
+        }
+        lines
+    }
+}
+
+impl Tier {
+    /// One line: name, driver, root, volatility, recall, floor, and cost when given.
+    pub fn describe(&self) -> String {
+        let mut line = format!(
+            "{}: kind={} path={} volatility={} recall={} copies={}",
+            self.name,
+            self.kind,
+            self.path.display(),
+            self.volatility.as_str(),
+            self.recall.as_str(),
+            self.copies
+        );
+        if let Some(cost) = &self.cost {
+            line.push_str(&format!(" cost={cost}"));
+        }
+        line
+    }
+}
+
+/// The raw serde shape. Every scalar is wrapped in `toml::Spanned` so a semantic error
+/// (an unknown `volatility`, a `copies` of zero) can name the line it sits on — a config
+/// error that does not say where it is costs the reader the search that the file's whole
+/// point is to avoid.
+#[derive(Debug, Deserialize)]
+struct RawFile {
+    tiers: BTreeMap<String, RawTier>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTier {
+    kind: toml::Spanned<String>,
+    path: toml::Spanned<String>,
+    volatility: toml::Spanned<String>,
+    recall: toml::Spanned<String>,
+    copies: toml::Spanned<i64>,
+    #[serde(default)]
+    cost: Option<toml::Spanned<toml::Value>>,
+}
+
+impl RawTier {
+    fn into_tier(self, name: &str, text: &str, file: &Path) -> Result<Tier, TiersError> {
+        let invalid = |detail: String| TiersError::Invalid {
+            path: file.to_path_buf(),
+            detail,
+        };
+
+        let kind = self.kind.get_ref().trim().to_string();
+        if kind.is_empty() {
+            return Err(invalid(format!(
+                "line {}: tier `{name}` has an empty `kind`",
+                line_at(text, self.kind.span().start)
+            )));
+        }
+
+        let raw_path = self.path.get_ref().trim();
+        if raw_path.is_empty() {
+            return Err(invalid(format!(
+                "line {}: tier `{name}` has an empty `path`",
+                line_at(text, self.path.span().start)
+            )));
+        }
+        let path = PathBuf::from(raw_path);
+        if !path.is_absolute() {
+            return Err(invalid(format!(
+                "line {}: tier `{name}` path `{raw_path}` must be absolute; catalogue roots \
+                 are absolute paths",
+                line_at(text, self.path.span().start)
+            )));
+        }
+
+        let volatility = Volatility::parse(self.volatility.get_ref()).ok_or_else(|| {
+            invalid(format!(
+                "line {}: tier `{name}` volatility `{}` must be `persistent` or `volatile`",
+                line_at(text, self.volatility.span().start),
+                self.volatility.get_ref()
+            ))
+        })?;
+
+        let recall = Recall::parse(self.recall.get_ref()).ok_or_else(|| {
+            invalid(format!(
+                "line {}: tier `{name}` recall `{}` must be one of us, ms, s, min, hours",
+                line_at(text, self.recall.span().start),
+                self.recall.get_ref()
+            ))
+        })?;
+
+        let copies = *self.copies.get_ref();
+        if copies < 1 {
+            return Err(invalid(format!(
+                "line {}: tier `{name}` copies must be at least 1, got {copies}",
+                line_at(text, self.copies.span().start)
+            )));
+        }
+
+        let cost = self.cost.map(|cost| match cost.into_inner() {
+            // A quoted string is the value, not its TOML spelling: `"$0.02"` means the
+            // string `$0.02`, and printing the quotes would misreport the config.
+            toml::Value::String(text) => text,
+            other => other.to_string(),
+        });
+        let cost = cost.filter(|cost| !cost.trim().is_empty());
+
+        Ok(Tier {
+            name: name.to_string(),
+            kind,
+            path,
+            volatility,
+            recall,
+            copies: copies as usize,
+            cost,
+        })
+    }
+}
+
+/// Canonicalize when the path exists, and fall back to the lexical path when it does not
+/// (an unmounted tier's disk is exactly when the config still has to mean something).
+fn canonical_or(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The 1-based line number holding a byte offset. `toml`'s spans are byte offsets into the
+/// text that was parsed, so counting newlines is exact.
+fn line_at(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn sample() -> &'static str {
+        r#"
+[tiers.ssd]
+kind = "fs"
+path = "/mnt/nvme-pool"
+volatility = "persistent"
+recall = "ms"
+copies = 1
+
+[tiers.hdd]
+kind = "fs"
+path = "/mnt/hdd-pool"
+volatility = "persistent"
+recall = "s"
+copies = 2
+cost = "$0.02"
+"#
+    }
+
+    #[test]
+    fn two_tiers_parse_with_every_field() {
+        let dir = tmp();
+        let set = TierSet::parse(sample(), &dir.path().join("tiers.toml")).unwrap();
+        assert_eq!(set.tiers().len(), 2);
+        let ssd = set.get("ssd").expect("ssd");
+        assert_eq!(ssd.kind, "fs");
+        assert_eq!(ssd.path, PathBuf::from("/mnt/nvme-pool"));
+        assert_eq!(ssd.volatility, Volatility::Persistent);
+        assert_eq!(ssd.recall, Recall::Ms);
+        assert_eq!(ssd.copies, 1);
+        assert_eq!(ssd.cost, None);
+        let hdd = set.get("hdd").expect("hdd");
+        assert_eq!(hdd.recall, Recall::S);
+        assert_eq!(hdd.copies, 2);
+        assert_eq!(hdd.cost.as_deref(), Some("$0.02"));
+    }
+
+    #[test]
+    fn a_volatile_tier_parses_and_is_not_a_home() {
+        let dir = tmp();
+        let text = r#"
+[tiers.ram]
+kind = "fs"
+path = "/mnt/ramdisk"
+volatility = "volatile"
+recall = "us"
+copies = 1
+"#;
+        let set = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap();
+        let ram = set.get("ram").unwrap();
+        assert_eq!(ram.volatility, Volatility::Volatile);
+        assert!(!ram.is_home());
+        assert_eq!(set.volatile().count(), 1);
+    }
+
+    /// A malformed config names the line. This is the acceptance criterion made concrete:
+    /// a syntax error the reader can go straight to.
+    #[test]
+    fn a_syntax_error_names_its_line() {
+        let dir = tmp();
+        // `copies` is unclosed on line 6.
+        let text = "[tiers.ssd]\nkind = \"fs\"\npath = \"/mnt/ssd\"\nvolatility = \"persistent\"\nrecall = \"ms\"\ncopies = \n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("line 6"), "{rendered}");
+    }
+
+    /// A semantically impossible value names its line too — a bad enum is not a syntax
+    /// error, and the search it would otherwise cost is the whole reason for the span.
+    #[test]
+    fn a_bad_enum_names_its_line() {
+        let dir = tmp();
+        let text = "[tiers.ssd]\nkind = \"fs\"\npath = \"/mnt/ssd\"\nvolatility = \"sometimes\"\nrecall = \"ms\"\ncopies = 1\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("line 4"), "{rendered}");
+        assert!(rendered.contains("volatility"), "{rendered}");
+    }
+
+    #[test]
+    fn a_zero_copy_floor_is_refused_by_line() {
+        let dir = tmp();
+        let text = "[tiers.ssd]\nkind = \"fs\"\npath = \"/mnt/ssd\"\nvolatility = \"persistent\"\nrecall = \"ms\"\ncopies = 0\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        assert!(err.to_string().contains("line 6"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_by_line() {
+        let dir = tmp();
+        let text = "[tiers.ssd]\nkind = \"fs\"\npath = \"nvme-pool\"\nvolatility = \"persistent\"\nrecall = \"ms\"\ncopies = 1\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        assert!(err.to_string().contains("line 3"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_missing_file_is_an_error_not_an_empty_set() {
+        let dir = tmp();
+        let err = TierSet::load(&dir.path().join("nope.toml")).unwrap_err();
+        assert!(matches!(err, TiersError::Missing { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_default_file_that_is_absent_is_no_config() {
+        let dir = tmp();
+        assert!(TierSet::load_beside(dir.path()).unwrap().is_none());
+        assert!(!TierSet::default_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_tier_root_is_named_and_falls_back_to_its_path() {
+        let dir = tmp();
+        let root = dir.path().join("cold");
+        fs::create_dir_all(&root).unwrap();
+        let text = format!(
+            "[tiers.cold-disk]\nkind = \"fs\"\npath = \"{}\"\nvolatility = \"persistent\"\nrecall = \"ms\"\ncopies = 1\n",
+            root.display()
+        );
+        let set = TierSet::parse(&text, &dir.path().join("tiers.toml")).unwrap();
+        assert_eq!(set.name_for_root(&root), "cold-disk");
+        assert_eq!(
+            set.recall_for_tier_key(&root.to_string_lossy()),
+            Some(Recall::Ms)
+        );
+        // A root the config does not name keeps the path-as-tier-name behaviour.
+        let other = dir.path().join("elsewhere");
+        assert_eq!(set.name_for_root(&other), other.to_string_lossy());
+        assert_eq!(set.recall_for_tier_key("/nowhere"), None);
+    }
+}

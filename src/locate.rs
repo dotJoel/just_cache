@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::catalog::{Catalog, CatalogError, ObjectRecord};
+use crate::tiers::TierSet;
 
 /// Exit code for a query that matched at least one object.
 pub const EXIT_FOUND: u8 = 0;
@@ -76,6 +77,10 @@ pub struct LocateRequest<'a> {
     /// The catalog file. It must exist: `locate` never creates one, because a catalog
     /// conjured empty at query time would answer "nothing found" for a tree that is fine.
     pub catalog: &'a Path,
+    /// The configured tiers, when there are any. Names the copy's tier and states its
+    /// recall class. Nothing acts on the class yet — naming it is the point, so a caller
+    /// can see the latency a read would pay before attempting one.
+    pub tiers: Option<&'a TierSet>,
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +99,9 @@ pub struct LocateReport {
     pub kind: QueryKind,
     /// Every object that matched. Empty is a real result, not an error.
     pub objects: Vec<ObjectRecord>,
+    /// The configured tiers the copies are named against, when there are any. Absent
+    /// means path-as-tier-name, exactly as before tiers existed.
+    pub tiers: Option<TierSet>,
 }
 
 impl LocateReport {
@@ -139,14 +147,14 @@ impl LocateReport {
             }
             for location in &object.locations {
                 lines.push(format!(
-                    "  copy: {}{} (tier {})",
+                    "  copy: {}{} ({})",
                     location.storage_key,
                     if location.is_primary {
                         " [PRIMARY]"
                     } else {
                         ""
                     },
-                    location.tier
+                    tier_label(self.tiers.as_ref(), &location.tier)
                 ));
             }
             lines.push(format!("  lifecycle: {}", describe_lifecycle(object)));
@@ -184,8 +192,10 @@ impl LocateReport {
                     .locations
                     .iter()
                     .map(|location| format!(
-                        "{{\"tier\":{},\"storage_key\":{},\"is_primary\":{}}}",
+                        "{{\"tier\":{},\"tier_name\":{},\"recall\":{},\"storage_key\":{},\"is_primary\":{}}}",
                         json_string(&location.tier),
+                        tier_name_json(self.tiers.as_ref(), &location.tier),
+                        recall_json(self.tiers.as_ref(), &location.tier),
                         json_string(&location.storage_key),
                         location.is_primary
                     ))
@@ -193,8 +203,10 @@ impl LocateReport {
                     .join(","),
                 primary
                     .map(|location| format!(
-                        "{{\"tier\":{},\"storage_key\":{}}}",
+                        "{{\"tier\":{},\"tier_name\":{},\"recall\":{},\"storage_key\":{}}}",
                         json_string(&location.tier),
+                        tier_name_json(self.tiers.as_ref(), &location.tier),
+                        recall_json(self.tiers.as_ref(), &location.tier),
                         json_string(&location.storage_key)
                     ))
                     .unwrap_or_else(|| "null".to_string()),
@@ -247,7 +259,41 @@ pub fn locate(request: &LocateRequest<'_>) -> Result<LocateReport, LocateError> 
         query: request.query.to_string(),
         kind,
         objects,
+        tiers: request.tiers.cloned(),
     })
+}
+
+/// The tier label for one copy line. With configured tiers this is the tier's name and
+/// its recall class — the whole point of the issue, and stated even though nothing acts on
+/// the class yet. With no config it is the raw path, byte-for-byte what the command said
+/// before tiers existed.
+fn tier_label(tiers: Option<&TierSet>, tier: &str) -> String {
+    match tiers.and_then(|set| set.tier_for_root(Path::new(tier))) {
+        Some(configured) => format!(
+            "tier {}, recall {}",
+            configured.name,
+            configured.recall.as_str()
+        ),
+        None => format!("tier {tier}"),
+    }
+}
+
+/// The JSON tier name for a recorded tier key: the configured name when there is one,
+/// otherwise the recorded path.
+fn tier_name_json(tiers: Option<&TierSet>, tier: &str) -> String {
+    match tiers {
+        Some(set) => json_string(&set.name_for_tier_key(tier)),
+        None => json_string(tier),
+    }
+}
+
+/// The JSON recall class for a recorded tier key, or `null` when the tier is unconfigured
+/// (an unknown latency is not a latency of zero).
+fn recall_json(tiers: Option<&TierSet>, tier: &str) -> String {
+    match tiers.and_then(|set| set.recall_for_tier_key(tier)) {
+        Some(recall) => json_string(recall.as_str()),
+        None => "null".to_string(),
+    }
 }
 
 fn describe_lifecycle(object: &ObjectRecord) -> String {
@@ -386,6 +432,7 @@ mod tests {
                     },
                 ],
             }],
+            tiers: None,
         };
         let json = report.to_json();
         assert!(json.contains("\"kind\":\"digest-prefix\""), "{json}");
@@ -405,6 +452,7 @@ mod tests {
             query: "nope.bin".to_string(),
             kind: QueryKind::Path,
             objects: Vec::new(),
+            tiers: None,
         };
         assert!(!report.found());
         assert_eq!(report.exit_code(), EXIT_NOT_FOUND);

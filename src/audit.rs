@@ -41,6 +41,7 @@ use thiserror::Error;
 use crate::catalog::{resolve_location_path, Catalog, CatalogError};
 use crate::digest;
 use crate::disk_management::{self, DiskError};
+use crate::tiers::TierSet;
 
 /// How many examples the readable summary lists by default.
 pub const DEFAULT_EXAMPLES: usize = 10;
@@ -297,6 +298,21 @@ impl Finding {
     /// catalog-backed verdicts carry (a tier/key, an expected digest) so a human can act
     /// without opening a shell.
     pub fn describe(&self) -> String {
+        self.describe_with(None)
+    }
+
+    /// As [`describe`](Finding::describe), but a configured tier is printed by name
+    /// instead of by path — the point of `tiers.toml`, applied to the findings that name a
+    /// tier. With no config every tier string is exactly what it was before.
+    pub fn describe_with(&self, tiers: Option<&TierSet>) -> String {
+        let tier_name = |tier: &str| match tiers {
+            Some(set) => set.name_for_tier_key(tier),
+            None => tier.to_string(),
+        };
+        let root_name = |path: &Path| match tiers {
+            Some(set) => set.name_for_root(path),
+            None => path.display().to_string(),
+        };
         let mut line = format!("{}: {}", self.verdict.kind().as_str(), self.path.display());
         match &self.verdict {
             Verdict::DanglingSymlink { target }
@@ -309,8 +325,9 @@ impl Finding {
             }
             Verdict::MissingCopy { tier, key, primary } => {
                 line.push_str(&format!(
-                    " ({} copy {key} on {tier} is gone)",
-                    if *primary { "primary" } else { "replica" }
+                    " ({} copy {key} on {} is gone)",
+                    if *primary { "primary" } else { "replica" },
+                    tier_name(tier)
                 ));
             }
             Verdict::ChecksumMismatch {
@@ -320,7 +337,8 @@ impl Finding {
                 found,
             } => {
                 line.push_str(&format!(
-                    " (recorded {expected}, found {found} at {tier}/{key})"
+                    " (recorded {expected}, found {found} at {}/{key})",
+                    tier_name(tier)
                 ));
             }
             Verdict::CopyFloor { object, copies } => {
@@ -332,7 +350,7 @@ impl Finding {
                 let list = |paths: &[PathBuf]| {
                     paths
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|path| root_name(path))
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
@@ -347,7 +365,8 @@ impl Finding {
             }
             Verdict::MalformedCatalog { tier, key, detail } => {
                 line.push_str(&format!(
-                    " (catalog row {tier}/{key}: {detail}; no filesystem operation)"
+                    " (catalog row {}/{key}: {detail}; no filesystem operation)",
+                    tier_name(tier)
                 ));
             }
             Verdict::Healthy => {}
@@ -394,11 +413,22 @@ pub struct AuditReport {
     pub healthy: usize,
     /// Only the non-healthy paths, sorted by path then kind.
     pub findings: Vec<Finding>,
+    /// The configured tiers (`tiers.toml`), when the invocation supplied one. It names the
+    /// tiers in the output and lets a finding print a tier's name instead of its path.
+    /// `None` is exactly the pre-tiers behaviour: a tier's path is its own name.
+    pub tiers: Option<TierSet>,
 }
 
 impl AuditReport {
     pub fn has_findings(&self) -> bool {
         !self.findings.is_empty()
+    }
+
+    /// Attach the configured tiers after the report is built. `None` leaves the report
+    /// exactly as it was before tiers existed — a tier's path is its own name.
+    pub fn with_tiers(mut self, tiers: Option<TierSet>) -> Self {
+        self.tiers = tiers;
+        self
     }
 
     pub fn count(&self, kind: VerdictKind) -> usize {
@@ -429,6 +459,13 @@ impl AuditReport {
         };
         let mut lines = vec![format!("audit: {answered_from}")];
         lines.push(format!("  healthy: {}", self.healthy));
+        // Configured tiers are named once, up front, so a finding below can refer to a
+        // tier by name and the reader has the key to what that name means.
+        if let Some(tiers) = &self.tiers {
+            if !tiers.is_empty() {
+                lines.extend(tiers.summary_lines());
+            }
+        }
         for kind in VerdictKind::problems() {
             lines.push(format!("  {}: {}", kind.as_str(), self.count(kind)));
         }
@@ -442,7 +479,7 @@ impl AuditReport {
             self.findings.len()
         ));
         for finding in self.findings.iter().take(shown) {
-            lines.push(format!("  {}", finding.describe()));
+            lines.push(format!("  {}", finding.describe_with(self.tiers.as_ref())));
         }
         if shown < self.findings.len() {
             lines.push(format!(
@@ -548,12 +585,42 @@ impl AuditReport {
             AuditSource::Walk => "null".to_string(),
         };
 
+        // The configured tiers, as a machine-readable list. `null` when none was given,
+        // so a consumer can tell "no config" from "an empty config" the same way the CLI
+        // does.
+        let tiers_json = match &self.tiers {
+            None => "null".to_string(),
+            Some(tiers) => {
+                let items: Vec<String> = tiers
+                    .tiers()
+                    .iter()
+                    .map(|tier| {
+                        format!(
+                            "{{\"name\":{},\"kind\":{},\"path\":{},\"volatility\":{},\"recall\":{},\"copies\":{},\"cost\":{}}}",
+                            json_string(&tier.name),
+                            json_string(&tier.kind),
+                            json_string(&tier.path.to_string_lossy()),
+                            json_string(tier.volatility.as_str()),
+                            json_string(tier.recall.as_str()),
+                            tier.copies,
+                            tier.cost
+                                .as_ref()
+                                .map(|cost| json_string(cost))
+                                .unwrap_or_else(|| "null".to_string())
+                        )
+                    })
+                    .collect();
+                format!("[{}]", items.join(","))
+            }
+        };
+
         format!(
-            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"scanned\":{},\"healthy\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
+            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"tiers\":{},\"scanned\":{},\"healthy\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
             json_string(&self.watch.to_string_lossy()),
             dest_json.join(","),
             json_string(self.source.as_str()),
             catalog_json,
+            tiers_json,
             self.scanned,
             self.healthy,
             findings.join(","),
@@ -700,6 +767,7 @@ pub fn audit_with_copies(
         scanned: relatives.len(),
         healthy,
         findings,
+        tiers: None,
     })
 }
 
@@ -1038,6 +1106,7 @@ pub fn catalog_audit(
         scanned: scanned.len(),
         healthy,
         findings,
+        tiers: None,
     })
 }
 
@@ -1473,6 +1542,7 @@ mod tests {
             source: AuditSource::Walk,
             scanned: 10,
             healthy: 6,
+            tiers: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/watch/a.bin"),
@@ -1524,6 +1594,7 @@ mod tests {
             source: AuditSource::Walk,
             scanned: 1,
             healthy: 0,
+            tiers: None,
             findings: vec![Finding {
                 path: PathBuf::from("/watch/a)weird\"name"),
                 relative: PathBuf::from("a)weird\"name"),
@@ -1569,6 +1640,7 @@ mod tests {
             },
             scanned: 3,
             healthy: 0,
+            tiers: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/cold/a.bin"),
