@@ -620,6 +620,21 @@ record. Proven by `tests/journal.rs` — both links planted with the target asse
 the refusal named on stderr, and the created file's mode asserted under `umask 0` — and by
 unit tests in `src/journal.rs` that fail when either guard is reverted.
 
+Closed by #78: `migrate_replicated` now journals the destination a replicated move
+*actually retires to*, not the first destination it tried. The mover retires the source to
+the first copy whose read-back digest verified, which need not be the first `--dest`: an
+unavailable or full first destination is skipped and a later one verifies. The intent
+written before the copy named that first destination, so a crash between removing the
+source and creating the symlink made `journal::repair` read a path holding no copy and
+report DATA LOST while verified copies existed. The verified destination is now recorded
+again after replication and before the source is removed, and if that record cannot be
+written the source is kept rather than retired under a record recovery cannot trust. The
+report names the same verified copy. `tests/migration.rs` drives the mover with a first
+destination that is not a directory and a second that verifies, leaves the record standing
+(the watched tree is read-only so the retirement cannot finish), removes the source to
+stand in for the crash, and asserts recovery restores the name from the verified copy
+rather than reporting the data lost — the test fails when the re-record is reverted.
+
 Still open, and honestly so:
 
 - **A hard link at the journal name is not distinguishable from the real journal.** The

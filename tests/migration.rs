@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use just_cache::disk_management::{self, DiskError, FileEntry, MoveOutcome};
 use just_cache::file_movement::{self, FileOutcome, MoveContext, Policy, UsageTracker};
-use just_cache::journal::Journal;
+use just_cache::journal::{self, Journal};
 use just_cache::opened::{FileId, Guards, OpenFiles};
 use just_cache::scope::Scope;
 
@@ -700,4 +700,104 @@ fn a_file_under_an_internal_prefixed_directory_is_neither_scanned_nor_moved() {
         !cold.join(".just_cache-partial-x").exists(),
         "nothing from the prefixed subtree may reach the cold tier"
     );
+}
+
+/// A replicated move must journal the destination it will actually retire to, not the
+/// first destination it tried. `migrate_replicated` retires the source to the first
+/// destination whose copy verified; when the first destination fails and a later one
+/// verifies, a record naming the first sends recovery to a path with no copy and reports
+/// DATA LOST while verified copies exist (issue #78).
+///
+/// The watched tree is made read-only so the retirement cannot remove the source: the
+/// mover's journal record is left on disk exactly as a crash in the retire window would
+/// leave it. The source is then removed to stand in for that crash, and recovery must
+/// restore the name from the verified copy rather than report the data lost.
+#[cfg(unix)]
+#[test]
+fn a_replicated_move_journals_the_destination_it_retires_to() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let not_a_destination = tmp.path().join("cold-a-not-a-dir");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    // The first destination is not a directory at all, so replication cannot use it and
+    // the verified copy lands on the second. That is the case the journal used to name
+    // wrongly: the record described the first destination, which never held a copy.
+    fs::write(&not_a_destination, b"not a destination root").unwrap();
+    let payload = b"the bytes a crash in the retire window must not lose".to_vec();
+    fs::write(watch.join("clip.bin"), &payload).unwrap();
+
+    let entries = scan(&watch);
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let dests = vec![not_a_destination.clone(), cold.clone()];
+
+    // Read-only watched tree: the copy to `cold` still succeeds, but removing the source
+    // fails, which leaves the record the mover wrote in place for us to read.
+    fs::set_permissions(&watch, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut journal = journal_for(&tmp);
+    let report = file_movement::migrate_replicated(
+        &entries,
+        &UsageTracker::new(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &Guards::permissive(),
+            journal: &mut journal,
+        },
+        SystemTime::now(),
+        &dests,
+        1, // a floor of one: one verified copy is enough to retire the source
+        0, // no free-space floor
+    );
+    fs::set_permissions(&watch, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        report.failed(),
+        1,
+        "the retirement must have failed against the read-only tree"
+    );
+    assert_eq!(fs::read(cold.join("clip.bin")).unwrap(), payload);
+
+    // The record names the destination that actually holds a verified copy.
+    let raw = fs::read_to_string(tmp.path().join(just_cache::journal::JOURNAL_NAME)).unwrap();
+    assert!(
+        raw.contains(&cold.join("clip.bin").to_string_lossy().to_string()),
+        "the journal must name the verified copy, not the failed first destination: {raw}"
+    );
+
+    // Stand in for the crash the record exists for: the name is gone, the copy is there.
+    fs::remove_file(watch.join("clip.bin")).unwrap();
+    let report = journal::repair(&mut journal, &watch, &dests).unwrap();
+    assert_eq!(
+        report.restored(),
+        1,
+        "recovery must restore the name from the verified copy: {report:?}"
+    );
+    assert_eq!(
+        report.trouble(),
+        0,
+        "recovery must not report the data lost: {report:?}"
+    );
+
+    let restored = watch.join("clip.bin");
+    assert!(
+        fs::symlink_metadata(&restored).unwrap().is_symlink(),
+        "the name must come back as a symlink"
+    );
+    assert_eq!(fs::read(&restored).unwrap(), payload);
+    assert_eq!(
+        fs::canonicalize(&restored).unwrap(),
+        fs::canonicalize(cold.join("clip.bin")).unwrap(),
+        "the restored name must point at the copy that verified"
+    );
+    let _ = tmp;
 }
