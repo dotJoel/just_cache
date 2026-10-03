@@ -768,6 +768,18 @@ struct MountArgs {
     /// does), and one conjured empty would serve an empty namespace.
     #[arg(long, value_name = "FILE")]
     catalog: Option<PathBuf>,
+    /// What a read of an offloaded file does with the bytes it recalls: `promote` (the
+    /// default) places a verified copy on the hot tier and makes it the tier of record;
+    /// `read-through` serves the slow tier directly and places nothing. A tier whose
+    /// `recall` class is `min`/`hours` refuses inline recall either way — run
+    /// `just_cache restore <path>` for those.
+    #[arg(long, value_name = "POLICY", default_value = "promote", value_parser = parse_recall_policy)]
+    recall: just_cache::recall::RecallPolicy,
+}
+
+fn parse_recall_policy(text: &str) -> Result<just_cache::recall::RecallPolicy, String> {
+    just_cache::recall::RecallPolicy::parse(text)
+        .ok_or_else(|| format!("`{text}` is not a recall policy (promote, read-through)"))
 }
 
 /// Everything `gateway` needs.
@@ -2872,6 +2884,8 @@ fn run_mount(args: MountArgs) -> ExitCode {
         dests: args.dest.clone(),
         mountpoint: args.mountpoint.clone(),
         caches,
+        tiers,
+        recall: args.recall,
     };
     eprintln!(
         "just_cache: mounting {} at {} (Ctrl-C to unmount)",

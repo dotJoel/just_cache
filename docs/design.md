@@ -257,6 +257,16 @@ tier (`min`, `hours`) is also allowed to refuse inline recall and instead requir
 explicit `just_cache restore <path>` — the S3 "restore request" model — so that
 no application timeout ever turns into a broken read.
 
+As built (#44): `just_cache mount --recall <promote|read-through>`, **default `promote`** —
+a read-only open of an offloaded name places a verified copy on the hot tier (the watch
+root) and makes it the tier of record, so the next read is fast and the idle rule demotes
+it again when it cools. `read-through` serves the tier of record and places nothing. A
+TTL-cached copy is not offered as a recall policy: a `[[cache]]` overlay (§2.1) already is
+the TTL-shaped copy, and it sits in front of whichever file the recall settles on. A tier
+whose `tiers.toml` recall class is `min` or `hours` refuses: the open answers `EAGAIN`
+(never `ENOENT`) and the mount's stderr names the tier and the `just_cache restore <path>`
+to run. A tier with no `tiers.toml` entry has no class and is recalled.
+
 ## 5. Policy engine
 
 Rules in `policy.toml`, evaluated per file against the catalog:
@@ -1420,6 +1430,38 @@ which CI does not run either; empty directories a delete leaves on a cold tier a
 pruned; deleting from a tier that is not mounted (the vault model) and a garbage collector
 for bytes no delete reaches remain out of scope (P3).
 
+Closed by #44: a read of an offloaded object recalls it inline. `src/recall.rs`
+(`Recaller`) is the provider-agnostic half; the FUSE `open` calls it for a read-only open of
+a catalogued name, then hands the result to the cache overlay (#46) and observes the open
+(#43) exactly as before, so all three compose. **The placement is `restore`**: copy into a
+private partial, read back and hash against the recorded checksum, atomic rename over the
+mover's symlink, cold copy kept. Only then does the catalog hear about it, through
+`Catalog::record_recall`, which is handed the digest of the placed file read back *again*:
+equal to the recorded checksum, the hot row is written verified and primary and the object
+`present`; anything else (or no digest) writes the row unverified, leaves the primary and
+the state alone, and the read fails — unknown, never good. A failed recall (no copy, a copy
+that fails the checksum) names the tier and records nothing. Policy and refusal are in §4
+(default `promote`; `min`/`hours` refuse with `EAGAIN` and the `restore` instruction).
+**One copy per object**: recalls are single-flighted per object id — the first reader
+recalls, concurrent readers of the same object wait on that flight and are handed its
+result, and the leader re-plans under the flight so a recall that finished a moment earlier
+is served, not repeated. The recaller opens its own catalog connection so a long copy never
+holds the mount's lookup lock, and `Catalog::open` now sets a 10 s SQLite busy timeout so
+the two writers wait for each other instead of failing. Tests (`tests/inline_recall.rs`,
+cold root on the second filesystem): end-to-end recall (bytes served, symlink replaced,
+cold copy kept, hot row verified/primary with the real checksum, `present`, a second read
+served hot); `min` and `hours` refusals naming the tier and `restore`, with nothing placed;
+read-through placing nothing; a same-length rotten cold copy failing with the tier named and
+the object still `offloaded`; two concurrent readers placing exactly one copy (a copy hook
+holds the leader for 400 ms, so the window is a sleep, not a proof — but both tests were
+shown to fail with the single-flight and the refusal removed). Not covered: the FUSE
+handler's errno mapping runs only in the `JUST_CACHE_TEST_FUSE=1` mount test, which CI does
+not run; and the "read back again disagrees" branch of `Recaller` has no deterministic trigger
+(`restore` already refused a mismatch), so `record_recall` is tested directly with a wrong
+and a missing digest (row unverified, not primary, object `offloaded`) rather than through
+the recaller. Writes to an offloaded
+name still go through to the cold copy in place; recall is read-only opens.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
@@ -1530,10 +1572,10 @@ for bytes no delete reaches remain out of scope (P3).
   confined to the watch root**: the mount can move a hot name (the disk overlay shows it
   afterwards) but a name whose bytes are on a cold tier answers `EROFS`, because renaming the
   cold copy would leave a name the mount cannot serve and no catalog row to update. (Deletion,
-  once listed here, landed with #128: `unlink` is a catalog delete — the one row write the
-  mount makes besides access observation — see §9.) And **recall is
-  not here**: a read of an offloaded object does not pull it one tier up (§4), so the mount is
-  the lookup/list/stat/read/write/rename over copies that are present. (Access observation,
+  once listed here, landed with #128: `unlink` is a catalog delete — see §9. Recall, once
+  listed here, landed with #44: a read of an offloaded object recalls it, and the mount then
+  writes the recalled copy's `location` row, verified, plus the object's `present` state.)
+  (Access observation,
   once listed here, landed with #43: the mount writes `lifecycle.last_access`/`accesses`,
   and nothing else.)
 - **The mount's FUSE surface is deliberately incomplete, and the catalog is indexed once.**
