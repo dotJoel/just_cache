@@ -372,13 +372,10 @@ fn scrub_object(
         checks.push(check);
     }
 
-    let corrupt_indices: Vec<usize> = checks
-        .iter()
-        .enumerate()
-        .filter(|(_, check)| **check == Check::Corrupt)
-        .map(|(index, _)| index)
-        .collect();
-    if corrupt_indices.is_empty() {
+    // No corruption was read this run, so there is nothing to repair: every
+    // already-verified location stays skipped, which is the resume contract. Only a group
+    // that actually has rot needs a fallback read (issue #75).
+    if !checks.contains(&Check::Corrupt) {
         return Ok(());
     }
 
@@ -386,17 +383,53 @@ fn scrub_object(
     // directly; one verified in an earlier run is re-read before it is trusted, because the
     // whole point of a scrub is to stop trusting records and start checking bytes — and
     // rot can have reached the sibling since it was last verified.
+    //
+    // The fallback read is a *real* verdict, not a throwaway: replacing the location's
+    // entry with what the read found is what lets a candidate that has since rotted join
+    // `corrupt_indices` and be marked damaged, rather than leaving a `scrub_state` row that
+    // still claims its bytes were verified — a claim every later scrub would skip without
+    // reading (issue #75). Every already-verified candidate is tried in turn, so a clean
+    // sibling *later* in the group is still found after an earlier one has rotted; the
+    // loop carries on past a failed candidate instead of stopping at the first.
     let mut source = checks.iter().position(|check| *check == Check::Clean);
     if source.is_none() {
-        if let Some(index) = checks
-            .iter()
-            .position(|check| *check == Check::AlreadyVerified)
-        {
-            if check_location(&group[index], &expected, limiter) == Check::Clean {
-                source = Some(index);
+        for (index, target) in group.iter().enumerate() {
+            if checks[index] != Check::AlreadyVerified {
+                continue;
             }
+            let check = check_location(target, &expected, limiter);
+            // This location was counted as skipped during the first pass, but the fallback
+            // read did real work. Move it from the skip count into the actual result count.
+            report.already_verified -= 1;
+            if check == Check::Clean {
+                report.verified += 1;
+                if !dry_run {
+                    catalog.record_verified(&target.tier, &target.storage_key, &target.object)?;
+                }
+                checks[index] = Check::Clean;
+                source = Some(index);
+                break;
+            }
+            match &check {
+                Check::Missing => report.missing.push(target.path()),
+                Check::Unreadable(detail) => {
+                    report.unreadable.push((target.path(), detail.clone()))
+                }
+                // Corruption is the reason to keep looking and to mark it below; the loop
+                // simply carries on to the next already-verified candidate.
+                Check::Corrupt => {}
+                Check::Clean | Check::AlreadyVerified => unreachable!(),
+            }
+            checks[index] = check;
         }
     }
+
+    let corrupt_indices: Vec<usize> = checks
+        .iter()
+        .enumerate()
+        .filter(|(_, check)| **check == Check::Corrupt)
+        .map(|(index, _)| index)
+        .collect();
 
     match source {
         Some(source_index) => {
@@ -487,7 +520,12 @@ fn check_location(
     limiter: &mut RateLimiter,
 ) -> Check {
     let path = target.path();
-    match fs::metadata(&path) {
+    // `symlink_metadata`, not `metadata`: a symlink at a recorded location is not a copy.
+    // `metadata` follows the final component, so a link to a byte-identical target would
+    // stat as a regular file, hash clean, and be recorded verified — a name the tool
+    // vouches for while the bytes it points at can be removed without the catalog
+    // noticing, which is the invariant-6 shape.
+    match fs::symlink_metadata(&path) {
         Err(_) => Check::Missing,
         Ok(metadata) if !metadata.is_file() => {
             Check::Unreadable(format!("not a regular file: {}", path.display()))
