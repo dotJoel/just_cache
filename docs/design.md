@@ -327,6 +327,17 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
    directory on the wrong filesystem.
 5. **No silent data loss**: one file failing never stops a sweep; failures are
    reported per file; `--once` exits nonzero if anything failed.
+6. **Plan the fault seam with the feature, not after it.** A feature whose failure
+   window no test can time deterministically ships its injection seam *in the same
+   change*, never as a retrofit once the window is discovered. The shape to copy is fixed
+   by the seams in `src/faults.rs` and the tests in `tests/fault_injection.rs`: **one**
+   env var, read once per operation and inert when unset, so a production process that
+   never sets it takes no different code path; a value that is set but malformed
+   **panics** rather than silently no-oping, because a switch that does nothing on a typo
+   lets a bogus test pass green with no fault injected; and a control test that runs the
+   same operation with the variable unset and asserts the inert path. It is test-only by
+   construction rather than `#[cfg(test)]`, because integration tests drive the compiled
+   binary and the seam must therefore live in that binary.
 
 ## 8. Phases
 
@@ -956,6 +967,18 @@ grammar and the one-shot claims parsed in `src/faults.rs`, the seams it arms in
 spec (a no-op switch would let a mistyped test pass green with nothing injected), and
 `tests/fault_injection.rs` as the worked example. No command already documented in `AGENTS.md`
 is restated; the pointer works from the repo alone.
+Closed by #38: the mandate to plan a fault seam with its feature is now rule 6 of §7, stated
+as a rule rather than left implicit in the two retrofits that taught it. Both deterministic
+seams in this repository — #25's replication hook and #36's mid-copy hook — arrived *after*
+the feature they test, and each is explained in this section by what it simulates rather
+than by the shape the next seam must follow. Rule 6 makes that shape binding at design time:
+one env var read once per operation and inert when unset, a malformed value that panics
+instead of silently no-oping, a control test that asserts the inert path, and test-only by
+construction rather than `#[cfg(test)]` because the integration tests drive the compiled
+binary. It points at `src/faults.rs` and `tests/fault_injection.rs` (whose
+`the_hook_is_inert_when_unset` is the control test) as the concrete pattern, so the rule is
+actionable from the repository alone. No code changed; retrofitting the two existing seams
+is a §10 non-goal.
 
 ## 10. Non-goals
 
@@ -1028,3 +1051,9 @@ is restated; the pointer works from the repo alone.
 - **Cost-aware placement is a later phase.** §5's cost model — reporting (and optionally
   acting on) the delta of keeping each subtree where it is — is not part of #41, which
   evaluates rules that name tiers by name and does not read a tier's `cost`.
+
+- **Retrofitting the existing fault seams is not this rule's job.** Rule 6 of §7 binds the
+  *next* feature whose failure window cannot be timed from a test; the two seams that
+  already ship (#25, #36) are the pattern it points at, not a queue of rework. A seam that
+  a later change proves malformed — or inert when it should fire — is a bug in the feature
+  that owns it, fixed on its own terms rather than by reopening this rule.
