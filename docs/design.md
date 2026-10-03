@@ -1177,11 +1177,11 @@ marked damaged (`damaged-copy`), a row that could never be joined into a path
 (`malformed-catalog` — the check is lexical), and the scrub-state summary, all in a
 `no-filesystem` object in `--json` and a readable block that prints only the classes it
 could check. It states out loud the findings it *cannot* make, from
-`VerdictKind::filesystem_only`: `missing-copy`, `checksum-mismatch`, `name-vanished`,
-`unknown-path`, `unknown-version`, `dangling-symlink`, `unexpected-target`, `duplicate`,
-`orphaned-copy`, and `replica-lost` — every one needs the tree — as an `unchecked` list in
-the JSON and a `cannot be checked without the tree:` line in the summary, precisely so a
-`0` is not read as "checked and clean". `--watch`/`--dest` are labels only in this mode and
+`VerdictKind::filesystem_only`: `missing-copy`, `checksum-mismatch`, `copy-floor`,
+`name-vanished`, `unknown-path`, `unknown-version`, `dangling-symlink`, `unexpected-target`,
+`duplicate`, `orphaned-copy`, and `replica-lost` — every one needs the tree — as an `unchecked`
+list in the JSON and a `cannot be checked without the tree:` line in the summary, precisely so
+a `0` is not read as "checked and clean". `--watch`/`--dest` are labels only in this mode and
 are never touched (the path checks every other mode runs are skipped), the source is named
 `catalog-only`, exit codes are unchanged (0/1/2), and it is read-only: nothing is written to
 the catalog or the tree, and `--repair` marks for resync exactly as catalog mode does.
