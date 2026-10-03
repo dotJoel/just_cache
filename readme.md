@@ -29,16 +29,25 @@ re-added disk is missing.
 
 ## Contents
 
-[Why](#why) · [Configuration](#configuration) · [How a file is
-chosen](#how-a-file-is-chosen) · [What happens to a file](#what-happens-to-a-file) ·
-[If the machine dies mid-move](#if-the-machine-dies-mid-move) · [Example
-run](#example-run) · [Running it continuously](#running-it-continuously) · [Explaining
-one path](#explaining-one-path) · [The catalog](#the-catalog) · [Auditing
-consistency](#auditing-consistency) · [Finding an object](#finding-an-object) ·
-[Restoring a file](#restoring-a-file) · [Scrubbing for bitrot](#scrubbing-for-bitrot) ·
-[Reconciling a re-added disk](#reconciling-a-re-added-disk) · [Building and
-testing](#building-and-testing) · [How this codebase is built](#how-this-codebase-is-built) ·
-[Layout](#layout) · [Design](#design) · [License](#license)
+- 💡 [Why](#why)
+- ⚙️ [Configuration](#configuration)
+- 📊 [How a file is chosen](#how-a-file-is-chosen)
+- 📦 [What happens to a file](#what-happens-to-a-file)
+- 💥 [If the machine dies mid-move](#if-the-machine-dies-mid-move)
+- ▶️ [Example run](#example-run)
+- ⏱️ [Running it continuously](#running-it-continuously)
+- 🔍 [Explaining one path](#explaining-one-path)
+- 🗃️ [The catalog](#the-catalog)
+- 🧾 [Auditing consistency](#auditing-consistency)
+- 🧭 [Finding an object](#finding-an-object)
+- 🔙 [Restoring a file](#restoring-a-file)
+- 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
+- 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
+- 🔨 [Building and testing](#building-and-testing)
+- 👷 [How this codebase is built](#how-this-codebase-is-built)
+- 🗺️ [Layout](#layout)
+- 📐 [Design](#design)
+- 📄 [License](#license)
 
 ## Why
 
