@@ -46,6 +46,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🧾 [Auditing consistency](#auditing-consistency)
 - 🧭 [Finding an object](#finding-an-object)
 - 🔙 [Restoring a file](#restoring-a-file)
+- 📌 [Pinning a file](#pinning-a-file)
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
 - 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
 - 🗂️ [Mounting the namespace](#mounting-the-namespace)
@@ -633,11 +634,14 @@ just_cache restore /mnt/cache/media/shows/s1/ep1.mkv \
   --dest /mnt/disk-slow/media
 ```
 
-The cold copy itself is found by *state*, not by the catalog: if the path is a symlink
+The cold copy itself is found by *state*, not only by the catalog: if the path is a symlink
 that resolves, its target is the copy the mover left; otherwise — a broken link, or a
-name that vanished — the mirrored relative path under each `--dest`, in order. If several
-candidates hold **different** bytes for one name, restore refuses and names them rather
-than guessing which tier is right.
+name that vanished — the mirrored relative path under each `--dest`, in order. When a
+catalog **does** exist, its recorded locations are searched too, so a copy on a tier that
+this invocation was not given as a `--dest` is still reached — the location is resolved
+through the catalog's path guard, so a hand-edited row is refused rather than followed. If
+several candidates hold **different** bytes for one name, restore refuses and names them
+rather than guessing which tier is right.
 
 The **verification**, though, prefers the catalog when one exists — `--catalog <FILE>`,
 or the default `.just_cache-catalog.sqlite` beside the watch root that `catalog sync`
@@ -681,6 +685,57 @@ A named gap: with no catalog there is no recorded digest to check a cold copy ag
 the read-back catches a torn copy, and only a catalog can catch a corrupt one
 (`docs/design.md` §9). With a catalog, restore verifies against the recorded checksum and
 refuses a corrupt cold copy; without one, that limitation is inherent and named.
+
+## Pinning a file
+
+A `policy.toml` `pins` pattern says *this kind of file is never moved*. A **catalog pin**
+says the same about one object, with an end date: `lifecycle.pinned_until` in the catalog,
+set by hand. While a pin holds it wins over every rule — a file its rule would move stays
+put, and the sweep says the pin is why (`docs/design.md` §5).
+
+```sh
+# leave this film alone for a month, whatever the rules say
+just_cache pin shows/s1/ep1.mkv --until 30d \
+  --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+
+# or until a Unix timestamp, in seconds
+just_cache pin shows/s1/ep1.mkv --until 1800000000 --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+`--until` is a **duration from now** (`30d`, `12h`, `45m`) or a **Unix timestamp in
+seconds**; a bare number is read as the latter, so `--until 30` pins until 1970 rather
+than for 30 seconds — write `30s` for half a minute. A `pin` attaches to an object the
+catalog already knows, so `--catalog` is required and the catalog must already exist:
+`pin` never creates one (invariant 9), and a path it does not name is a finding (exit
+`1`), not a silent no-op.
+
+```sh
+# what is pinned, and for how long (live and lapsed, so a stale pin is visible)
+just_cache pin --list --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+
+# release it — idempotent: clearing a pin that is already gone is still exit 0
+just_cache unpin shows/s1/ep1.mkv --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+- **It wins over policy, then stops.** `explain <path>` reports the pin in its verdict
+  ("pinned in the catalog until … — a pin wins over policy"), in the same place a rule or
+  an exclusion is named.
+- **The expiry is visible, not implied.** A pin at or before the current time blocks
+  nothing, and both `pin --list` and `explain` print it as *expired* with the instant it
+  lapsed — an expired pin does not read the same as no pin.
+- **It is per object.** The pin lives on the object's lifecycle row, so two paths holding
+  identical bytes share one pin; that is the catalog's own notion of identity.
+- **It does not stop an explicit request.** A pin freezes policy-driven moves; `restore`
+  is an operator asking for bytes back, and still works. A pin on an already-offloaded
+  object likewise keeps the policy from moving it further down.
+
+The sweep reads pins from the default catalog beside the watch root
+(`.just_cache-catalog.sqlite`, opened only if it is already there). Without one there can
+be no pin, and the sweep behaves exactly as before.
+
+Exit codes: `pin` and `unpin` are `0` written (or `unpin` found nothing to clear), `1` the
+path is not named in the catalog, `2` bad invocation (missing catalog, unparseable
+`--until`, `--list` with a path).
 
 ## Scrubbing for bitrot
 

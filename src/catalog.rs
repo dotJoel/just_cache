@@ -379,6 +379,86 @@ impl ObjectRecord {
     }
 }
 
+/// One object protected by a `lifecycle.pinned_until` pin (`docs/design.md` §5).
+///
+/// A pin is the one lifecycle fact that is *maintained by a command* rather than inferred
+/// from the tree: an operator says "never move this until <when>" and the sweep must obey
+/// it. The expiry travels with the record so an expired pin is visible in the answer that
+/// ignores it — "a pin existed and has lapsed" is a different statement from "no pin", and
+/// collapsing them would make the expiry implied rather than shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRecord {
+    /// A namespace path naming the object, in path order. `None` for an object the catalog
+    /// pins but no live name references — reported, not hidden.
+    pub path: Option<String>,
+    /// The object id, hex-encoded.
+    pub object: String,
+    /// Unix seconds until which the pin holds. A value at or before `now` is expired.
+    pub pinned_until: i64,
+}
+
+impl PinRecord {
+    /// True while the pin still wins over policy. At the exact second it names it has
+    /// lapsed: `--until` is the last instant the pin holds, so `<= now` is expired.
+    pub fn is_live(&self, now: i64) -> bool {
+        self.pinned_until > now
+    }
+
+    /// One line for `pin --list`, saying out loud whether the pin still holds.
+    pub fn describe(&self, now: i64) -> String {
+        let where_to = self
+            .path
+            .clone()
+            .unwrap_or_else(|| format!("<unnamed object {}>", self.object));
+        if self.is_live(now) {
+            format!(
+                "  {where_to}: pinned until {} (in force)",
+                format_rfc3339(self.pinned_until)
+            )
+        } else {
+            format!(
+                "  {where_to}: pin expired {} (blocks nothing)",
+                format_rfc3339(self.pinned_until)
+            )
+        }
+    }
+}
+
+/// The catalog's pins as a sweep reads them, keyed by namespace path.
+///
+/// Loaded once per sweep, so the mover never opens the catalog per candidate. It is a
+/// *read-only snapshot*: a pin set while the sweep is running is seen by the next sweep,
+/// which is the same one-snapshot-per-pass rule every other live fact follows.
+#[derive(Debug, Default, Clone)]
+pub struct Pins {
+    until: BTreeMap<String, i64>,
+}
+
+impl Pins {
+    /// Read every pin from a catalog. Only objects with a name can be pinned by path, so an
+    /// unnamed pin is dropped here rather than silently matching nothing.
+    pub fn from_catalog(catalog: &Catalog) -> Result<Self, CatalogError> {
+        let mut until = BTreeMap::new();
+        for pin in catalog.pins()? {
+            if let Some(path) = pin.path {
+                until.insert(path, pin.pinned_until);
+            }
+        }
+        Ok(Pins { until })
+    }
+
+    /// The recorded pin expiry for `path`, live or expired, when the catalog records one.
+    /// The caller compares it with its own clock: the same value must be able to say both
+    /// "this is why it did not move" and "this lapsed, so policy applies".
+    pub fn pinned_until(&self, path: &str) -> Option<i64> {
+        self.until.get(path).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.until.is_empty()
+    }
+}
+
 /// One location to scrub, with what the catalog expects to find there.
 ///
 /// The expected checksum is the object id itself: the identity of every object is the
@@ -2139,6 +2219,84 @@ impl Catalog {
         Ok(changed > 0)
     }
 
+    /// The pin expiry recorded for the object named by `path`, when the catalog both names
+    /// the path and records a pin. `Ok(None)` covers both "not a name" and "no pin".
+    pub fn pinned_until_for_path(&self, path: &str) -> Result<Option<i64>, CatalogError> {
+        self.conn
+            .query_row(
+                "SELECT l.pinned_until FROM lifecycle l
+                   JOIN name n ON n.object_id = l.object_id
+                  WHERE n.path = ?1 AND l.pinned_until IS NOT NULL",
+                params![path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Set (or replace) the pin on the object named by `path`, to `until` unix seconds.
+    ///
+    /// Returns `Ok(false)` when the path names nothing: a pin is a fact *about a known
+    /// object*, and inventing an object to pin would let a typo look like protection. The
+    /// row is written even if this object has no `lifecycle` row yet (a hand-edited or
+    /// pre-ingest catalog), because a pin that silently did nothing would be worse than
+    /// one that fails loudly — which is why the caller checks the boolean.
+    pub fn set_pin(&self, path: &str, until: i64) -> Result<bool, CatalogError> {
+        let changed = self.conn.execute(
+            "INSERT INTO lifecycle (object_id, last_access, accesses, pinned_until, rule)
+             SELECT object_id, ?2, 0, ?3, NULL FROM name WHERE path = ?1
+             ON CONFLICT(object_id) DO UPDATE SET pinned_until = excluded.pinned_until",
+            params![path, now_seconds(), until],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clear the pin on the object named by `path`. Idempotent: clearing a pin that was
+    /// never set still succeeds, so `unpin` can be run twice or from cron without a
+    /// spurious failure. Returns `Ok(false)` only when the path names nothing.
+    pub fn clear_pin(&self, path: &str) -> Result<bool, CatalogError> {
+        let named: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM name WHERE path = ?1)",
+            params![path],
+            |row| row.get(0),
+        )?;
+        if !named {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE lifecycle SET pinned_until = NULL
+             WHERE object_id = (SELECT object_id FROM name WHERE path = ?1)",
+            params![path],
+        )?;
+        Ok(true)
+    }
+
+    /// Every object with a pin — live or expired — in path order, with the expiry so the
+    /// answer can say which is which. Expired pins are listed, not hidden: their presence
+    /// is the only durable record that a pin once held, and §9's "expiry is visible" means
+    /// exactly that this command shows it rather than dropping the row.
+    pub fn pins(&self) -> Result<Vec<PinRecord>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.pinned_until, lower(hex(o.id)),
+                    (SELECT n.path FROM name n WHERE n.object_id = o.id ORDER BY n.path LIMIT 1)
+               FROM object o JOIN lifecycle l ON l.object_id = o.id
+              WHERE l.pinned_until IS NOT NULL
+              ORDER BY 3, 2",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PinRecord {
+                pinned_until: row.get(0)?,
+                object: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// One object, by the namespace path it answers to. `None` when the path is not
     /// named — which is an answer: the catalog, not the filesystem, is the source of
     /// truth for "does this object exist" (§3).
@@ -2772,6 +2930,47 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// RFC 3339 in UTC, without a date crate: the tool has no business growing a dependency
+/// just to print a timestamp, and the arithmetic is small enough to test directly.
+///
+/// Shared so a pin's expiry reads the same in `pin --list`, `explain`, and a sweep's skip
+/// line; two renderings of the same instant that could drift would make the expiry the one
+/// thing an operator cannot compare.
+pub fn format_rfc3339(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3_600,
+        (rest % 3_600) / 60,
+        rest % 60
+    )
+}
+
+/// Days from the Unix epoch to a civil date (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = (shifted - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 #[cfg(test)]

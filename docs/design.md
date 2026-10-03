@@ -831,7 +831,9 @@ Still open, and honestly so:
   (`Catalog::record_lifecycle_rule`, #41), so the "which rule fired" half is maintained.
   `last_access` is still filled only at first ingest from atime and `accesses` stays 0;
   nothing updates them because proper access observation is the namespace provider's job
-  (§4, P2). The `state` column is likewise derived at sync from whether a hot and a cold copy
+  (§4, P2). (`pinned_until` is the exception since #45: `pin`/`unpin` write it, so it is a
+  maintained column rather than an ingest-only one — see the `Closed by #45` entry below.)
+  The `state` column is likewise derived at sync from whether a hot and a cold copy
   both exist, not written by `restore`: a completed restore only becomes `present` after the
   next `catalog sync`, and until then `audit` tells a restore-in-progress from a true duplicate.
 - **A same-size, same-mtime rewrite is invisible to the digest cache.** A sync keys a
@@ -894,7 +896,16 @@ Still open, and honestly so:
 - **Root-owned files cannot be relocated** by a non-root sweep: the copy fails on
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
-- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
+- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS), and the
+  tool's own reads count as use: `catalog sync` hashes a file, and on a mount that maintains
+  atime under the `relatime` rule — every normal Linux mount — that read refreshes atime, so
+  a sync postpones that file's move by up to a whole idle window. The fix that has not been
+  made is to open the tool's read-only hashing with `O_NOATIME` (it owns the file in the
+  common case and can fall back when it does not), so the stamp means "the user read it"
+  rather than "we did". Until then, a test that asserts a move from an idleness precondition
+  has to re-stamp the file after the last read of it — `tests/pins.rs` does, and says why —
+  because on a `noatime` box (where those tests were written) the polluting read is invisible
+  and the failure only appears on CI.
 - **`explain` never moved files, and now reads the catalog when one exists.** The command
   evaluates scope, guards and policy in the mover's order and reports the outermost reason,
   and its "where does this live / when was it last accessed" answers are cross-checked
@@ -1228,8 +1239,38 @@ to a tier file, a rename, a clean unmount — is gated behind `JUST_CACHE_TEST_F
 **not run by CI**, which has no usable `/dev/fuse`; everything only a real mount proves is
 therefore verified by a human running it with the gate set, and is named rather than implied.
 
+Closed by #45: `lifecycle.pinned_until` is written by commands now. `pin <path> --until
+<when>` sets it, `unpin <path>` clears it, and `pin --list` prints every pin, live or
+lapsed, with the instant it lapses; `--until` takes a duration from now (`30d`) or a Unix
+timestamp in seconds. A sweep reads the pins from the catalog beside the watch root
+(opened only if it already exists, so a sweep never creates one), and a live pin is a skip
+in its own right — `SkipReason::PinnedUntil`, reported as `pinned in the catalog until
+<instant> (a pin wins over policy)` — checked before the observed-access pin and before the
+rule, and re-checked immediately before a move so a pin set mid-sweep still holds. An
+*expired* pin blocks nothing: it is shown as `pin expired <instant> (blocks nothing)`, both
+in `pin --list` and in `explain`'s catalog note, and `explain` names a *live* pin in its
+verdict the way it names a rule, with a `pin_live` field in `--json`. `restore` now searches
+the catalog's recorded locations in addition to the link target and the mirrored `--dest`
+path, resolving each through the catalog's path guard (#72), so an object on a tier this
+invocation was not given as `--dest` is reached; `restore` stays idempotent and verifies
+against the recorded checksum on the catalog-backed path, and `--remove-copy` may drop a
+copy under a catalog-recorded tier root once the restored file verifies. Exit codes follow
+the house contract. `tests/pins.rs` proves a pin blocks a sweep, an expired pin releases
+it, `explain` names a live pin and shows an expiry, and `unpin` is idempotent — the blocking
+test was shown to fail with the mover's pin check removed. `tests/restore.rs` proves a
+restore reaches a copy on a catalog-recorded tier that neither the `--dest` roots nor the
+symlink target can serve. A tier named in `tiers.toml` that no `catalog sync` has recorded
+yet is still not consulted by `restore`: the catalog is where a location is known, and a
+root it has never seen is not one it can vouch for.
+
 ## 10. Non-goals
 
+- **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
+  commands and `restore` is an explicit request: nothing schedules a pin's lapse (an expired
+  pin simply stops mattering, and says so) and nothing decides *where* a restored object
+  should live. §4's "a slow tier may require an explicit restore request" is the operator
+  asking for the bytes back; the policy-driven placement that would put them somewhere
+  again is later work.
 - **The tool does not run a maintenance daemon.** `just_cache reconcile` and `just_cache
   scrub` are on-demand commands, and #48 schedules them without one: `schedule.toml` names a
   cadence and a budget per pass, and `just_cache schedule --run` — run from cron or a

@@ -88,6 +88,10 @@ enum Command {
     Locate(LocateArgs),
     /// Bring an offloaded file back to the hot path, verified.
     Restore(RestoreArgs),
+    /// Pin an object so policy leaves it alone until an instant, whatever rule would fire.
+    Pin(PinArgs),
+    /// Clear a pin set by `pin`.
+    Unpin(UnpinArgs),
     /// Read every stored copy back and verify it against the catalog, repairing rot.
     Scrub(ScrubArgs),
     /// Rebuild copies that are missing from a destination root (a disk re-added after a
@@ -532,6 +536,45 @@ struct RestoreArgs {
     quiet: bool,
 }
 
+/// Everything `pin` needs. Like `scrub` it names no `--watch`/`--dest`: a pin is a fact
+/// about an object the catalog already knows, so the catalog is the only input.
+#[derive(Debug, Args)]
+struct PinArgs {
+    /// The object to pin, as the namespace path the catalog recorded (relative to the watch
+    /// root, the same string `catalog sync` ingested). Omitted when `--list` is given.
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+
+    /// When the pin lapses: a duration from now (`30d`, `12h`, `90m`) or a Unix timestamp in
+    /// seconds. A pin at or before now is recorded but already expired, which blocks nothing
+    /// — useful for clearing a protection without forgetting that it was set. Required with
+    /// a path.
+    #[arg(long, value_name = "WHEN")]
+    until: Option<String>,
+
+    /// List every recorded pin — live and expired — and change nothing.
+    #[arg(long)]
+    list: bool,
+
+    /// The catalog to read or write. It must already exist: a pin attaches to an object the
+    /// catalog knows, and `pin` never creates one (invariant 9 — `catalog sync` does).
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+}
+
+/// Everything `unpin` needs.
+#[derive(Debug, Args)]
+struct UnpinArgs {
+    /// The object to unpin, as the namespace path the catalog recorded.
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
+
+    /// The catalog to read or write. It must already exist: a pin attaches to an object the
+    /// catalog knows, and `unpin` never creates one (invariant 9 — `catalog sync` does).
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+}
+
 /// Everything `scrub` needs. Unlike restore/sweep it names no `--watch`/`--dest`: the
 /// catalog already knows every tier root and every key within it, which is the point of
 /// having made the catalog the source of truth.
@@ -680,6 +723,8 @@ fn main() -> ExitCode {
         Some(Command::Explain(args)) => run_explain(args),
         Some(Command::Locate(args)) => run_locate(args),
         Some(Command::Restore(args)) => run_restore(args),
+        Some(Command::Pin(args)) => run_pin(args),
+        Some(Command::Unpin(args)) => run_unpin(args),
         Some(Command::Scrub(args)) => run_scrub(args),
         Some(Command::Reconcile(args)) => run_reconcile(args),
         Some(Command::Schedule(args)) => run_schedule(args),
@@ -1497,6 +1542,170 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
     }
 }
 
+/// Set a `lifecycle.pinned_until` pin, or list the pins (`--list`).
+///
+/// Exit contract: `0` for a pin that was written (or a listing that answered), `1` when the
+/// path names nothing in the catalog, `2` for a bad invocation or an unreadable catalog. A
+/// path that names nothing is a *finding*, not a usage error: the invocation was well
+/// formed, and cron should be able to see that the pin it wanted did not land.
+fn run_pin(args: PinArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} is not an existing file (create it with `catalog sync`)",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let now = unix_now();
+
+    if args.list {
+        // A listing is a read: a path or --until beside it would be a contradiction, not a
+        // silent extra filter.
+        if args.path.is_some() || args.until.is_some() {
+            eprintln!("just_cache: --list takes no path and no --until");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        let pins = match catalog.pins() {
+            Ok(pins) => pins,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_FINDINGS);
+            }
+        };
+        let live = pins.iter().filter(|pin| pin.is_live(now)).count();
+        println!("pins: {} recorded, {live} in force", pins.len());
+        for pin in &pins {
+            println!("{}", pin.describe(now));
+        }
+        if pins.is_empty() {
+            println!("  none: no object is pinned");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(path) = args.path.as_deref() else {
+        eprintln!("just_cache: pin needs a PATH, or --list");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let Some(until_text) = args.until.as_deref() else {
+        eprintln!(
+            "just_cache: pin needs --until <WHEN> (a duration like `30d`, or a Unix timestamp)"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let until = match parse_pin_until(until_text, now) {
+        Ok(until) => until,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    let key = path.to_string_lossy();
+    match catalog.set_pin(&key, until) {
+        Ok(true) => {
+            // The expiry is printed whether it is in the future or already past: a pin set
+            // to an instant that has gone is not a protection, and saying so is the point of
+            // "expiry is visible rather than implied".
+            if until > now {
+                println!(
+                    "pinned {key} until {} (unix {until}; a pin wins over policy)",
+                    catalog::format_rfc3339(until)
+                );
+            } else {
+                println!(
+                    "pinned {key} until {} (unix {until}) — already expired, so it blocks nothing",
+                    catalog::format_rfc3339(until)
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!(
+                "just_cache: {key} is not named in the catalog; nothing was pinned (run \
+                 `catalog sync` if the tree has changed)"
+            );
+            ExitCode::from(EXIT_FINDINGS)
+        }
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::from(EXIT_FINDINGS)
+        }
+    }
+}
+
+/// Clear a pin. Idempotent: unpinning a path that carries no pin still exits `0`, so a cron
+/// job that clears a pin every run needs no failure handling for the common case.
+fn run_unpin(args: UnpinArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} is not an existing file (create it with `catalog sync`)",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let key = args.path.to_string_lossy();
+    match catalog.clear_pin(&key) {
+        Ok(true) => {
+            println!("unpinned {key} (no pin now holds)");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("just_cache: {key} is not named in the catalog; nothing was unpinned");
+            ExitCode::from(EXIT_FINDINGS)
+        }
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::from(EXIT_FINDINGS)
+        }
+    }
+}
+
+/// Parse `--until`: a plain integer is a Unix timestamp, anything with a unit is a duration
+/// from `now`. The split is deliberate — `1800000000` must not read as a duration that
+/// lands in the year 2083, and `30d` must not read as the timestamp 30 — so there is exactly
+/// one way to spell each.
+fn parse_pin_until(text: &str, now: i64) -> Result<i64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("--until is empty; use a duration like `30d` or a Unix timestamp".to_string());
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return trimmed
+            .parse::<i64>()
+            .map_err(|_| format!("--until {trimmed:?} is not a Unix timestamp in seconds"));
+    }
+    let duration = just_cache::policy::parse_duration(trimmed).map_err(|reason| {
+        format!(
+            "--until {trimmed:?} is neither a Unix timestamp nor a duration ({reason}); use \
+             e.g. `30d`, `12h`, or `1800000000`"
+        )
+    })?;
+    Ok(now.saturating_add(duration.as_secs() as i64))
+}
+
+/// Unix seconds now, for pin comparisons and the expiry an answer prints.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Read every stored copy back and verify it against the catalog.
 ///
 /// Exit contract: `0` when every copy verified or was repaired, `1` when corruption,
@@ -2133,6 +2342,15 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     let min_free = args.min_free_bytes();
     let mut pending = entries.clone();
 
+    // The catalog's pins, when one already exists. A pin is a catalog fact (§5), and a
+    // sweep never creates a catalog (invariant 9) — the same open-if-present rule the
+    // `lifecycle.rule` recording below uses. With no catalog there can be no pin, so this
+    // is `None` and nothing changes for a catalog-less sweep.
+    let pins = catalog::Catalog::open_existing(catalog::Catalog::default_path(watch))
+        .ok()
+        .flatten()
+        .and_then(|catalog| catalog::Pins::from_catalog(&catalog).ok());
+
     if args.copies > 1 {
         // Replication path: every candidate is tried against the destinations in order
         // until `copies` copies have verified, rather than filling one tier before moving
@@ -2145,6 +2363,7 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             journal,
             lifecycle,
             dest_tiers,
+            pins: pins.as_ref(),
         };
         let replicated = file_movement::migrate_replicated(
             &pending,
@@ -2169,6 +2388,7 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             journal,
             lifecycle,
             dest_tiers,
+            pins: pins.as_ref(),
         };
         let by_rules = file_movement::migrate_least_used(
             &pending,
@@ -2207,6 +2427,7 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
                 journal,
                 lifecycle: None,
                 dest_tiers,
+                pins: pins.as_ref(),
             };
             let tier = file_movement::migrate_least_used(
                 &pending,

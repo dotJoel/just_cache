@@ -669,3 +669,124 @@ fn a_path_with_a_parent_component_is_refused_before_any_work() {
         support::partial_files(&watch)
     );
 }
+
+/// `restore` reaches a copy on a tier this invocation was *not* given as a `--dest`, because
+/// the catalog recorded it — the case the symlink provider's filesystem search cannot serve.
+///
+/// The copy is moved onto `cold-b` with the real mover (so the link names it), the catalog is
+/// synced with `cold-b` as a root, and the restore is then run with only `cold-a` as `--dest`.
+/// Without the catalog the link target is on `cold-b` (outside `cold-a`) and the mirrored path
+/// under `cold-a` is absent, so nothing is found; naming the catalog resolves the recorded
+/// location and the bytes come back through the same verified path.
+#[test]
+fn restore_reaches_a_copy_on_a_catalog_recorded_tier_the_dests_cannot_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold_a = tmp.path().join("cold-a");
+    let cold_b = tmp.path().join("cold-b");
+    for dir in [&watch, &cold_a, &cold_b] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let bytes = payload(8192);
+    fs::write(watch.join("clip.mov"), &bytes).unwrap();
+
+    // Move onto cold-b: the hot path becomes a symlink to a copy on b.
+    let hot = migrate(&watch, &cold_b, "clip.mov");
+    assert!(fs::symlink_metadata(&hot).unwrap().is_symlink());
+    let copy_b = cold_b.join("clip.mov");
+    assert!(copy_b.is_file(), "the mover should have left the copy on b");
+
+    // An explicit catalog *elsewhere*, so the restore below can be run with and without it:
+    // the roots it records are the watch and cold-b.
+    let catalog = tmp.path().join("elsewhere.sqlite");
+    let output = bin()
+        .args(["catalog", "sync", "--watch"])
+        .arg(&watch)
+        .arg("--dest")
+        .arg(&cold_b)
+        .arg("--catalog")
+        .arg(&catalog)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "sync must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // With only --dest cold-a and no catalog, the filesystem search cannot reach the copy:
+    // the link target is on cold-b, outside cold-a, and cold-a has no mirrored copy.
+    let mut command = bin();
+    command
+        .arg("restore")
+        .arg(&hot)
+        .arg("--watch")
+        .arg(&watch)
+        .arg("--dest")
+        .arg(&cold_a);
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "without the catalog this restore must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no cold copy"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&hot).unwrap().is_symlink(),
+        "nothing may be restored without the catalog"
+    );
+
+    // Naming the catalog, the recorded location on cold-b is reached and the bytes come back.
+    let mut command = bin();
+    command
+        .arg("restore")
+        .arg(&hot)
+        .arg("--watch")
+        .arg(&watch)
+        .arg("--dest")
+        .arg(&cold_a)
+        .arg("--catalog")
+        .arg(&catalog);
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the catalog-recorded tier must serve the restore; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&hot).unwrap(), bytes, "the bytes come back");
+    assert!(!fs::symlink_metadata(&hot).unwrap().is_symlink());
+    assert!(copy_b.is_file(), "the cold copy stays by default");
+    assert!(support::partial_files(&watch).is_empty());
+
+    // `--remove-copy` may drop a copy under a catalog-recorded tier root, after verification.
+    let mut command = bin();
+    command
+        .arg("restore")
+        .arg(&hot)
+        .arg("--watch")
+        .arg(&watch)
+        .arg("--dest")
+        .arg(&cold_a)
+        .arg("--catalog")
+        .arg(&catalog)
+        .arg("--remove-copy");
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !copy_b.exists(),
+        "the cold copy on the catalog-recorded tier is dropped after the restored file verifies"
+    );
+    assert_eq!(fs::read(&hot).unwrap(), bytes);
+}
