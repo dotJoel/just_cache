@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>just_cache</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.6; }
+    code { background: color-mix(in srgb, currentColor 10%, transparent); padding: .1em .3em; border-radius: 4px; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <h1>just_cache</h1>
+  <p>Moves cold, rarely used files off a fast disk onto slower ones, and leaves a symlink behind so every existing path keeps working.</p>
+  <p>
+    Point it at a directory and one or more cold-storage roots. On each sweep it walks the
+    tree, asks the filesystem when each file was last <em>used</em>, and moves the files that
+    have gone untouched onto the cold tier, replacing them with a symlink to the new location.
+  </p>
+  <pre><code>just_cache \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media \
+  --min-idle-days 60 \
+  --limit 25</code></pre>
+  <p>Documentation lives in <a href="readme.md">readme.md</a> and the design rationale in <a href="design.md">design.md</a>.</p>
+</body>
+</html>
