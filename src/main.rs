@@ -978,7 +978,8 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         // A path outside the tree, or an unusable one, is a bad invocation (exit 2, the
         // same code `audit` uses); everything else is the requested restore failing on its
         // own terms (exit 1), so cron can tell the two apart without parsing text.
-        Err(err @ RestoreError::OutsideWatch { .. }) => {
+        Err(err @ RestoreError::OutsideWatch { .. })
+        | Err(err @ RestoreError::ParentComponent { .. }) => {
             eprintln!("just_cache: {err}");
             ExitCode::from(EXIT_USAGE)
         }

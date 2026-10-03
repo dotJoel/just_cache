@@ -565,3 +565,107 @@ fn a_missing_named_catalog_is_a_usage_error() {
         "nothing may be touched on a bad invocation"
     );
 }
+
+/// A symlink in the watched tree whose target resolves outside every `--dest` is a foreign
+/// link, not a cold copy the mover left. A plain restore must not treat it as a copy, must
+/// not create anything from it, and must leave the target alone. Anyone who can write the
+/// tree can create such a link, so the target is an arbitrary file the operator can read.
+#[test]
+fn a_link_target_outside_every_dest_is_not_a_cold_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let outside = tmp.path().join("outside.bin");
+    fs::write(&outside, b"outside-precious").unwrap();
+    // The target is relative and leaves both the watch and every dest, exactly the shape
+    // the mover's symlinks can be forged into.
+    let hot = watch.join("movie.bin");
+    link(Path::new("../outside.bin"), &hot);
+
+    let (code, _, stderr) = restore_via_binary(&hot, &watch, &cold, &[]);
+    assert_eq!(code, 1, "a foreign link is not a copy; stderr: {stderr}");
+    assert!(stderr.contains("no cold copy"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"outside-precious",
+        "the link target must never be read or copied"
+    );
+    assert!(
+        fs::symlink_metadata(&hot).unwrap().is_symlink(),
+        "the link is left as it was"
+    );
+    assert!(
+        !cold.join("movie.bin").exists(),
+        "nothing is created under --dest"
+    );
+}
+
+/// `--remove-copy` must never delete a foreign link's target: the copy it removes has to
+/// be proved part of a `--dest` root first, or the command becomes deletion of an
+/// arbitrary file the operator can read.
+#[test]
+fn remove_copy_refuses_a_link_target_outside_every_dest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let outside = tmp.path().join("outside.bin");
+    fs::write(&outside, b"outside-precious").unwrap();
+    let hot = watch.join("movie.bin");
+    link(Path::new("../outside.bin"), &hot);
+
+    let (code, _, stderr) = restore_via_binary(&hot, &watch, &cold, &["--remove-copy"]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("no cold copy"), "stderr: {stderr}");
+    assert!(
+        outside.exists(),
+        "the foreign target must survive a --remove-copy run"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside-precious");
+    assert!(
+        fs::symlink_metadata(&hot).unwrap().is_symlink(),
+        "the link is left as it was"
+    );
+    assert!(
+        support::partial_files(&watch).is_empty(),
+        "no .just_cache-partial-* leftovers: {:?}",
+        support::partial_files(&watch)
+    );
+}
+
+/// A path argument whose relative part contains a `..` component is refused before any
+/// lookup, copy or delete. `absolute()` is lexical and does not resolve `..`, so
+/// `T/../escaped.bin` strips to `../escaped.bin` and would otherwise name a file outside
+/// the tree — with `--remove-copy` it would be deleted.
+#[test]
+fn a_path_with_a_parent_component_is_refused_before_any_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let outside = tmp.path().join("escaped.bin");
+    fs::write(&outside, b"escapee").unwrap();
+
+    // watch/../escaped.bin resolves to `outside`; the `..` is not resolved lexically.
+    let hot = watch.join("../escaped.bin");
+    let (code, _, stderr) = restore_via_binary(&hot, &watch, &cold, &["--remove-copy"]);
+    assert_eq!(code, 2, "a bad path is a usage error; stderr: {stderr}");
+    assert!(
+        stderr.contains(".."),
+        "the refusal must name the component: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"escapee",
+        "the file the `..` reaches must never be touched"
+    );
+    assert!(
+        support::partial_files(&watch).is_empty(),
+        "no .just_cache-partial-* leftovers on a refused path: {:?}",
+        support::partial_files(&watch)
+    );
+}
