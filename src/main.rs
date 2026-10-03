@@ -547,7 +547,7 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
 
     // What the last run was in the middle of. Run once, before any new work, so a recovered
     // name is visible to this very sweep rather than the one after it.
-    match journal::repair(&mut journal, &watch) {
+    match journal::repair(&mut journal, &watch, &args.dest) {
         Ok(report) => {
             if let Some(summary) = report.summary() {
                 println!("{summary}");
