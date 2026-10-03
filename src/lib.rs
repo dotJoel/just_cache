@@ -25,6 +25,7 @@ mod faults;
 pub mod file_movement;
 pub mod journal;
 pub mod locate;
+pub mod observe;
 pub mod opened;
 pub mod policy;
 pub mod reconcile;
@@ -63,6 +64,7 @@ pub use fuse::{serve as mount_serve, MountError, MountRequest};
 pub use gateway::{Gateway, GatewayConfig, GatewayError};
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
+pub use observe::{AccessLog, FLUSH_INTERVAL};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
 pub use policy::{
     DownDecision, DownRule, Lifecycle, PolicyError, Rule, RuleSet, UpRule, POLICY_FILE_NAME,

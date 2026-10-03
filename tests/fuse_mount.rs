@@ -498,6 +498,18 @@ fn a_real_mount_serves_bytes_and_unmounts_cleanly() {
     // Unmount is clean: the daemon exits, nothing partial is left behind.
     unmount(&mountpoint);
     reap(child);
+
+    // Access observation (issue #43): the read through the mount was recorded as an open,
+    // by the provider, and the write created no lifecycle transition.
+    let catalog = tree.open();
+    let moved = catalog.record_for_path("shows/moved.mkv").unwrap().unwrap();
+    assert!(moved.access_observed, "the provider recorded the read");
+    assert!(moved.accesses.unwrap_or(0) >= 1, "{moved:?}");
+    let live = catalog.record_for_path("shows/live.bin").unwrap().unwrap();
+    assert_eq!(
+        live.rule, None,
+        "a write through the mount is not a transition"
+    );
     assert!(
         fs::read_dir(&mountpoint).unwrap().next().is_none(),
         "an unmounted mountpoint reads as the empty directory it was"

@@ -410,6 +410,7 @@ mod tests {
                 state: "restoring".to_string(),
                 last_access: Some(0),
                 accesses: Some(3),
+                access_observed: false,
                 pinned_until: None,
                 rule: Some("intelligent-tiering".to_string()),
                 names: vec!["shows/moved.mkv".to_string()],

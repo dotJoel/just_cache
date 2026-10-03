@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS lifecycle (
     last_access  INTEGER NOT NULL,     -- observed by the namespace provider, or atime
     accesses     INTEGER NOT NULL,     -- observed counter since ingest
     pinned_until INTEGER,              -- pin wins over policy
-    rule         TEXT                  -- which rule decided the last transition
+    rule         TEXT,                 -- which rule decided the last transition
+    observed     INTEGER NOT NULL DEFAULT 0 -- 1 once a namespace provider recorded access
 );
 CREATE TABLE IF NOT EXISTS volume (
     id    TEXT PRIMARY KEY,            -- 'drawer-07'
@@ -360,6 +361,9 @@ pub struct ObjectRecord {
     pub last_access: Option<i64>,
     /// The observed-access counter, from `lifecycle`.
     pub accesses: Option<u64>,
+    /// True when `last_access`/`accesses` were written by the namespace provider (the
+    /// mount observed an open/read/close) rather than ingested from atime at sync.
+    pub access_observed: bool,
     /// Unix seconds until which a pin wins over the idle rule, from `lifecycle`.
     pub pinned_until: Option<i64>,
     /// The lifecycle rule that decided the last transition, if any.
@@ -434,6 +438,11 @@ impl PinRecord {
 #[derive(Debug, Default, Clone)]
 pub struct Pins {
     until: BTreeMap<String, i64>,
+    /// Namespace path -> `lifecycle.last_access` for every object whose access the
+    /// namespace provider has observed (issue #43). Carried with the pins because it is
+    /// the other lifecycle fact a sweep must read from the catalog rather than infer: for
+    /// these objects the stamp is the provider's, and atime is never consulted.
+    observed: BTreeMap<String, i64>,
 }
 
 impl Pins {
@@ -446,7 +455,17 @@ impl Pins {
                 until.insert(path, pin.pinned_until);
             }
         }
-        Ok(Pins { until })
+        Ok(Pins {
+            until,
+            observed: catalog.observed_last_access()?,
+        })
+    }
+
+    /// The provider-observed last access for `path` (unix seconds), when the mount has
+    /// recorded one. `None` means the object was never accessed through the provider, and
+    /// only then may a caller fall back to the filesystem's atime (the symlink provider).
+    pub fn observed_access(&self, path: &str) -> Option<i64> {
+        self.observed.get(path).copied()
     }
 
     /// The recorded pin expiry for `path`, live or expired, when the catalog records one.
@@ -2091,6 +2110,7 @@ impl Catalog {
                 // them per object and is not used here.
                 last_access: None,
                 accesses: None,
+                access_observed: false,
                 pinned_until: None,
                 rule: None,
                 names: Vec::new(),
@@ -2389,6 +2409,57 @@ impl Catalog {
         Ok(records)
     }
 
+    /// Record accesses the namespace provider observed (issue #43), one transaction per
+    /// batch. Each item is `(namespace path, unix seconds of the latest access, how many
+    /// opens to add)`.
+    ///
+    /// `last_access` only moves forward (`MAX`) so a batch flushed late — or two mounts
+    /// over one catalog — can never make an object look colder than an access already
+    /// recorded. Only `last_access`, `accesses` and `observed` are written: an access is
+    /// an observation, never a transition, so `rule` and `pinned_until` are untouched.
+    /// A path the catalog does not name (a file created through the mount and not yet
+    /// synced) has no object to attach to and is skipped; the count of rows written is
+    /// returned so a caller can tell.
+    pub fn record_observed_accesses(
+        &mut self,
+        batch: &[(String, i64, u64)],
+    ) -> Result<usize, CatalogError> {
+        let tx = self.conn.transaction()?;
+        let mut written = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO lifecycle (object_id, last_access, accesses, pinned_until, rule,
+                                        observed)
+                 SELECT object_id, ?2, ?3, NULL, NULL, 1 FROM name WHERE path = ?1
+                 ON CONFLICT(object_id) DO UPDATE SET
+                     last_access = MAX(last_access, excluded.last_access),
+                     accesses = accesses + excluded.accesses,
+                     observed = 1",
+            )?;
+            for (path, last_access, opens) in batch {
+                written += stmt.execute(params![path, last_access, *opens as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Path -> `last_access` for every named object whose access the provider observed.
+    pub fn observed_last_access(&self) -> Result<BTreeMap<String, i64>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.path, l.last_access FROM name n
+               JOIN lifecycle l ON l.object_id = n.object_id
+              WHERE l.observed != 0",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (path, last) = row?;
+            out.insert(path, last);
+        }
+        Ok(out)
+    }
+
     /// One object by its hex id, with its names, every copy, and its lifecycle row.
     pub fn record_for_object(&self, id: &str) -> Result<Option<ObjectRecord>, CatalogError> {
         let id = id.to_ascii_lowercase();
@@ -2412,10 +2483,10 @@ impl Catalog {
 
         // A lifecycle row is written at ingest, but a catalog hand-edited or written by an
         // older schema might lack one; absence is reported, not guessed.
-        let (last_access, accesses, pinned_until, rule) = self
+        let (last_access, accesses, pinned_until, rule, observed) = self
             .conn
             .query_row(
-                "SELECT last_access, accesses, pinned_until, rule FROM lifecycle
+                "SELECT last_access, accesses, pinned_until, rule, observed FROM lifecycle
                   WHERE lower(hex(object_id)) = ?1",
                 params![id],
                 |row| {
@@ -2424,11 +2495,12 @@ impl Catalog {
                         row.get::<_, Option<i64>>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
                     ))
                 },
             )
             .optional()?
-            .unwrap_or((None, None, None, None));
+            .unwrap_or((None, None, None, None, None));
 
         let mut locations = Vec::new();
         let mut stmt = self.conn.prepare(
@@ -2466,6 +2538,7 @@ impl Catalog {
             state,
             last_access,
             accesses: accesses.map(|value| value.max(0) as u64),
+            access_observed: observed.unwrap_or(0) != 0,
             pinned_until,
             rule,
             names,
@@ -2979,6 +3052,20 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "ALTER TABLE location ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE location ADD COLUMN checksum BLOB;",
+        )?;
+    }
+    // `lifecycle.observed` (issue #43) says whether `last_access` was written by the
+    // namespace provider or is still the atime ingested at sync. A catalog written before
+    // the mount observed access gains it as 0 — "still a timestamp" — which is the truth
+    // about every row such a catalog holds.
+    let has_observed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('lifecycle') WHERE name = 'observed'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_observed == 0 {
+        conn.execute_batch(
+            "ALTER TABLE lifecycle ADD COLUMN observed INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     Ok(())
