@@ -359,8 +359,10 @@ part nothing else does.
 ## 9. Known gaps (tracked, not hidden)
 
 Closed in P0: metadata/sparseness loss on cross-device copies; size-only adoption;
-the open-file/hardlink gap; the crash window between source removal and symlink
-creation; and CI's failure to exercise the EXDEV path.
+the open-file/hardlink gap (the open-descriptor half is now backed by a per-candidate
+`/proc` re-scan immediately before each move — #77 — with the residual window named
+below); the crash window between source removal and symlink creation; and CI's failure
+to exercise the EXDEV path.
 
 Closed in P1 by `just_cache catalog sync` (#16): the catalog is now *written*, so "where
 does this file live" is finally a question the filesystem is not the only answer to. It is
@@ -467,6 +469,20 @@ scrub scheduling) and verifying copies that are present — a stat per location 
 "is this copy absent", and anything more is the scrubber's job.
 
 Still open, and honestly so:
+
+- **The open-descriptor re-check is a fresh scan, not a lock (#77).** The sweep's
+  snapshot only sees descriptors that existed when the sweep began, so the mover re-scans
+  `/proc/*/fd` immediately before each candidate's bytes move (`Guards::recheck`) — once
+  per file it is about to move, not per file in the tree — and the hardlink half re-stats
+  live in the same step. That catches a file opened during the walk, which the snapshot
+  could not. What remains is the gap between the scan and the rename/remove: a descriptor
+  opened in that instant is still missed, because no kernel primitive says "refuse the next
+  open". The window is now microseconds at the point of the operation rather than the whole
+  sweep, and it is named here rather than implied away. Its timing through the binary is not
+  tested (the window cannot be hit deterministically from a test that only drives the
+  binary); the re-check is pinned instead by a library test that takes the snapshot, opens a
+  real descriptor in another process, and asserts the move is refused — reverting the mover
+  to the snapshot-only check fails it.
 
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears
   mid-sweep is now deterministically testable.** A destination that becomes unavailable
@@ -699,3 +715,8 @@ Still open, and honestly so:
 - Multi-user quotas/permissions: single-trust-domain system.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.
+- **Locking a watched file against future opens is not attempted.** The pre-move
+  re-check (§9) narrows the open-descriptor window to the scan itself, but closing it
+  completely would need a kernel "no one may open this next" primitive that does not
+  exist. The residual gap is declared in §9 rather than hidden behind a check that
+  cannot promise it.

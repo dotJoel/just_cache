@@ -1180,9 +1180,10 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     let journal: &mut Journal = state.journal;
     let now = SystemTime::now();
 
-    // One snapshot per sweep, not one per candidate: a process-table scan per file would
-    // cost more than the copy it is protecting. The guard is deliberately taken *before*
-    // the walk so that a file opened mid-sweep is caught by the re-check in the mover.
+    // The sweep snapshot is a cheap prefilter, not the final word: it keeps the walk from
+    // selecting files that were already open without a process-table scan per file in the
+    // tree. A file opened *after* this snapshot is caught by the mover's per-candidate
+    // re-check (`Guards::recheck`), which re-scans /proc immediately before bytes move.
     let open_files = OpenFiles::snapshot();
     let coverage_note = open_files.coverage_note();
     let guards = Guards::new(open_files, !args.allow_hardlinked);
