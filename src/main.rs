@@ -105,6 +105,10 @@ enum Command {
     Mount(MountArgs),
     /// Inspect cache overlays (§2.1). Residency is ephemeral: it is never data of record.
     Cache(CacheArgs),
+    /// Serve the catalog's namespace over an authenticated WebDAV endpoint (listing,
+    /// metadata, range reads, and `POST <path>?restore`) for consumers that cannot
+    /// mount (issue #47).
+    Gateway(GatewayArgs),
 }
 
 #[derive(Debug, Args)]
@@ -742,6 +746,43 @@ struct MountArgs {
     catalog: Option<PathBuf>,
 }
 
+/// Everything `gateway` needs.
+#[derive(Debug, Args)]
+struct GatewayArgs {
+    /// Address to listen on. Loopback by default: the endpoint speaks plain HTTP, so
+    /// exposing it beyond the host belongs behind a TLS terminator.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8730")]
+    listen: String,
+
+    /// Directory to watch: the namespace served, and where a restore puts bytes back.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root to expose, fastest tier first. An object with a copy on a
+    /// root not named here is refused, even if the catalog knows that root.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`); a volatile tier is refused as a `--dest`.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// The catalog to serve. Defaults to `.just_cache-catalog.sqlite` beside the watch
+    /// root, and must already exist.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// File holding the access token (surrounding whitespace is trimmed). Read from a
+    /// file, or from `JUST_CACHE_GATEWAY_TOKEN`, never from the command line, where it
+    /// would show up in `ps` and shell history.
+    #[arg(long, value_name = "FILE")]
+    token_file: Option<PathBuf>,
+
+    /// Do not print the per-request access log (method, path, status).
+    #[arg(long, short)]
+    quiet: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -759,6 +800,7 @@ fn main() -> ExitCode {
         Some(Command::Schedule(args)) => run_schedule(args),
         Some(Command::Mount(args)) => run_mount(args),
         Some(Command::Cache(args)) => run_cache(args),
+        Some(Command::Gateway(args)) => run_gateway(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -2804,4 +2846,76 @@ fn run_cache(args: CacheArgs) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Serve the catalog over WebDAV until killed.
+///
+/// Exit `2` for a bad invocation (missing catalog, no token, unusable root); `1` if the
+/// listener fails while serving.
+fn run_gateway(args: GatewayArgs) -> ExitCode {
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // The token's value never reaches an error message: only where it was looked for.
+    let token = match &args.token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text.trim().to_string(),
+            Err(err) => {
+                eprintln!(
+                    "just_cache: cannot read --token-file {}: {err}",
+                    path.display()
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => match std::env::var("JUST_CACHE_GATEWAY_TOKEN") {
+            Ok(token) => token.trim().to_string(),
+            Err(_) => {
+                eprintln!(
+                    "just_cache: the gateway needs a token: pass --token-file or set \
+                     JUST_CACHE_GATEWAY_TOKEN"
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
+    let config = just_cache::GatewayConfig {
+        catalog_path: args
+            .catalog
+            .clone()
+            .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch)),
+        watch: args.watch.clone(),
+        dests: args.dest.clone(),
+        token,
+        log: !args.quiet,
+    };
+    let gateway = match just_cache::Gateway::bind(&args.listen, config) {
+        Ok(gateway) => gateway,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Ok(addr) = gateway.local_addr() {
+        eprintln!("just_cache: gateway listening on http://{addr}/");
+    }
+    match gateway.serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("just_cache: gateway failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

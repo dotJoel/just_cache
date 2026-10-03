@@ -14,6 +14,9 @@ pub mod explain;
 // host with no FUSE kernel module still compiles every other subcommand.
 #[cfg(unix)]
 pub mod fuse;
+// The gateway namespace provider (issue #47): WebDAV over the catalog. Pure std; only
+// the `gateway` subcommand reaches it.
+pub mod gateway;
 pub mod namespace;
 // Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
 // built without test cfg, so the fault seam has to be compiled into production and stay
@@ -57,6 +60,7 @@ pub use file_movement::{
 };
 #[cfg(unix)]
 pub use fuse::{serve as mount_serve, MountError, MountRequest};
+pub use gateway::{Gateway, GatewayConfig, GatewayError};
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
