@@ -2781,7 +2781,7 @@ fn hash_path(
         // where a real read would, and the caller's Err arm marks the name and location
         // unreadable. Without this, `an_unreadable_file_is_not_recorded_as_missing`'s
         // second sync exits 0 and invents agreement the tree does not have.
-        fs::File::open(path).map_err(|source| CatalogError::Checksum {
+        digest::open_for_hashing(path).map_err(|source| CatalogError::Checksum {
             path: path.to_path_buf(),
             source,
         })?;

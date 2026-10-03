@@ -896,16 +896,16 @@ Still open, and honestly so:
 - **Root-owned files cannot be relocated** by a non-root sweep: the copy fails on
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
-- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS), and the
-  tool's own reads count as use: `catalog sync` hashes a file, and on a mount that maintains
-  atime under the `relatime` rule — every normal Linux mount — that read refreshes atime, so
-  a sync postpones that file's move by up to a whole idle window. The fix that has not been
-  made is to open the tool's read-only hashing with `O_NOATIME` (it owns the file in the
-  common case and can fall back when it does not), so the stamp means "the user read it"
-  rather than "we did". Until then, a test that asserts a move from an idleness precondition
-  has to re-stamp the file after the last read of it — `tests/pins.rs` does, and says why —
-  because on a `noatime` box (where those tests were written) the polluting read is invisible
-  and the failure only appears on CI.
+- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS). What
+  counts as use is a read by someone other than the tool: the tool never marks its own
+  use. Every internal read-only open — `catalog sync`'s hash, `scrub`'s verify, `audit`'s
+  probe, the mover's and replication's comparison read-backs — goes through
+  `digest::open_for_hashing`, which opens with `O_NOATIME` and falls back to a plain open
+  on `EPERM` (the tool does not own the file; that read can still refresh atime under
+  `relatime`, and is accepted over failing the hash). Deliberately excluded: the mover's
+  copy of a source it is about to delete, and `restore`'s copy back from a cold tier, which
+  is the user asking for the file. The reproduction lives in `tests/noatime_hashing.rs`
+  (#129).
 - **`explain` never moved files, and now reads the catalog when one exists.** The command
   evaluates scope, guards and policy in the mover's order and reports the outermost reason,
   and its "where does this live / when was it last accessed" answers are cross-checked
@@ -1262,6 +1262,15 @@ restore reaches a copy on a catalog-recorded tier that neither the `--dest` root
 symlink target can serve. A tier named in `tiers.toml` that no `catalog sync` has recorded
 yet is still not consulted by `restore`: the catalog is where a location is known, and a
 root it has never seen is not one it can vouch for.
+
+Closed by #129: the tool's own hashing reads no longer count as use on a `relatime`
+mount. Internal read-only opens use `O_NOATIME` with an `EPERM` fallback, so a sync is never
+the "last access" the next sweep reads. The test does not depend on the mount — on the
+`noatime` box the pollution is invisible — so `JUST_CACHE_FAULT=relatime=1` stamps atime
+after any internal open that lacks the flag, the deterministic form of #124; removing the
+flag fails both tests in `tests/noatime_hashing.rs`. Gap: a file the tool does not own
+still takes the plain-open fallback and can be refreshed by the read; that path is not
+exercised end to end, because the suite does not run as a second user.
 
 ## 10. Non-goals
 

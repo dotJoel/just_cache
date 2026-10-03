@@ -865,7 +865,8 @@ fn digest_reader(file: &mut File) -> io::Result<blake3::Hash> {
 }
 
 fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
-    let mut file = File::open(path)?;
+    // A comparison read, not a use: see `digest::open_for_hashing`.
+    let mut file = crate::digest::open_for_hashing(path)?;
     digest_reader(&mut file)
 }
 

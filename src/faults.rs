@@ -45,6 +45,11 @@
 //!   This is the window in which removing the source would delete the last verified copy
 //!   because the name no longer resolves to what was read. `N` is unused (the seam fires
 //!   once); it exists because the value grammar is uniform.
+//! * `relatime=N` — every read-only open the tool makes for its own hashing
+//!   (`digest::open_for_hashing`) that did *not* get `O_NOATIME` stamps the file's atime to
+//!   now, as a `relatime` mount would on that first read. This makes "the tool never marks
+//!   its own use" testable on a `noatime` mount, where the real refresh is invisible.
+//!   `N` is unused.
 //!
 //! A *set but unparseable* value panics rather than being ignored: a fault switch that
 //! silently no-ops would let a mistyped test pass green with no fault injected, which is
@@ -63,6 +68,7 @@ pub(crate) enum FaultMode {
     UnlinkMidCopy,
     PartialModeMidCopy,
     ReplaceVerifiedDest,
+    Relatime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,7 @@ impl Fault {
             "unlink-mid-copy" => FaultMode::UnlinkMidCopy,
             "partial-mode-mid-copy" => FaultMode::PartialModeMidCopy,
             "replace-verified-dest" => FaultMode::ReplaceVerifiedDest,
+            "relatime" => FaultMode::Relatime,
             other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
         };
         let at = ordinal
