@@ -424,6 +424,22 @@ drops the cold copy only after the restored file verifies. Without a catalog the
 is byte-for-byte what it was before (verify against the cold copy; a pre-corrupt copy
 cannot be caught — there is nothing independent to compare against, see below).
 
+Hardened as a security fix (#70): `restore` now proves a cold copy lives under a `--dest`
+root before it acts on one. A symlink in the watched tree is writable by anyone who can
+write the tree, so its target is not accepted as a copy on trust: with an unchecked target,
+`restore --remove-copy` deletes an arbitrary file the operator can read, and a plain
+`restore` copies an out-of-tree file into the watched tree. The link target is now accepted
+only when `canonicalize` puts it under a canonicalized `--dest` root — the same containment
+`audit::resolve_target` applies to a watched symlink — and a target that escapes every root
+is a *foreign link*, dropped rather than guessed at. The mirrored candidate is held to the
+same test, so a name inside a tier that is itself a symlink out of it is no more a copy; and
+`--remove-copy` re-tests containment immediately before its one unrecoverable delete rather
+than trusting a proof made in `locate`. Finally, a path argument whose relative part carries
+a `..` component is refused before any lookup, copy or delete: `absolute()` is lexical and
+does not resolve `..`, so `T/../escaped.bin` would otherwise strip to `../escaped.bin` and
+name a file outside the tree. `tests/restore.rs` drives all three refusals through the real
+binary, and each fails when the fix is reverted.
+
 Closed in P1 by `just_cache audit` reading the catalog (#19): "audit is a query" (§3) is
 now true rather than an aspiration. When a catalog exists — `--catalog <FILE>`, or the
 default `.just_cache-catalog.sqlite` beside the watch root — the audit answers from the
@@ -711,6 +727,12 @@ Still open, and honestly so:
 - Mounting an offline volume or streaming recall from an object store: `locate` reports the
   state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
   volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
+- **`restore` refuses a lexically-unresolved path rather than resolving it.** A path
+  argument carrying a `..` component, or a link target that escapes every `--dest`, is a
+  refusal, not something to `canonicalize` and then act on: canonicalizing to decide what a
+  path "really" is would lose the symlink state `restore` exists to see, and would make the
+  command act on a name the operator did not give it. The operator re-runs with the path as
+  the filesystem spells it (§9, #70).
 - Multi-user quotas/permissions: single-trust-domain system.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.
