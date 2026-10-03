@@ -46,16 +46,17 @@ use crate::tiers::TierSet;
 /// How many examples the readable summary lists by default.
 pub const DEFAULT_EXAMPLES: usize = 10;
 
-/// The copy floor this audit enforces for every object.
+/// The copy floor an audit enforces for an object when the operator names none.
 ///
-/// `docs/design.md` §6 asks for a *per-tier* floor the scheduler maintains, but the schema
-/// the catalog shipped with has no floor column and adding one is more than a small, honest
-/// migration (it needs a versioning step, not an `ALTER TABLE` that existing catalogs never
-/// see). So this enforces the only floor the schema can express without inventing a column:
-/// **every object must keep at least one location that still exists**. An object whose every
-/// recorded copy is gone is below the floor and is reported as such — the "missing copy is a
-/// repair job, reported, not silent" case, made visible even when each individual copy was
-/// already reported missing. A configurable per-tier floor is named as a gap in §9.
+/// This is a per-*object* floor and it is not the schema's only one. `docs/design.md` §6
+/// asks for a per-tier floor, and the catalog records it: the `tier` table's `copies` column
+/// (written by `catalog sync` from `tiers.toml`, or by `--copies N`) is the floor a sweep
+/// enforces when it decides whether a tier is under-replicated. An audit answers a different
+/// question — how many locations still *exist* for one object — so its floor is per object and
+/// normally comes from `--copies`; this constant is the default. **Every object must keep at
+/// least one location that still exists**: an object whose every recorded copy is gone is
+/// below the floor and is reported as such — the "missing copy is a repair job, reported, not
+/// silent" case, made visible even when each individual copy was already reported missing.
 pub const COPY_FLOOR: usize = 1;
 
 #[derive(Debug, Error)]
