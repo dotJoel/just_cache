@@ -313,6 +313,24 @@ impl RuleSet {
             path: self.path.clone(),
             detail,
         };
+        // A `[[cache]]` name is not a tier, so `tiers.get` would already miss it — but the
+        // "not configured" message would send the operator looking for a typo. Name the
+        // real reason: an overlay is never a policy target (§2.1, §5).
+        for rule in &self.rules {
+            for down in &rule.downs {
+                for (field, name) in [("down.from", &down.from), ("down.to", &down.to)] {
+                    if let Some(cache) = tiers.cache(name) {
+                        return Err(invalid(format!(
+                            "rule `{}`: `{field}` names cache overlay `{}` ({}); a cache is a \
+                             promotion target, never a policy target (docs/design.md §2.1)",
+                            rule.name,
+                            cache.name,
+                            cache.path.display()
+                        )));
+                    }
+                }
+            }
+        }
         for rule in &self.rules {
             for down in &rule.downs {
                 let from = tiers.get(&down.from).ok_or_else(|| {

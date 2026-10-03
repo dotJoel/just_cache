@@ -65,6 +65,7 @@ use fuser::{
 };
 use rustix::fs::OFlags;
 
+use crate::cache::Overlay;
 use crate::catalog::{Catalog, CatalogError};
 use crate::namespace::{Entry, Namespace, NamespaceError};
 
@@ -102,6 +103,9 @@ pub struct MountRequest {
     pub dests: Vec<PathBuf>,
     /// The directory to mount on. Must exist and be empty.
     pub mountpoint: PathBuf,
+    /// `[[cache]]` overlays to serve reads through, each with the root of the tier it
+    /// sits in front of (§2.1, issue #46). Empty means no overlay.
+    pub caches: Vec<(crate::tiers::CacheConfig, PathBuf)>,
 }
 
 /// Why a mount could not be served.
@@ -122,6 +126,10 @@ pub enum MountError {
     UnknownTier(PathBuf),
     /// The FUSE session could not be established or run.
     Mount(io::Error),
+    /// A cache overlay could not be opened (its path is missing, or its owned directory
+    /// could not be reset). Refused rather than mounted without it, so a ramdisk that
+    /// failed to mount is noticed instead of silently costing every read.
+    Cache(crate::cache::CacheError),
     /// The signal handler that unmounts on Ctrl-C could not be installed; without it
     /// a SIGINT would leave a dead mount behind, so the mount is refused.
     Signal(ctrlc::Error),
@@ -156,6 +164,7 @@ impl std::fmt::Display for MountError {
                 path.display()
             ),
             MountError::Mount(err) => write!(f, "the FUSE mount failed: {err}"),
+            MountError::Cache(err) => write!(f, "{err}"),
             MountError::Signal(err) => write!(
                 f,
                 "could not install the unmount-on-signal handler: {err}; refusing to mount \
@@ -199,7 +208,20 @@ pub fn serve(request: &MountRequest) -> Result<(), MountError> {
         return Err(MountError::MountpointNotEmpty(request.mountpoint.clone()));
     }
 
-    let filesystem = MountFs::new(catalog, namespace, request.watch.clone());
+    let mut overlays = Vec::with_capacity(request.caches.len());
+    for (config, home_root) in &request.caches {
+        let overlay = Overlay::open(config.clone(), home_root).map_err(MountError::Cache)?;
+        // The overlay opens empty, so any residency rows a previous process left are
+        // describing bytes that no longer exist. Losing them is the point: a cache is
+        // never something the catalog has to account for.
+        if let Err(err) = catalog.clear_cache_residency(overlay.name()) {
+            return Err(MountError::Catalog(err));
+        }
+        overlays.push(overlay);
+    }
+
+    let mut filesystem = MountFs::new(catalog, namespace, request.watch.clone());
+    filesystem.overlays = Mutex::new(overlays);
     let mut config = Config::default();
     config.mount_options = mount_options();
 
@@ -245,6 +267,9 @@ struct MountFs {
     /// Open file handles, keyed by the handle returned from `open`/`create`.
     handles: Mutex<HashMap<u64, File>>,
     next_handle: AtomicU64,
+    /// Cache overlays (§2.1). Reads may be served from a copy here; writes always land on
+    /// the home and drop the copy first (write-invalidate).
+    overlays: Mutex<Vec<Overlay>>,
 }
 
 impl MountFs {
@@ -260,6 +285,7 @@ impl MountFs {
             inodes: Mutex::new(Inodes::new()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            overlays: Mutex::new(Vec::new()),
         }
     }
 
@@ -416,6 +442,60 @@ impl MountFs {
                 blksize: 4096,
                 flags: 0,
             },
+        }
+    }
+
+    /// Where a read-only open of `path` (home bytes at `bytes`) should read from: an
+    /// overlay copy when one is resident or this read earns a promotion, else the home.
+    /// Residency changes are mirrored into the catalog's `cache_residency` table for
+    /// observability; a failure to mirror is ignored, because that table is never read as
+    /// data of record and the read itself is unaffected.
+    fn read_source(&self, path: &str, bytes: PathBuf) -> PathBuf {
+        let mut overlays = self.overlays.lock().unwrap();
+        if overlays.is_empty() {
+            return bytes;
+        }
+        let object = {
+            let catalog = self.catalog.lock().unwrap();
+            match self.namespace.lookup(&catalog, path) {
+                Ok(Entry::File { object, .. }) => object,
+                // Only catalogued names are cached: a fresh hot file has no object id to
+                // report residency against, and is already on the fastest tier anyway.
+                _ => return bytes,
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for overlay in overlays.iter_mut() {
+            if !overlay.covers(&bytes) {
+                continue;
+            }
+            let outcome = overlay.read(path, &object, &bytes, now);
+            let catalog = self.catalog.lock().unwrap();
+            for dropped in &outcome.dropped {
+                let _ = catalog.drop_cache_residency(overlay.name(), dropped);
+            }
+            if outcome.promoted {
+                let _ = catalog.record_cache_residency(overlay.name(), path, &object, now as i64);
+            }
+            if let Some(serve) = outcome.serve {
+                return serve;
+            }
+        }
+        bytes
+    }
+
+    /// Drop every overlay copy of `path` before its home is written. Called before the
+    /// write so a reader racing the write can never be handed the old copy afterwards.
+    fn invalidate(&self, path: &str) {
+        let mut overlays = self.overlays.lock().unwrap();
+        for overlay in overlays.iter_mut() {
+            if overlay.invalidate(path) {
+                let catalog = self.catalog.lock().unwrap();
+                let _ = catalog.drop_cache_residency(overlay.name(), path);
+            }
         }
     }
 
@@ -604,17 +684,22 @@ impl Filesystem for MountFs {
             }
         };
         let mut options = OpenOptions::new();
-        match flags.acc_mode() {
+        let bytes = match flags.acc_mode() {
             OpenAccMode::O_RDONLY => {
                 options.read(true);
+                self.read_source(&path, bytes)
             }
             OpenAccMode::O_WRONLY => {
                 options.write(true);
+                self.invalidate(&path);
+                bytes
             }
             OpenAccMode::O_RDWR => {
                 options.read(true).write(true);
+                self.invalidate(&path);
+                bytes
             }
-        }
+        };
         match options.open(&bytes) {
             Ok(file) => {
                 let handle = self.add_handle(file);
@@ -843,6 +928,7 @@ impl Filesystem for MountFs {
         }
 
         if let Some(size) = size {
+            self.invalidate(&path);
             let bytes = match self.file_bytes(&path) {
                 Ok(bytes) => bytes,
                 Err(errno) => {
@@ -903,6 +989,9 @@ impl Filesystem for MountFs {
         };
         let source = Self::join(&parent_path, name);
         let destination = Self::join(&newparent_path, newname);
+        // A rename changes which bytes both names answer to; neither copy is coherent.
+        self.invalidate(&source);
+        self.invalidate(&destination);
 
         let source_disk = self.watch.join(&source);
         if let Ok(metadata) = fs::symlink_metadata(&source_disk) {

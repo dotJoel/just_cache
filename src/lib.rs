@@ -2,6 +2,8 @@
 //! exercised from integration tests and reused as a crate.
 
 pub mod audit;
+#[cfg(unix)]
+pub mod cache;
 pub mod catalog;
 pub mod digest;
 
@@ -74,4 +76,6 @@ pub use schedule::{
 };
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
 pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};
-pub use tiers::{Recall, Tier, TierSet, TiersError, Volatility, TIERS_FILE_NAME};
+pub use tiers::{
+    CacheConfig, PromoteOn, Recall, Tier, TierSet, TiersError, Volatility, TIERS_FILE_NAME,
+};

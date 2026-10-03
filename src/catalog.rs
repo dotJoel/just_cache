@@ -49,7 +49,8 @@
 //! it in `location` would let a restart promote a RAM copy to data of record. Nothing in
 //! this module ever writes a cache to `location` — the only tiers written are the watch
 //! root and the `--dest` roots — and the `cache_residency` table exists for observability
-//! at most and is never a durability input.
+//! at most and is never a durability input. Its only writer is a running overlay
+//! (`src/cache.rs`, through the mount), which clears its rows when it reopens empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -130,7 +131,8 @@ CREATE TABLE IF NOT EXISTS tier (
     copies INTEGER NOT NULL DEFAULT 1  -- the copy floor for objects that live here
 );
 -- Ephemeral, observability only: a promotion target's contents are re-derivable and
--- MUST NOT be read as data of record (§2.1). No code path in this module writes here.
+-- MUST NOT be read as data of record (§2.1). Only a running overlay (src/cache.rs,
+-- through the mount) writes here; nothing that decides placement, floors or scrub reads it.
 CREATE TABLE IF NOT EXISTS cache_residency (
     object_id   BLOB NOT NULL,
     cache       TEXT NOT NULL,
@@ -1805,6 +1807,60 @@ impl Catalog {
             .conn
             .query_row("SELECT COUNT(*) FROM name", [], |row| row.get::<_, i64>(0))?
             as usize)
+    }
+
+    /// Mirror one overlay entry into `cache_residency`, for observability only. This is
+    /// the only writer of that table, and it never touches `location`: a cache copy is
+    /// not a place an object lives (§2.1, §3).
+    pub fn record_cache_residency(
+        &self,
+        cache: &str,
+        key: &str,
+        object_hex: &str,
+        observed_at: i64,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cache_residency (object_id, cache, key, observed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![object_hex.as_bytes(), cache, key, observed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one overlay entry (evicted, or write-invalidated).
+    pub fn drop_cache_residency(&self, cache: &str, key: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM cache_residency WHERE cache = ?1 AND key = ?2",
+            rusqlite::params![cache, key],
+        )?;
+        Ok(())
+    }
+
+    /// Forget every entry of one overlay. Called when an overlay opens empty, so rows a
+    /// previous (crashed) process left behind never describe bytes that are gone.
+    pub fn clear_cache_residency(&self, cache: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM cache_residency WHERE cache = ?1",
+            rusqlite::params![cache],
+        )?;
+        Ok(())
+    }
+
+    /// Every recorded overlay entry as `(cache, key, object_hex, observed_at)`.
+    pub fn cache_residency(&self) -> Result<Vec<(String, String, String, i64)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cache, key, object_id, observed_at FROM cache_residency ORDER BY cache, key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let object: Vec<u8> = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                String::from_utf8_lossy(&object).into_owned(),
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn location_count(&self) -> Result<usize, CatalogError> {

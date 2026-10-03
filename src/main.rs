@@ -103,6 +103,35 @@ enum Command {
     /// Mount the catalog's namespace as a FUSE filesystem, so a consumer that does not
     /// follow symlinks sees real bytes for an offloaded file (issue #42).
     Mount(MountArgs),
+    /// Inspect cache overlays (§2.1). Residency is ephemeral: it is never data of record.
+    Cache(CacheArgs),
+}
+
+#[derive(Debug, Args)]
+struct CacheArgs {
+    #[command(subcommand)]
+    command: CacheCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// List the configured overlays and what each currently holds, as last mirrored by a
+    /// running mount. Everything shown is ephemeral: losing it loses no data.
+    Status(CacheStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct CacheStatusArgs {
+    /// Directory to watch; locates the default `tiers.toml` and catalog.
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+    /// Tier configuration (`tiers.toml`), holding the `[[cache]]` blocks.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+    /// The catalog a mount mirrors residency into. Defaults to the one beside the watch
+    /// root; read only, never created.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -729,6 +758,7 @@ fn main() -> ExitCode {
         Some(Command::Reconcile(args)) => run_reconcile(args),
         Some(Command::Schedule(args)) => run_schedule(args),
         Some(Command::Mount(args)) => run_mount(args),
+        Some(Command::Cache(args)) => run_cache(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -2197,6 +2227,18 @@ fn refuse_volatile_dests(tiers: Option<&TierSet>, dests: &[PathBuf]) -> Result<(
         return Ok(());
     };
     for dest in dests {
+        // A `[[cache]]` overlay is never a tier, so `tier_for_root` cannot see it; the
+        // overlap check is separate and comes first. A destination inside (or around) an
+        // overlay would make a promotion target the home of record (§2.1).
+        if let Some(cache) = tiers.cache_overlapping(dest) {
+            return Err(format!(
+                "--dest {} overlaps cache overlay `{}` ({}): a cache is a promotion target, \
+                 never a destination root (docs/design.md §2.1)",
+                dest.display(),
+                cache.name,
+                cache.path.display()
+            ));
+        }
         if let Some(tier) = tiers.tier_for_root(dest) {
             if !tier.is_home() {
                 return Err(format!(
@@ -2670,11 +2712,24 @@ fn run_mount(args: MountArgs) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
 
+    let caches = tiers
+        .as_ref()
+        .map(|set| {
+            set.caches()
+                .iter()
+                .filter_map(|cache| {
+                    set.get(&cache.over)
+                        .map(|tier| (cache.clone(), tier.path.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let request = just_cache::MountRequest {
         catalog_path,
         watch: args.watch.clone(),
         dests: args.dest.clone(),
         mountpoint: args.mountpoint.clone(),
+        caches,
     };
     eprintln!(
         "just_cache: mounting {} at {} (Ctrl-C to unmount)",
@@ -2696,4 +2751,57 @@ fn run_mount(args: MountArgs) -> ExitCode {
 fn run_mount(_args: MountArgs) -> ExitCode {
     eprintln!("just_cache: mount needs FUSE, which this build does not have (it is Unix-only)");
     ExitCode::from(EXIT_USAGE)
+}
+
+/// `cache status`: the configured overlays and their mirrored residency, every line marked
+/// ephemeral so nobody reads a cache copy as a place their data lives.
+fn run_cache(args: CacheArgs) -> ExitCode {
+    let CacheCommand::Status(args) = args.command;
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(Some(tiers)) => tiers,
+        Ok(None) => {
+            println!("no tiers.toml, so no cache overlays are configured");
+            return ExitCode::SUCCESS;
+        }
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if tiers.caches().is_empty() {
+        println!("no cache overlays are configured");
+        return ExitCode::SUCCESS;
+    }
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
+    let rows = if catalog_path.is_file() {
+        match catalog::Catalog::open(&catalog_path).and_then(|c| c.cache_residency()) {
+            Ok(rows) => rows,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    for cache in tiers.caches() {
+        println!(
+            "cache {} (EPHEMERAL — not data of record)",
+            cache.describe()
+        );
+        let held: Vec<_> = rows.iter().filter(|row| row.0 == cache.name).collect();
+        if held.is_empty() {
+            println!("  resident: none");
+        }
+        for (_, key, object, observed_at) in held {
+            println!(
+                "  resident (ephemeral): {key} object={object} since={}",
+                catalog::format_rfc3339(*observed_at)
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }

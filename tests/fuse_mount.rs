@@ -293,6 +293,7 @@ fn a_catalog_with_no_recorded_roots_is_refused_before_any_mount() {
         watch: hot,
         dests: vec![cold],
         mountpoint,
+        caches: Vec::new(),
     })
     .expect_err("a rootless catalog must not mount");
     assert!(
@@ -346,6 +347,7 @@ fn mount_refuses_a_non_empty_mountpoint_rather_than_hiding_files() {
         watch: tree.hot.clone(),
         dests: vec![tree.cold.clone()],
         mountpoint: mountpoint.clone(),
+        caches: Vec::new(),
     })
     .expect_err("a non-empty mountpoint must be refused");
     assert!(
@@ -373,6 +375,7 @@ fn mount_refuses_a_dest_the_catalog_never_recorded() {
         watch: tree.hot.clone(),
         dests: vec![tree.cold.clone(), other.clone()],
         mountpoint,
+        caches: Vec::new(),
     })
     .expect_err("a tier the catalog does not record must be refused");
     assert!(
