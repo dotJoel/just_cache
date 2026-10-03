@@ -156,7 +156,7 @@ Off-host copies are a later phase.
 
 A file is moved when **all** of these hold:
 
-0. it is in scope (see Scope below): inside `--include`, not `--exclude`, within the size window;
+0. it is in scope (see Scope above): inside `--include`, not `--exclude`, within the size window;
 1. it is not already a symlink (already migrated);
 2. it is not empty;
 3. nothing has read it during this run (the `--min-observed-accesses` pin), and nothing is
@@ -204,11 +204,11 @@ A destination below its free-space floor is not a failure: those files are repor
 
 ## If the machine dies mid-move
 
-A move is the three operations described above — the bytes land on the cold
-tier, the source is removed, the symlink appears — and they cannot be one. Crash
-between the last two and the file is still on disk but nothing points at it.
-`<watch>/.just_cache-journal` — and fsyncs it — before anything moves, and clears the
-record once the symlink is in place.
+A move is three filesystem operations that cannot be one — the bytes land on the cold
+tier, the source is removed, the symlink appears — and the window this section is about
+is between the last two: the file is still on disk but nothing points at it. So every
+move writes an **intent** to `<watch>/.just_cache-journal` — and fsyncs it — before
+anything moves, and clears the record once the symlink is in place.
 
 The next run reads that journal and asks the *filesystem* what happened, because the
 journal only knows what was attempted:
