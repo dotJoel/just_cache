@@ -41,6 +41,7 @@ use crate::catalog::Catalog;
 use crate::disk_management::{self, AccessSource, FileEntry};
 use crate::file_movement::{Policy, UsageTracker};
 use crate::opened::{self, Coverage, FileId, Guards};
+use crate::policy::{DownDecision, Lifecycle};
 use crate::scope::{self, Scope, ScopeRefusal};
 
 /// The exit code for a path the engine manages: a sweep run now would move it, or it is
@@ -76,6 +77,10 @@ pub struct ExplainContext<'a> {
     /// answer. `main` sets this only for a file that already exists — `explain` must never
     /// conjure an empty catalog beside a healthy tree.
     pub catalog: Option<PathBuf>,
+    /// The lifecycle rules (`policy.toml`), when one governs this tree. `None` is the
+    /// fallback the report names: the flag-driven decision, exactly what the tool did
+    /// before rules existed.
+    pub lifecycle: Option<&'a Lifecycle<'a>>,
 }
 
 /// What the engine concluded about one path.
@@ -91,6 +96,9 @@ pub struct Explanation {
     pub policy: PolicyReport,
     pub verdict: Verdict,
     pub catalog: CatalogReport,
+    /// What `policy.toml` decided, or that there is none. This is the "which rule fired,
+    /// or which exclusion stopped it" answer §5 requires of `explain`.
+    pub rules: RuleReport,
 }
 
 impl Explanation {
@@ -118,6 +126,7 @@ impl Explanation {
         lines.push(format!("  scope:   {}", self.scope.describe()));
         lines.push(format!("  guards:  {}", self.guards.describe()));
         lines.push(format!("  policy:  {}", self.policy.describe()));
+        lines.push(format!("  rules:   {}", self.rules.describe()));
         lines.push(format!("  verdict: {}", self.verdict.describe()));
         lines.push(format!("  catalog: {}", self.catalog.describe()));
         for disagreement in &self.catalog.disagreements {
@@ -154,6 +163,7 @@ impl Explanation {
         out.push_str(&format!("\"scope\":{},", self.scope.to_json()));
         out.push_str(&format!("\"guards\":{},", self.guards.to_json()));
         out.push_str(&format!("\"policy\":{},", self.policy.to_json()));
+        out.push_str(&format!("\"rules\":{},", self.rules.to_json()));
         out.push_str(&format!("\"verdict\":{},", self.verdict.to_json()));
         out.push_str(&format!("\"catalog\":{}", self.catalog.to_json()));
         out.push('}');
@@ -588,6 +598,12 @@ pub enum Verdict {
     },
     /// In scope and unguarded, but not idle long enough yet.
     WouldMoveInDays { days: f64, min_idle_days: f64 },
+    /// A lifecycle rule applies, but the file has not been idle past its `after_idle`.
+    WouldMoveInDaysByRule {
+        rule: String,
+        days: f64,
+        after_idle_days: f64,
+    },
     /// The outermost gate refuses it; `reason` is that gate's sentence.
     WouldNeverMove { reason: String },
     /// Cold bytes are already in place: the path is a symlink into a configured tier.
@@ -610,6 +626,7 @@ impl Verdict {
         match self {
             Verdict::WouldMoveNow { .. } => "would-move-now",
             Verdict::WouldMoveInDays { .. } => "would-move-in-days",
+            Verdict::WouldMoveInDaysByRule { .. } => "would-move-in-days",
             Verdict::WouldNeverMove { .. } => "would-never-move",
             Verdict::AlreadyMigrated { .. } => "already-migrated",
             Verdict::ForeignSymlink { .. } => "foreign-symlink",
@@ -633,6 +650,14 @@ impl Verdict {
             } => format!(
                 "would move in {days:.1} days (idle {days:.1} d of the {min_idle_days:.1} d \
                  --min-idle-days requires)"
+            ),
+            Verdict::WouldMoveInDaysByRule {
+                rule,
+                days,
+                after_idle_days,
+            } => format!(
+                "would move in {days:.1} days by rule `{rule}` (idle {days:.1} d of the \
+                 {after_idle_days:.1} d after_idle it requires)"
             ),
             Verdict::WouldNeverMove { reason } => format!("would never move: {reason}"),
             Verdict::AlreadyMigrated {
@@ -688,6 +713,20 @@ impl Verdict {
                 "null".to_string(),
                 format!("{days}"),
                 format!("idle {days:.1} d of the {min_idle_days:.1} d required"),
+            ),
+            Verdict::WouldMoveInDaysByRule {
+                rule,
+                days,
+                after_idle_days,
+            } => (
+                "null".to_string(),
+                "null".to_string(),
+                "null".to_string(),
+                format!("{days}"),
+                format!(
+                    "rule `{rule}`: idle {days:.1} d of the {after_idle_days:.1} d after_idle \
+                     required"
+                ),
             ),
             Verdict::WouldNeverMove { reason } => (
                 "null".to_string(),
@@ -805,6 +844,116 @@ impl CatalogReport {
     }
 }
 
+/// What `policy.toml` decided for this path — the rule that fired, or the exclusion that
+/// stopped it (§5, §5.1), or that no policy is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleReport {
+    /// False when an earlier gate refused, so the rules were never reached.
+    pub evaluated: bool,
+    pub skipped_reason: Option<String>,
+    /// The rule whose `match` covered the path, when one did.
+    pub matched_rule: Option<String>,
+    /// A machine-stable word for the decision: `fired`, `too-warm`, `pinned`, `no-rule`,
+    /// `not-managed-tier`, `no-down-from`, `up`, `fallback`, `not-applicable`.
+    pub decision: &'static str,
+    /// The rule that decided or blocked, when a named rule did.
+    pub rule: Option<String>,
+    /// One sentence a human can act on.
+    pub detail: String,
+}
+
+impl RuleReport {
+    /// No `policy.toml`: the flag-driven decision, exactly what the tool did before rules.
+    fn fallback() -> Self {
+        Self {
+            evaluated: true,
+            skipped_reason: None,
+            matched_rule: None,
+            decision: "fallback",
+            rule: None,
+            detail: "no policy.toml is configured, so the flag-driven decision \
+                     (--min-idle-days) applies"
+                .to_string(),
+        }
+    }
+
+    fn not_evaluated(reason: &str) -> Self {
+        Self {
+            evaluated: false,
+            skipped_reason: Some(reason.to_string()),
+            matched_rule: None,
+            decision: "not-applicable",
+            rule: None,
+            detail: reason.to_string(),
+        }
+    }
+
+    fn from_down(decision: &DownDecision) -> Self {
+        let (word, detail) = match decision {
+            DownDecision::NoRule => ("no-rule", decision.describe()),
+            DownDecision::Pinned { .. } => ("pinned", decision.describe()),
+            DownDecision::NotOnManagedTier => ("not-managed-tier", decision.describe()),
+            DownDecision::NoDownFrom { .. } => ("no-down-from", decision.describe()),
+            DownDecision::TooWarm { .. } => ("too-warm", decision.describe()),
+            DownDecision::Down { .. } => ("fired", decision.describe()),
+        };
+        Self {
+            evaluated: true,
+            skipped_reason: None,
+            matched_rule: decision.rule().map(str::to_string),
+            decision: word,
+            rule: decision.rule().map(str::to_string),
+            detail,
+        }
+    }
+
+    fn from_up(rule: &str, from: &str, to: &str) -> Self {
+        Self {
+            evaluated: true,
+            skipped_reason: None,
+            matched_rule: Some(rule.to_string()),
+            decision: "up",
+            rule: Some(rule.to_string()),
+            detail: format!(
+                "rule `{rule}`: accessed again on `{to}`, a read promotes it back to `{from}` \
+                 (recall is the namespace provider's job, §8 P2)"
+            ),
+        }
+    }
+
+    fn describe(&self) -> String {
+        if !self.evaluated {
+            return format!(
+                "not evaluated: {}",
+                self.skipped_reason
+                    .as_deref()
+                    .unwrap_or("an earlier gate decided")
+            );
+        }
+        match &self.rule {
+            Some(rule) => format!("rule `{rule}` ({}) — {}", self.decision, self.detail),
+            None => format!("{} — {}", self.decision, self.detail),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"evaluated\":{},\"decision\":{},\"matched_rule\":{},\"rule\":{},\"detail\":{}}}",
+            self.evaluated,
+            json_string(self.decision),
+            self.matched_rule
+                .as_ref()
+                .map(|rule| json_string(rule))
+                .unwrap_or_else(|| "null".to_string()),
+            self.rule
+                .as_ref()
+                .map(|rule| json_string(rule))
+                .unwrap_or_else(|| "null".to_string()),
+            json_string(&self.detail)
+        )
+    }
+}
+
 /// What the catalog would answer for one namespace path. Nothing constructs this yet —
 /// it exists so the seam below has a shape to slot into, and so the disagreement path can
 /// be tested before the catalog exists.
@@ -906,6 +1055,7 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
             policy: PolicyReport::not_evaluated("nothing at this path", context.policy),
             verdict: Verdict::NotFound,
             catalog: catalog_report,
+            rules: RuleReport::not_evaluated("nothing at this path"),
         };
     };
 
@@ -932,6 +1082,7 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
                 reason: "not a regular file; the mover only moves regular files".to_string(),
             },
             catalog: catalog_report,
+            rules: RuleReport::not_evaluated("not a regular file"),
         };
     }
 
@@ -966,6 +1117,7 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
             policy: PolicyReport::not_evaluated("scope refused first", context.policy),
             verdict: Verdict::WouldNeverMove { reason },
             catalog: catalog_report,
+            rules: RuleReport::not_evaluated("scope refused first"),
         };
     }
 
@@ -988,6 +1140,7 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
                 reason: refusal.describe(),
             },
             catalog: catalog_report,
+            rules: RuleReport::not_evaluated("scope refused first"),
         };
     }
     let scope = ScopeReport::In {
@@ -1008,6 +1161,7 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
             policy: PolicyReport::not_evaluated("guards refused first", context.policy),
             verdict: Verdict::WouldNeverMove { reason },
             catalog: catalog_report,
+            rules: RuleReport::not_evaluated("guards refused first"),
         };
     }
 
@@ -1036,7 +1190,20 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
         atime_matches_mtime,
     };
 
-    // ---- 4. verdict --------------------------------------------------------------
+    // ---- 4. lifecycle rules ------------------------------------------------------
+    // A rule decides the destination as well as the idle gate, so the verdict below is
+    // the rule's when one governs this tree. With no `policy.toml` this is `None` and the
+    // flag-driven path stands, exactly as before rules existed.
+    let current_tier = context.lifecycle.and_then(|lc| lc.current_tier(path));
+    let (rules, rule_decision) = match context.lifecycle {
+        None => (RuleReport::fallback(), None),
+        Some(lifecycle) => {
+            let decision = lifecycle.evaluate_down(&entry.relative, current_tier, idle);
+            (RuleReport::from_down(&decision), Some(decision))
+        }
+    };
+
+    // ---- 5. verdict --------------------------------------------------------------
     let verdict = if pinned {
         Verdict::WouldNeverMove {
             reason: format!(
@@ -1044,6 +1211,45 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
                  {} — a file just seen being used is not cold",
                 context.policy.observed_access_pin
             ),
+        }
+    } else if let Some(decision) = &rule_decision {
+        match decision {
+            DownDecision::Down { rule, to, .. } => {
+                match tier_index_for_name(context, to).and_then(|index| {
+                    disk_management::destination_with_room(
+                        &context.dests[index],
+                        entry.allocated,
+                        context.min_free,
+                    )
+                    .map(|destination| (index, destination))
+                }) {
+                    Some((tier_index, destination)) => Verdict::WouldMoveNow {
+                        destination: destination.join(&entry.relative),
+                        tier_index,
+                    },
+                    None => Verdict::WaitingForRoom {
+                        reason: format!(
+                            "rule `{rule}` targets tier `{to}`, but no --dest for it has room \
+                             for {} above the {} free-space floor",
+                            scope::human_bytes(entry.allocated),
+                            scope::human_bytes(context.min_free)
+                        ),
+                    },
+                }
+            }
+            DownDecision::TooWarm {
+                rule,
+                idle,
+                after_idle,
+                ..
+            } => Verdict::WouldMoveInDaysByRule {
+                rule: rule.clone(),
+                days: idle.as_secs_f64() / 86_400.0,
+                after_idle_days: after_idle.as_secs_f64() / 86_400.0,
+            },
+            other => Verdict::WouldNeverMove {
+                reason: other.describe(),
+            },
         }
     } else if idle < context.policy.min_idle {
         Verdict::WouldMoveInDays {
@@ -1076,7 +1282,20 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
         policy,
         verdict,
         catalog: catalog_report,
+        rules,
     }
+}
+
+/// The index of the `--dest` root that is configured as tier `name`, if any. A rule names
+/// a tier, and the mover can only act on a tier it was given a root for.
+fn tier_index_for_name(context: &ExplainContext<'_>, name: &str) -> Option<usize> {
+    let lifecycle = context.lifecycle?;
+    context.dests.iter().position(|dest| {
+        lifecycle
+            .tiers()
+            .tier_for_root(dest)
+            .is_some_and(|tier| tier.name == name)
+    })
 }
 
 /// A path that is already a symlink: the mover's output, resolved back to its cold home.
@@ -1090,7 +1309,7 @@ fn explain_symlink(
     let not_applicable = |reason: &str| ScopeReport::NotApplicable {
         reason: reason.to_string(),
     };
-    let base = |verdict: Verdict| Explanation {
+    let base = |verdict: Verdict, rules: RuleReport| Explanation {
         path: path.to_path_buf(),
         watch: watch.to_path_buf(),
         relative: relative.clone(),
@@ -1100,14 +1319,18 @@ fn explain_symlink(
         policy: PolicyReport::not_evaluated("already a symlink", context.policy),
         verdict,
         catalog: catalog.clone(),
+        rules,
     };
 
     let target = match fs::read_link(path) {
         Ok(target) => target,
         Err(err) => {
-            return base(Verdict::WouldNeverMove {
-                reason: format!("symlink could not be read: {err}"),
-            });
+            return base(
+                Verdict::WouldNeverMove {
+                    reason: format!("symlink could not be read: {err}"),
+                },
+                RuleReport::not_evaluated("the symlink could not be read"),
+            );
         }
     };
     // A relative link is relative to the directory holding the link.
@@ -1120,25 +1343,57 @@ fn explain_symlink(
     };
     let resolves = fs::metadata(&resolved).is_ok();
     if !resolves {
-        return base(Verdict::WouldNeverMove {
-            reason: format!(
-                "dangling symlink -> {} (the cold copy is missing)",
-                target.display()
-            ),
-        });
+        return base(
+            Verdict::WouldNeverMove {
+                reason: format!(
+                    "dangling symlink -> {} (the cold copy is missing)",
+                    target.display()
+                ),
+            },
+            RuleReport::not_evaluated("the cold copy is missing"),
+        );
     }
 
+    // The bytes live on a tier now: if a rule promotes on access, name it. Without a
+    // policy this is the fallback line, exactly as a hot file gets.
+    let resolved_tier = context.lifecycle.and_then(|lc| lc.current_tier(&resolved));
+    let rules = match (context.lifecycle, relative.as_deref()) {
+        (Some(lifecycle), Some(relative)) => match lifecycle.evaluate_up(relative, resolved_tier) {
+            Some(rule) => {
+                // The `from` of the transition that put the bytes there — the tier an `up`
+                // promotes back to. `evaluate_up` only returns a rule with a `down` whose
+                // `to` is the current tier, so one of the entries always names it.
+                let from = resolved_tier
+                    .and_then(|tier| rule.down_from(tier))
+                    .map(|down| down.from.as_str())
+                    .or_else(|| rule.downs.first().map(|down| down.from.as_str()))
+                    .unwrap_or("its home tier");
+                RuleReport::from_up(&rule.name, from, resolved_tier.unwrap_or("its cold tier"))
+            }
+            None => RuleReport::not_evaluated(
+                "the cold copy is in place; no up rule promotes it on access",
+            ),
+        },
+        _ => RuleReport::fallback(),
+    };
+
     match tier_containing(context.dests, &resolved) {
-        Some((tier_index, tier)) => base(Verdict::AlreadyMigrated {
-            target,
-            tier: Some(tier),
-            tier_index: Some(tier_index),
-            resolves: true,
-        }),
-        None => base(Verdict::ForeignSymlink {
-            target,
-            resolves: true,
-        }),
+        Some((tier_index, tier)) => base(
+            Verdict::AlreadyMigrated {
+                target,
+                tier: Some(tier),
+                tier_index: Some(tier_index),
+                resolves: true,
+            },
+            rules,
+        ),
+        None => base(
+            Verdict::ForeignSymlink {
+                target,
+                resolves: true,
+            },
+            rules,
+        ),
     }
 }
 
@@ -1339,6 +1594,7 @@ mod tests {
             tracker,
             min_free: 0,
             catalog: None,
+            lifecycle: None,
         }
     }
 

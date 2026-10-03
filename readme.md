@@ -88,6 +88,7 @@ root's path is its own tier name, exactly as it always was. Nothing is hardcoded
 | `--watch <DIR>` | *required* | Tree to watch. Walked recursively. |
 | `--dest <DIR>` | *required* | Cold root, fastest tier first. Repeat for each slower disk. Must already exist. |
 | `--tiers <FILE>` | `tiers.toml` beside the watch root | Tier configuration: names each tier and describes it (see below). The default is read only when it already exists — never created. |
+| `--policy <FILE>` | `policy.toml` beside the watch root | Lifecycle rules: per-path `down` transitions and `pins` (see below). Read only when it already exists — never created. With no file the `--min-idle-days` decision stands. |
 | `--include <GLOB>` | *(whole tree)* | Only manage paths matching this glob. Repeatable. |
 | `--exclude <GLOB>` | *(nothing)* | Never manage paths matching this glob. Repeatable; wins over `--include`. |
 | `--min-size <SIZE>` | `0` | Ignore files smaller than this (e.g. `1MiB`). |
@@ -137,6 +138,48 @@ a command never creates it. An explicitly named `--tiers` file is different: if 
 missing or malformed the command refuses to run, naming the line it broke on, rather than
 silently falling back to path-as-tier-name. With no file the tool behaves exactly as
 before: a destination root's path is its own tier name.
+
+### Policy: which rule fired
+
+`policy.toml` (docs/design.md §5) turns the idle gate into per-path rules. Each `[[rule]]`
+matches files by glob and names the `down` transition to take when they are cold:
+
+```toml
+[[rule]]
+name = "intelligent-tiering"
+match = "**"
+down = { after_idle = "30d", from = "ssd", to = "hdd_parked" }
+up = { on_access = true }          # reported by `explain`; recall is the P2 provider's job
+
+[[rule]]
+name = "camcorder-raw"             # a later rule overrides an earlier one for its subtree
+match = "video/raw/**"
+down = { after_idle = "3d", from = "ssd", to = "hdd" }
+pins = ["*.drp", "*.fcpxml"]       # pinned files are never moved, however idle
+```
+
+A rule's `to` tier must name a configured tier that is also a `--dest` root this sweep was
+given, and `down` must actually go *slower*: a rule that names an unconfigured tier, a
+`volatile` tier, an unparseable duration or a `to` that is faster than its `from` is a usage
+error naming the rule — never a silent skip. A `policy.toml` with rules but no `tiers.toml`
+is refused for the same reason. With no `policy.toml` the flag-driven `--min-idle-days`
+decision stands, and `explain` says so rather than inventing a rule.
+
+Every transition **records which rule fired** (`lifecycle.rule` in the catalog) when the
+existing catalog has that namespace name. A sweep never creates a catalog (invariant 9);
+if there is no row to update, the move still reports its rule and warns to run `catalog
+sync`. `just_cache explain <path>` answers "where is this file and why" — naming the rule
+that fired, the rule that has not fired yet, or the exclusion that stopped it:
+
+```sh
+$ just_cache explain shows/old.mkv --watch /mnt/cache --dest /mnt/cold
+  rules:   rule `tiering` (fired) — idle 90.0 d past the 30.0 d after_idle; ssd -> hdd_parked
+  catalog: consulted (catalog); catalog state "offloaded", 0 observed access(es); last rule "tiering"
+```
+
+The config files themselves — `policy.toml` and `tiers.toml`, which default to sitting
+inside the watched tree — are never move candidates: moving the rules that govern a sweep
+would change them behind the operator's back.
 
 ### Scope: what this tool is allowed to touch
 

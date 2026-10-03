@@ -153,9 +153,18 @@ pub enum TiersError {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TierSet {
     tiers: Vec<Tier>,
+    /// The file this set was read from. `tiers.toml` may live inside the watched tree
+    /// (the default is beside the watch root), so a sweep must be able to recognise its
+    /// own config and leave it alone — see `Lifecycle::is_config_file`.
+    path: PathBuf,
 }
 
 impl TierSet {
+    /// The file this set was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The default file beside a watch root.
     pub fn default_path(watch: &Path) -> PathBuf {
         watch.join(TIERS_FILE_NAME)
@@ -201,7 +210,10 @@ impl TierSet {
         for (name, tier) in raw.tiers {
             tiers.push(tier.into_tier(&name, text, path)?);
         }
-        Ok(TierSet { tiers })
+        Ok(TierSet {
+            tiers,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,6 +236,18 @@ impl TierSet {
         self.tiers
             .iter()
             .find(|tier| canonical_or(&tier.path) == wanted)
+    }
+
+    /// The configured tier whose `path` *contains* a file, deepest first. Unlike
+    /// [`TierSet::tier_for_root`] this is a prefix match, because a file is not a root: a
+    /// watched tree is usually a subtree of a tier's pool, and a rule's `from` must name
+    /// the tier the file actually lives on, not the root the operator spelled on the CLI.
+    pub fn tier_containing(&self, path: &Path) -> Option<&Tier> {
+        let wanted = canonical_or(path);
+        self.tiers
+            .iter()
+            .filter(|tier| wanted.starts_with(canonical_or(&tier.path)))
+            .max_by_key(|tier| canonical_or(&tier.path).components().count())
     }
 
     /// The name to print for a tier root: the configured name when the root is a tier,

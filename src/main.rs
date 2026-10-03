@@ -17,12 +17,13 @@ use clap::{Args, Parser, Subcommand};
 
 use just_cache::audit::{self, AuditSource, RepairAction};
 use just_cache::catalog;
-use just_cache::disk_management::{self, FileEntry};
+use just_cache::disk_management;
 use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::journal::{self, Journal};
 use just_cache::locate::{self, LocateRequest};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
+use just_cache::policy::{Lifecycle, RuleSet};
 use just_cache::reconcile;
 use just_cache::restore::{self, RestoreError, RestoreRequest};
 use just_cache::scope::{self, Scope};
@@ -104,6 +105,15 @@ struct SweepArgs {
     /// that is missing or malformed is an error, not a silent fallback.
     #[arg(long, value_name = "FILE")]
     tiers: Option<PathBuf>,
+
+    /// Lifecycle policy (`policy.toml`): rules that decide, per file, which tier it
+    /// belongs on. Each rule has a `match` glob and a `down = { after_idle, from, to }`
+    /// transition; a rule can `pin` patterns to protect, and an `up = { on_access }` rule
+    /// names the promotion. Defaults to `policy.toml` beside the watch root, consulted
+    /// only when it is already there — never created. With no file the sweep's decision is
+    /// the flag-driven `--min-idle-days` one, exactly as before.
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
 
     /// Seconds to sleep between sweeps.
     #[arg(long, value_name = "SECS", default_value_t = 3600)]
@@ -317,6 +327,12 @@ struct ExplainArgs {
     /// as a `--dest` (a destination is a home; a volatile tier is a mirror, §2.1).
     #[arg(long, value_name = "FILE")]
     tiers: Option<PathBuf>,
+
+    /// Lifecycle policy (`policy.toml`): the rules that decide where a file belongs, and
+    /// the answer to "which rule fired or which exclusion stopped it". Defaults to
+    /// `policy.toml` beside the watch root, consulted only when it is already there.
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
 
     /// Only manage files matching these globs — the same `--include` a sweep uses.
     #[arg(long, value_name = "GLOB")]
@@ -562,6 +578,24 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
+    // The lifecycle policy is loaded and validated before anything moves. A rule that
+    // names an unconfigured tier, a volatile cache overlay, an impossible from/to pair or
+    // an unparseable duration is a usage error naming the rule — never a silent skip.
+    let rules = match load_policy(args.policy.as_deref(), &watch) {
+        Ok(rules) => rules,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let lifecycle = match build_lifecycle(&rules, &tiers) {
+        Ok(lifecycle) => lifecycle,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let dest_tiers = destination_tiers(tiers.as_ref(), &args.dest);
 
     let policy = match args.policy() {
         Ok(policy) => policy,
@@ -643,6 +677,8 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             scope: &scope,
             tracker: &mut tracker,
             journal: &mut journal,
+            lifecycle: lifecycle.as_ref(),
+            dest_tiers: &dest_tiers,
         };
         let report = sweep(&mut state, pass);
         // Compaction is what keeps the journal describing only what is still in flight:
@@ -937,6 +973,22 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
     }
+    // The same policy/tier pairing a sweep uses, so `explain` answers with the rules that
+    // would actually decide — a different policy here would explain a different tool.
+    let rules = match load_policy(args.policy.as_deref(), &args.watch) {
+        Ok(rules) => rules,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let lifecycle = match build_lifecycle(&rules, &tiers) {
+        Ok(lifecycle) => lifecycle,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
 
     let scope = match Scope::build(&args.include, &args.exclude, args.min_size, args.max_size) {
         Ok(scope) => scope,
@@ -1009,6 +1061,7 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
         tracker: &tracker,
         min_free: args.min_free_bytes(),
         catalog: catalog_path,
+        lifecycle: lifecycle.as_ref(),
     };
     let explanation = explain::explain(&context);
 
@@ -1331,6 +1384,59 @@ fn load_tiers(explicit: Option<&Path>, beside: &Path) -> Result<Option<TierSet>,
     }
 }
 
+/// Load the lifecycle policy for an invocation: `--policy` when named, otherwise
+/// `policy.toml` beside `beside` when it is already there — the same open-if-present rule
+/// `tiers.toml` uses, so a command never creates a config it was not asked to.
+fn load_policy(explicit: Option<&Path>, beside: &Path) -> Result<Option<RuleSet>, String> {
+    match explicit {
+        Some(path) => RuleSet::load(path).map(Some).map_err(|err| err.to_string()),
+        None => RuleSet::load_beside(beside).map_err(|err| err.to_string()),
+    }
+}
+
+/// Build the lifecycle engine from a policy and a tier config, refusing a rule that names
+/// a tier the config does not describe.
+///
+/// A `policy.toml` with rules but no `tiers.toml` is a usage error: a rule governs tiers,
+/// and every tier it names is therefore unconfigured. A policy with no rules is a no-op,
+/// not an error — a file that should not have been created answers "no rule matches".
+fn build_lifecycle<'a>(
+    rules: &'a Option<RuleSet>,
+    tiers: &'a Option<TierSet>,
+) -> Result<Option<Lifecycle<'a>>, String> {
+    let Some(rules) = rules else {
+        return Ok(None);
+    };
+    let Some(tiers) = tiers else {
+        if rules.is_empty() {
+            return Ok(None);
+        }
+        return Err(format!(
+            "--policy {} has rules but no tier config; add a tiers.toml beside the watch \
+             root (or pass --tiers), because a rule names tiers",
+            rules.path().display()
+        ));
+    };
+    rules.validate_tiers(tiers).map_err(|err| err.to_string())?;
+    Ok(Some(Lifecycle::new(rules, tiers)))
+}
+
+/// The `(configured tier name, destination root)` pairs for the destinations given. A
+/// destination the config does not name gets no tier, so no rule can target it.
+fn destination_tiers(tiers: Option<&TierSet>, dests: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let Some(tiers) = tiers else {
+        return Vec::new();
+    };
+    dests
+        .iter()
+        .filter_map(|dest| {
+            tiers
+                .tier_for_root(dest)
+                .map(|tier| (tier.name.clone(), dest.clone()))
+        })
+        .collect()
+}
+
 /// Refuse a destination root the config marks volatile.
 ///
 /// §2.1 is a hard rule: a volatile tier is a promotion target, never the place a file
@@ -1423,6 +1529,10 @@ struct Sweep<'a> {
     scope: &'a Scope,
     tracker: &'a mut UsageTracker,
     journal: &'a mut Journal,
+    /// The lifecycle rules, when `policy.toml` governs this sweep.
+    lifecycle: Option<&'a Lifecycle<'a>>,
+    /// `(tier name, destination root)` pairs, so a rule's `to` tier can be routed to.
+    dest_tiers: &'a [(String, PathBuf)],
 }
 
 fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
@@ -1431,6 +1541,8 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
     let args = state.args;
     let policy = state.policy;
     let scope = state.scope;
+    let lifecycle = state.lifecycle;
+    let dest_tiers = state.dest_tiers;
     let tracker: &mut UsageTracker = state.tracker;
     let journal: &mut Journal = state.journal;
     let now = SystemTime::now();
@@ -1490,6 +1602,8 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             scope,
             guards: &guards,
             journal,
+            lifecycle,
+            dest_tiers,
         };
         let replicated = file_movement::migrate_replicated(
             &pending,
@@ -1503,6 +1617,43 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
         report.records.extend(replicated.records);
         report.replication = replicated.replication;
         pending.clear();
+    } else if lifecycle.is_some() {
+        // Rule path: a `policy.toml` decides both whether a file is cold and which tier it
+        // belongs on, so candidates are not poured into the fastest disk with room — each
+        // is routed to the tier its rule names.
+        let mut context = file_movement::MoveContext {
+            policy,
+            scope,
+            guards: &guards,
+            journal,
+            lifecycle,
+            dest_tiers,
+        };
+        let by_rules = file_movement::migrate_least_used(
+            &pending,
+            tracker,
+            &mut context,
+            now,
+            |candidate: &file_movement::Candidate| {
+                let dest = candidate.tier.as_deref().and_then(|name| {
+                    dest_tiers
+                        .iter()
+                        .find(|(tier, _)| tier == name)
+                        .map(|(_, path)| path)
+                });
+                match dest {
+                    Some(dest) => Ok(disk_management::destination_with_room(
+                        dest,
+                        candidate.entry.allocated,
+                        min_free,
+                    )),
+                    None => Ok(None),
+                }
+            },
+        );
+        report.records.extend(by_rules.records);
+        report.replication.extend(by_rules.replication);
+        pending.clear();
     } else {
         for dest in dests {
             // Both sides matter: the guards are live state (a descriptor can open at any
@@ -1513,16 +1664,18 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
                 scope,
                 guards: &guards,
                 journal,
+                lifecycle: None,
+                dest_tiers,
             };
             let tier = file_movement::migrate_least_used(
                 &pending,
                 tracker,
                 &mut context,
                 now,
-                |entry: &FileEntry| {
+                |candidate: &file_movement::Candidate| {
                     Ok(disk_management::destination_with_room(
                         dest,
-                        entry.allocated,
+                        candidate.entry.allocated,
                         min_free,
                     ))
                 },
@@ -1564,6 +1717,34 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             catalog::Catalog::open_existing(catalog::Catalog::default_path(watch))
         {
             record_replicas(&existing_catalog, &report.replication);
+        }
+    }
+
+    // Record which rule decided each transition (§5). A sweep never creates a catalog
+    // (invariant 9), so it updates only an existing catalog row and warns if a move cannot
+    // be persisted. The per-file report still names the rule; dry-run records nothing,
+    // because nothing transitioned.
+    if lifecycle.is_some() {
+        match catalog::Catalog::open_existing(catalog::Catalog::default_path(watch)) {
+            Ok(Some(existing_catalog)) => record_lifecycle_rules(&existing_catalog, watch, &report),
+            Ok(None)
+                if report.records.iter().any(|record| {
+                    matches!(
+                        record.outcome,
+                        FileOutcome::Moved | FileOutcome::LinkedExisting
+                    ) && record.rule.is_some()
+                }) =>
+            {
+                eprintln!(
+                    "just_cache: policy-governed moves completed without an existing catalog; \
+                     the sweep does not create one, so run `catalog sync` to persist lifecycle.rule"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "just_cache: policy-governed moves completed, but could not open the existing \
+                 catalog to record lifecycle.rule: {err}"
+            ),
         }
     }
 
@@ -1619,6 +1800,39 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
         .collect()
+}
+
+/// Write the rule that decided each transition into an existing catalog (§5). A record
+/// whose path the catalog has not ingested yet is skipped: a sweep must not invent a name,
+/// and the next `catalog sync` brings it in.
+fn record_lifecycle_rules(catalog: &catalog::Catalog, watch: &Path, report: &MigrationReport) {
+    for record in &report.records {
+        let Some(rule) = record.rule.as_deref() else {
+            continue;
+        };
+        // Only real transitions: a dry run plans and moves nothing, so it records nothing.
+        if !matches!(
+            record.outcome,
+            FileOutcome::Moved | FileOutcome::LinkedExisting
+        ) {
+            continue;
+        }
+        let Ok(relative) = record.path.strip_prefix(watch) else {
+            continue;
+        };
+        match catalog.record_lifecycle_rule(&relative.to_string_lossy(), rule) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "just_cache: moved {} by rule `{rule}`, but it is not in the catalog; run \
+                 `catalog sync` before the next policy sweep to record lifecycle.rule",
+                record.path.display()
+            ),
+            Err(err) => eprintln!(
+                "just_cache: moved {} by rule `{rule}`, but could not record lifecycle.rule: {err}",
+                record.path.display()
+            ),
+        }
+    }
 }
 
 /// Write the verified copies of one sweep into an existing catalog, if the objects are
