@@ -409,6 +409,18 @@ preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of 
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
 
+Closed in P1 by issue #72: `audit`, `scrub`, and `reconcile` no longer turn a location row's
+`tier` and `storage_key` into a filesystem path blindly. A sync records the canonical watch
+and destination roots in the catalog; readers prove the tier is one of those roots and reject
+an absolute key or any key with a `..` component before stat, hash, create, or replace. A
+refused row is reported as `malformed-catalog`, and the outside path is not touched. The
+integration test edits the catalog directly to reproduce absolute-key, parent-component,
+and unknown-tier rows; it asserts the outside sentinel and the would-be reconcile target
+remain unchanged/nonexistent. A catalog from before root tracking fails closed until a
+successful `catalog sync` records independently observed roots. This prevents a path-escape
+through a location row, not an operator who edits both the location and trusted-root rows
+consistently; the catalog is not a tamper-proof trust store.
+
 Closed in P1 by #75: the resume path no longer discards a repair candidate's verdict. When a
 group has rot but no sibling verified clean *this run*, `scrub` re-reads its already-verified
 locations as possible repair sources — and that re-read is now recorded as the location's real
@@ -562,6 +574,20 @@ on a second filesystem (`tests/cross_device.rs`), and, through a new
 `JUST_CACHE_FAULT=replace-verified-dest` seam, an adoption whose destination is swapped in
 the verification-to-removal window (`tests/fault_injection.rs`). Both fail if the guard is
 reverted.
+
+Closed by #80: a `--dest` root nested inside the watched tree — or a `--watch` nested inside
+a `--dest` root — is now refused up front, in both directions. The shared `validate_paths`
+check used to reject only `dest == watch` (canonical equality), so `--watch /data --dest
+/data/cold` passed: the sweep wrote its copy into a directory it also scans, discovered that
+copy on the next pass, and tiered it deeper, moving its own output once per pass. The check
+now compares the canonical roots component-wise (`Path::starts_with`), which is what makes
+`/data` a prefix of `/data/cold` but not of a sibling named `/database`, and it names the
+direction in the refusal ("inside the watched tree" / "inside the `--dest` root"). Because
+`validate_paths` is shared, every subcommand that takes a `--watch`/`--dest` pair inherits
+it; the acceptance criteria cover the sweep and `catalog sync`, and `tests/nested_dest.rs`
+drives the real binary for both, both directions, plus a symlinked `--dest` that resolves
+inside the watch (the check is on the canonical path, not the spelling) and a name-prefix
+sibling that must still be accepted.
 
 Still open, and honestly so:
 
@@ -853,6 +879,10 @@ Still open, and honestly so:
   command act on a name the operator did not give it. The operator re-runs with the path as
   the filesystem spells it (§9, #70).
 - Multi-user quotas/permissions: single-trust-domain system.
+- **The catalog is not a tamper-proof trust store.** Row-path validation rejects an edited
+  `location` row against the roots recorded by sync (or supplied to `audit`); protecting
+  against an actor who edits both the location and the root table is outside the threat
+  model. Protect the catalog file with the same access controls as the data it describes.
 - **Tightening a catalog that already exists is not this guard's job.** #73 fixes how a
   catalog is *created* and *opened*: a fresh one is 0600, and a symlink at its name or a
   SQLite sibling is refused. A catalog an earlier version already created 0644 is left

@@ -191,6 +191,20 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
                 Err(_) => continue,
             };
             let path = entry.path();
+            let name = entry.file_name();
+
+            // Our own bookkeeping: the journal and any in-flight copies, whether a
+            // file or a directory. Moving the journal onto a cold tier would be
+            // absurd, and worse, would destroy the record of what is in flight
+            // exactly when it is needed. Test the name before the type branches so
+            // a prefixed *directory* is neither descended nor returned: its contents
+            // are internal too (invariant 8).
+            if name
+                .to_string_lossy()
+                .starts_with(crate::journal::INTERNAL_PREFIX)
+            {
+                continue;
+            }
 
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -207,16 +221,6 @@ pub fn list_files_recursive(root: &Path) -> Result<Vec<FileEntry>, DiskError> {
             }
             if !metadata.is_file() {
                 // sockets, fifos, devices: not our business
-                continue;
-            }
-            let name = entry.file_name();
-            // Our own bookkeeping: the journal and any in-flight copies. Moving the
-            // journal onto a cold tier would be absurd, and worse, would destroy the
-            // record of what is in flight exactly when it is needed.
-            if name
-                .to_string_lossy()
-                .starts_with(crate::journal::INTERNAL_PREFIX)
-            {
                 continue;
             }
 
@@ -1600,6 +1604,33 @@ mod tests {
         assert!(
             linked.is_symlink,
             "symlinks must be flagged as already migrated"
+        );
+    }
+
+    #[test]
+    fn walks_past_internal_prefixed_directories_without_descending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("watched");
+        fs::create_dir_all(root.join(".just_cache-partial-x/nested")).unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join(".just_cache-partial-x/in-flight.bin"), b"partial").unwrap();
+        fs::write(
+            root.join(".just_cache-partial-x/nested/deep.bin"),
+            b"partial",
+        )
+        .unwrap();
+        fs::write(root.join("real/keep.bin"), b"real").unwrap();
+
+        let names: Vec<String> = list_files_recursive(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.relative.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["real/keep.bin".to_string()],
+            "a prefixed directory must not be descended: its files are internal too"
         );
     }
 

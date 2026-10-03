@@ -43,7 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -157,6 +157,14 @@ CREATE TABLE IF NOT EXISTS damage (
     PRIMARY KEY (tier, storage_key)
 );
 CREATE INDEX IF NOT EXISTS damage_by_object ON damage(object_id);
+-- The canonical roots the catalog was synced from: the watch root and every `--dest`
+-- root. A reader joins a location's `tier` to a path only when it is one of these, so a
+-- hand-edited (or restored-from-backup) catalog cannot point a scrub's replace, a
+-- reconcile's create, or an audit's hash outside every destination root (issue #72).
+-- `catalog sync` is the only writer, like every other table here.
+CREATE TABLE IF NOT EXISTS root (
+    path TEXT PRIMARY KEY
+);
 ";
 
 #[derive(Debug, Error)]
@@ -357,9 +365,16 @@ pub struct ScrubTarget {
 }
 
 impl ScrubTarget {
-    /// Where the bytes are: the tier root joined with the key within it.
-    pub fn path(&self) -> PathBuf {
-        Path::new(&self.tier).join(&self.storage_key)
+    /// Where the bytes are: the tier root joined with the key within it, after proving the
+    /// row stays under a root this invocation trusts.
+    ///
+    /// This is the only way a recorded row becomes a filesystem path for a scrub. A row
+    /// whose tier is not a trusted root, whose key is absolute, or whose key contains `..`
+    /// is refused before any filesystem call, so a hand-edited (or restored-from-backup)
+    /// catalog cannot point the tool at a file outside every destination root (issue #72,
+    /// `SECURITY.md`).
+    pub fn path(&self, roots: &[PathBuf]) -> Result<PathBuf, RowPathError> {
+        resolve_location_path(&self.tier, &self.storage_key, roots)
     }
 
     /// True when this location has already been verified against the object it now
@@ -371,6 +386,114 @@ impl ScrubTarget {
     pub fn object_hex(&self) -> String {
         hex(&self.object)
     }
+}
+
+/// Why a recorded `(tier, storage_key)` is not a filesystem path the tool may touch.
+///
+/// A catalog row is data, and a path built from that data is one an editor of the catalog
+/// controls. `Path::join` with an absolute component discards the tier, and a `..`
+/// component walks out of it lexically — so a row is checked against the roots this
+/// invocation trusts before it becomes a path (issue #72).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowPathError {
+    /// The tier is not one of the canonical roots this invocation trusts. The catalog
+    /// writer only ever recorded a watch or `--dest` root, so anything else is a row no
+    /// current root explains.
+    UnknownTier,
+    /// The key is absolute: `Path::join` would replace the tier with it entirely.
+    AbsoluteKey,
+    /// The key contains a `..` component: the join walks out of the tier lexically.
+    ParentDirKey,
+    /// The joined path is not under the tier root (defence in depth; with the key checks
+    /// above this only fires for a tier that is not itself canonical).
+    Escapes,
+}
+
+impl RowPathError {
+    /// The reason, for a report line.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            RowPathError::UnknownTier => "tier is not one of the current roots",
+            RowPathError::AbsoluteKey => "storage_key is absolute and would replace the tier",
+            RowPathError::ParentDirKey => "storage_key contains `..` and would escape the tier",
+            RowPathError::Escapes => "resolved path does not sit under the tier root",
+        }
+    }
+}
+
+/// A catalog row the reader refused to turn into a path, reported instead of touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedRow {
+    pub tier: String,
+    pub storage_key: String,
+    pub detail: String,
+}
+
+impl MalformedRow {
+    pub fn new(tier: &str, storage_key: &str, error: &RowPathError) -> Self {
+        MalformedRow {
+            tier: tier.to_string(),
+            storage_key: storage_key.to_string(),
+            detail: error.detail().to_string(),
+        }
+    }
+
+    /// One report line, in the voice of the rest of the tool's output.
+    pub fn describe(&self) -> String {
+        format!(
+            "  malformed catalog row {}/{}: {} (no filesystem operation)",
+            self.tier, self.storage_key, self.detail
+        )
+    }
+}
+
+/// Turn a recorded `(tier, storage_key)` into the filesystem path to touch, refusing any
+/// row that does not provably stay under a trusted root.
+///
+/// `roots` are the canonical root paths this invocation trusts: the watch root and every
+/// `--dest`, as `catalog sync` recorded them. The tier must be one of them exactly; an
+/// empty set (a catalog not yet synced since root tracking was added) fails closed because
+/// the reader has no independent way to tell a real root from an edited row. Everything
+/// the three readers do with a row — stat, hash, create, replace — goes through here
+/// first, so a refused row is only ever *reported*, never touched.
+pub fn resolve_location_path(
+    tier: &str,
+    storage_key: &str,
+    roots: &[PathBuf],
+) -> Result<PathBuf, RowPathError> {
+    let tier_path = Path::new(tier);
+    if tier_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(RowPathError::UnknownTier);
+    }
+
+    // With no independently observed roots we cannot distinguish a legitimate absolute
+    // tier from one substituted into an edited location row, so refuse it. A `catalog sync`
+    // refreshes root rows from a filesystem walk before readers act on this catalog.
+    let root = roots
+        .iter()
+        .find(|root| root.as_path() == tier_path)
+        .cloned()
+        .ok_or(RowPathError::UnknownTier)?;
+
+    let key = Path::new(storage_key);
+    if key.is_absolute() {
+        return Err(RowPathError::AbsoluteKey);
+    }
+    if key
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(RowPathError::ParentDirKey);
+    }
+
+    let path = root.join(key);
+    if !path.starts_with(&root) {
+        return Err(RowPathError::Escapes);
+    }
+    Ok(path)
 }
 
 /// The counts behind "has this copy ever been scrubbed?", for `audit`.
@@ -490,6 +613,10 @@ pub(crate) struct Observation {
     pub(crate) accessed: BTreeMap<ObjectId, i64>,
     /// Tier string of the watched (hot) root.
     pub(crate) watch_tier: String,
+    /// Canonical root strings this observation was taken under: the watch root and every
+    /// `--dest`. Persisted so a later reader can re-check that a row's tier is real
+    /// instead of trusting the stored string (issue #72).
+    pub(crate) roots: BTreeSet<String>,
     /// Structural problems found while walking, independent of the catalog.
     pub(crate) differences: Vec<Difference>,
 }
@@ -739,6 +866,17 @@ impl Catalog {
 
         let now = now_seconds();
         let tx = self.conn.transaction()?;
+
+        // 0. The roots this catalog was synced from. Recorded inside the one transaction so
+        //    an interrupted sync leaves no half-declared root, and so a later reader can
+        //    prove a row's tier is one of them instead of joining the stored string blind
+        //    (issue #72).
+        for root in &observation.roots {
+            tx.execute(
+                "INSERT OR IGNORE INTO root (path) VALUES (?1)",
+                params![root],
+            )?;
+        }
 
         // 1. Objects. A known object keeps its identity and only has its state refreshed;
         //    a new one is created (never before its names, which reference it).
@@ -1071,6 +1209,22 @@ impl Catalog {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The canonical roots this catalog was synced from, for a reader that must re-check a
+    /// row's `tier` before joining it into a path (issue #72).
+    ///
+    /// Empty for a catalog written before roots were recorded; [`resolve_location_path`]
+    /// then refuses rows until a successful `catalog sync` records independently observed
+    /// roots.
+    pub fn roots(&self) -> Result<Vec<PathBuf>, CatalogError> {
+        let mut stmt = self.conn.prepare("SELECT path FROM root ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(PathBuf::from(row?));
         }
         Ok(out)
     }
@@ -1616,6 +1770,10 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
         watch_tier: watch_tier.clone(),
         ..Observation::default()
     };
+    observation.roots.insert(watch_tier.clone());
+    for (_, tier) in &dest_roots {
+        observation.roots.insert(tier.clone());
+    }
     // One hash per unique file: a symlink and the cold scan both see the same bytes, and
     // hashing a 40 GB file twice would be the tool's own worst enemy.
     let mut hashes: BTreeMap<PathBuf, ObjectId> = BTreeMap::new();
@@ -1822,6 +1980,7 @@ mod tests {
             "volume",
             "scrub_state",
             "damage",
+            "root",
         ] {
             let found: i64 = catalog
                 .conn
@@ -2117,7 +2276,8 @@ mod tests {
 
         let target = catalog.scrub_targets().unwrap().pop().unwrap();
         assert!(!target.is_already_verified());
-        assert_eq!(target.path(), watch.join("a.bin"));
+        let roots = catalog.roots().unwrap();
+        assert_eq!(target.path(&roots).unwrap(), watch.join("a.bin"));
 
         catalog
             .record_verified(&target.tier, &target.storage_key, &target.object)
@@ -2148,5 +2308,73 @@ mod tests {
         assert_eq!(damaged.damaged, 1);
         assert_eq!(damaged.verified, 0);
         assert_eq!(damaged.never_scrubbed, 1);
+    }
+
+    #[test]
+    fn a_recorded_row_only_becomes_a_path_under_a_trusted_root() {
+        let roots = vec![PathBuf::from("/hot"), PathBuf::from("/cold")];
+
+        // The legitimate row resolves exactly as a join would.
+        assert_eq!(
+            resolve_location_path("/cold", "shows/ep1.mkv", &roots).unwrap(),
+            PathBuf::from("/cold/shows/ep1.mkv")
+        );
+
+        // An absolute key would have replaced the tier entirely.
+        assert_eq!(
+            resolve_location_path("/cold", "/etc/passwd", &roots),
+            Err(RowPathError::AbsoluteKey)
+        );
+        // A `..` component walks out of the tier lexically.
+        assert_eq!(
+            resolve_location_path("/cold", "../../etc/passwd", &roots),
+            Err(RowPathError::ParentDirKey)
+        );
+        // A tier no current root explains is refused even with a harmless key.
+        assert_eq!(
+            resolve_location_path("/etc", "passwd", &roots),
+            Err(RowPathError::UnknownTier)
+        );
+        assert_eq!(
+            resolve_location_path("relative/dir", "x.bin", &roots),
+            Err(RowPathError::UnknownTier)
+        );
+
+        // Without any roots independently recorded from a sync, the catalog fails closed:
+        // even an absolute tier cannot be distinguished from an edited row.
+        assert_eq!(
+            resolve_location_path("/cold", "../../etc/passwd", &[]),
+            Err(RowPathError::UnknownTier)
+        );
+        assert_eq!(
+            resolve_location_path("relative/dir", "x.bin", &[]),
+            Err(RowPathError::UnknownTier)
+        );
+        assert_eq!(
+            resolve_location_path("/cold", "shows/ep1.mkv", &[]),
+            Err(RowPathError::UnknownTier)
+        );
+    }
+
+    #[test]
+    fn a_sync_records_the_roots_it_was_run_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("hot");
+        let cold_a = tmp.path().join("cold-a");
+        let cold_b = tmp.path().join("cold-b");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold_a).unwrap();
+        fs::create_dir_all(&cold_b).unwrap();
+        fs::write(watch.join("a.bin"), b"payload").unwrap();
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog
+            .sync(&watch, &[cold_a.clone(), cold_b.clone()])
+            .unwrap();
+
+        let roots = catalog.roots().unwrap();
+        assert!(roots.contains(&canonical(&watch)), "roots: {roots:?}");
+        assert!(roots.contains(&canonical(&cold_a)), "roots: {roots:?}");
+        assert!(roots.contains(&canonical(&cold_b)), "roots: {roots:?}");
     }
 }

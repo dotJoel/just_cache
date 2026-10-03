@@ -71,7 +71,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CatalogError, LocationRecord, ReconcileObject, STATE_PRESENT, STATE_RESTORING,
+    resolve_location_path, Catalog, CatalogError, LocationRecord, ReconcileObject, RowPathError,
+    STATE_PRESENT, STATE_RESTORING,
 };
 use crate::digest;
 use crate::restore;
@@ -105,6 +106,9 @@ pub enum ReconcileOutcome {
     /// No sibling verified against the recorded checksum, so the object stays
     /// under-replicated and is reported; nothing was copied and nothing deleted.
     NoSource { detail: String },
+    /// The row was refused before any filesystem call: its tier is not a trusted root, or
+    /// its key would escape one. Reported, never joined or touched (issue #72).
+    Malformed { detail: String },
     /// The rebuild itself failed (permissions, a full disk, a torn read-back).
     Failed { detail: String },
 }
@@ -118,6 +122,7 @@ impl ReconcileOutcome {
             ReconcileOutcome::Conflict { .. } => "conflict",
             ReconcileOutcome::TierUnavailable => "tier-unavailable",
             ReconcileOutcome::NoSource { .. } => "no-source",
+            ReconcileOutcome::Malformed { .. } => "malformed-catalog",
             ReconcileOutcome::Failed { .. } => "failed",
         }
     }
@@ -166,6 +171,11 @@ impl ReconcileRecord {
                 self.path.display(),
                 self.object
             ),
+            ReconcileOutcome::Malformed { detail } => format!(
+                "  malformed catalog row {} (object {}): {detail} (no filesystem operation)",
+                self.path.display(),
+                self.object
+            ),
             ReconcileOutcome::Failed { detail } => format!(
                 "  FAILED to rebuild {} (object {}): {detail}",
                 self.path.display(),
@@ -211,7 +221,7 @@ impl ReconcileReport {
         };
         let mut lines = vec![format!("reconcile: {}", self.catalog.display())];
         lines.push(format!(
-            "  objects: {} ({} destination tier(s) with a recorded floor); rebuilt: {}, adopted: {}, conflicts: {}, tiers unavailable: {}, no verified sibling: {}, failed: {}",
+            "  objects: {} ({} destination tier(s) with a recorded floor); rebuilt: {}, adopted: {}, conflicts: {}, tiers unavailable: {}, no verified sibling: {}, malformed-catalog: {}, failed: {}",
             self.objects,
             self.tiers,
             count("rebuilt"),
@@ -219,6 +229,7 @@ impl ReconcileReport {
             count("conflict"),
             count("tier-unavailable"),
             count("no-source"),
+            count("malformed-catalog"),
             count("failed")
         ));
         lines.extend(self.finding_lines());
@@ -248,6 +259,9 @@ pub struct ReconcileRequest<'a> {
 pub fn reconcile(request: &ReconcileRequest<'_>) -> Result<ReconcileReport, ReconcileError> {
     let catalog = request.catalog;
     let floors = catalog.all_tier_floors()?;
+    // The roots a row's tier must be one of before any path is joined. Read once here so a
+    // hand-edited tier is refused before the first stat (issue #72).
+    let roots = catalog.roots()?;
     let mut report = ReconcileReport {
         catalog: catalog.path().to_path_buf(),
         dry_run: request.dry_run,
@@ -262,10 +276,33 @@ pub fn reconcile(request: &ReconcileRequest<'_>) -> Result<ReconcileReport, Reco
     }
 
     for object in catalog.reconcile_objects()? {
-        reconcile_object(catalog, &object, &floors, request.dry_run, &mut report)?;
+        reconcile_object(
+            catalog,
+            &object,
+            &floors,
+            &roots,
+            request.dry_run,
+            &mut report,
+        )?;
     }
 
     Ok(report)
+}
+
+/// One refused row, reported in the shape of every other reconcile record.
+fn malformed_record(
+    object_hex: &str,
+    tier: &str,
+    key: &str,
+    error: &RowPathError,
+) -> ReconcileRecord {
+    ReconcileRecord {
+        object: object_hex.to_string(),
+        path: PathBuf::from(format!("{tier}/{key}")),
+        outcome: ReconcileOutcome::Malformed {
+            detail: error.detail().to_string(),
+        },
+    }
 }
 
 /// Bring one object back to its floor, if it is below it and anything is missing.
@@ -273,6 +310,7 @@ fn reconcile_object(
     catalog: &Catalog,
     object: &ReconcileObject,
     floors: &[(String, usize)],
+    roots: &[PathBuf],
     dry_run: bool,
     report: &mut ReconcileReport,
 ) -> Result<(), ReconcileError> {
@@ -311,7 +349,20 @@ fn reconcile_object(
     let mut present_keys: BTreeSet<String> = BTreeSet::new();
     let mut missing_rows: Vec<&LocationRecord> = Vec::new();
     for location in &object.locations {
-        let path = Path::new(&location.tier).join(&location.storage_key);
+        // A row is only stat'ed once it has proved to stay under a trusted root. A refused
+        // row is reported and skipped before any filesystem call (issue #72).
+        let path = match resolve_location_path(&location.tier, &location.storage_key, roots) {
+            Ok(path) => path,
+            Err(error) => {
+                report.records.push(malformed_record(
+                    &object_hex,
+                    &location.tier,
+                    &location.storage_key,
+                    &error,
+                ));
+                continue;
+            }
+        };
         if fs::symlink_metadata(&path)
             .map(|m| m.is_file())
             .unwrap_or(false)
@@ -382,8 +433,18 @@ fn reconcile_object(
         if present >= expected_floor {
             break;
         }
+        // The destination is joined only after the row proves to stay under a trusted root:
+        // a refused row is reported, and no directory is created for it (issue #72).
+        let dest = match resolve_location_path(&tier, &key, roots) {
+            Ok(dest) => dest,
+            Err(error) => {
+                report
+                    .records
+                    .push(malformed_record(&object_hex, &tier, &key, &error));
+                continue;
+            }
+        };
         let root = Path::new(&tier);
-        let dest = root.join(&key);
 
         // Invariant 1: a destination root is never created. A disk that is still unmounted
         // is reported, not silently turned into a directory on the wrong filesystem.
@@ -451,7 +512,7 @@ fn reconcile_object(
                 },
             }),
             // Absent: this is the copy to rebuild.
-            Err(_) => match resolve_source(catalog, object, &expected, dry_run)? {
+            Err(_) => match resolve_source(catalog, object, &expected, roots, dry_run)? {
                 SourceResolution::None(detail) => report.records.push(ReconcileRecord {
                     object: object_hex.clone(),
                     path: dest,
@@ -543,6 +604,7 @@ fn resolve_source(
     catalog: &Catalog,
     object: &ReconcileObject,
     expected: &blake3::Hash,
+    roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<SourceResolution, ReconcileError> {
     let is_damaged = |location: &LocationRecord| {
@@ -566,7 +628,20 @@ fn resolve_source(
 
     let mut rejected: Vec<String> = Vec::new();
     for location in ordered {
-        let path = Path::new(&location.tier).join(&location.storage_key);
+        // A sibling is only read once its row proves to stay under a trusted root; a
+        // refused row is named among the rejections, never stat'ed or hashed (#72).
+        let path = match resolve_location_path(&location.tier, &location.storage_key, roots) {
+            Ok(path) => path,
+            Err(error) => {
+                rejected.push(format!(
+                    "{}/{}: {}",
+                    location.tier,
+                    location.storage_key,
+                    error.detail()
+                ));
+                continue;
+            }
+        };
         let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
