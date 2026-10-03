@@ -83,7 +83,8 @@ catalog and integrity commands.
 Today just_cache is a local mover with move recovery and explicit commands to record,
 locate, check, restore and delete copies, plus a FUSE mount and a WebDAV gateway over the
 same catalog. The larger plan — one namespace across local disks, LAN peers, cloud object
-storage and offline volumes — is not implemented yet. See [Design](#design) for that
+storage and offline volumes — is not implemented yet: the remote drivers are the phase
+being worked (P3, tracked as #140–#144). See [Design](#design) for that
 roadmap and its current boundary.
 
 ## Configuration
@@ -312,7 +313,7 @@ the same filesystem-side as `replica-lost`.
 Distinctness is by configured root, not by device: two directories on one pool are two
 destinations. With a floor of 2 and one other disk, the second copy lands on that other
 disk **on the same host** — this survives a disk failure, not the loss of the machine.
-Off-host copies are a later phase.
+Off-host copies are the phase in progress (P3).
 
 ## How a file is chosen
 
