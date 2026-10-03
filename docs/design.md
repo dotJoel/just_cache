@@ -527,9 +527,8 @@ follows the scrub precedent: anything rebuilt is still a finding (a disk was out
 has to see that once), so `0` means every recorded floor was already met, `1` means
 something was rebuilt/adopted or could not be, `2` a missing or unreadable catalog — which
 is a usage error here, because the recorded checksum a rebuild is proved against comes
-from it. What is deliberately out of scope is deciding *when* to reconcile (§10, like
-scrub scheduling) and verifying copies that are present — a stat per location answers
-"is this copy absent", and anything more is the scrubber's job.
+from it. What is deliberately out of scope is verifying copies that are present — a stat
+per location answers "is this copy absent", and anything more is the scrubber's job.
 
 Closed in P1 by the journal-record containment check (#68): `journal::repair` no longer acts
 on the paths a record names without first proving they are paths it is allowed to touch. A
@@ -757,6 +756,21 @@ Still open, and honestly so:
   below the floor is left alone and reported, naming the root that would have been filled.
   The check is by the object's recorded length, which is all the catalog holds, so a sparse
   object whose allocated size is smaller may be refused conservatively (§10).
+- **Reconcile trusts the catalog's state; its schedule is shared with scrub.** The command
+  stays usable on demand, and `schedule.toml` can run it on its own cadence through the
+  same mechanism as scrub (the Closed by #48 entry at the end of this list). It decides
+  "does this object have a hot copy" from the `state` column, so a catalog left stale by a
+  sweep (a sweep records replicas but does not rewrite state) makes reconcile see a
+  `present` object and skip it — the same `catalog sync` that reports the
+  under-replication brings the state current, and reconcile acts on the catalog as recorded
+  rather than re-deriving it.
+- **Reconcile hashes every sibling candidate it considers.** The `verified` flag is not
+  trusted as a source vouch (that is the whole point), so a rebuild reads its source once
+  to prove it and once to copy it. No read budget yet (`scrub` has `--rate`); a rebuild of
+  a large object on a busy tier is unthrottled.
+- **Reconcile has no free-space gate.** A replicated sweep refuses a destination below
+  `--min-free-gb`; a rebuild only fails when the copy itself fails, which is reported per
+  object. A pre-flight floor is a small, honest addition when someone needs it.
 
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
   N distinct `--dest` roots before it retires the source, and `catalog sync --copies N`
@@ -905,6 +919,18 @@ Still open, and honestly so:
   group that has rot, in which case it is re-read and a failed read is marked damaged
   (#75, above). `--rate` is what makes a cron-driven scrub safe to run
   against a tier that is serving reads.
+- **Scrub now has a schedule; the resume rule is what it relies on.** `just_cache scrub`
+  remains an on-demand command, and `schedule.toml` plus `just_cache schedule --run` (from
+  cron) is how it runs on its own cadence — the mechanism is the Closed by #48 entry at the
+  end of this list. A location verified once is still skipped until its content changes
+  under the catalog (or the damage record for it is cleared) — unless it is the only
+  candidate repair source for a group that has rot, in which case it is re-read and a
+  failed read is marked damaged (#75, above) — and a scheduled scrub carries the configured
+  `rate`, so a cron-driven pass keeps its budget against a tier that is serving reads.
+- **`audit --json` does not carry the scrub section.** `audit --catalog` adds
+  "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
+  document has no `scrub` object yet; only the readable path reports it. The readable
+  output is what ships, and the omission is named rather than silently implied.
 - **The symlinked-component guard covers the mover, not every writer.** #71 resolves and
   holds the destination directory only in `move_file_with_symlink`. `copy_into_place`, which
   `--copies` replication and `reconcile` call, still opens `dest.parent()` by path, so a
@@ -1068,12 +1094,47 @@ as deferred and leaves it absent, so a following pass with room rebuilds it — 
 fail if the gates are removed. What is deliberately left to `scrub`, and named in §10, is
 *pacing*: a budget and a rate answer different questions.
 
+Closed by #48: scrub and reconcile now have a schedule of their own. `schedule.toml` — read
+from `--config <FILE>`, or from `schedule.toml` beside the catalog **only when it is already
+there**, the same open-if-present rule `tiers.toml`/`policy.toml` use — holds one table per
+pass (`[scrub]`, `[reconcile]`), each with a required `every` and optional `rate` (scrub
+only) and `min_free_gb`; an unknown key is an error, not a pass nobody scheduled. The
+mechanism is a config file plus a cron contract, not a daemon: cron runs `just_cache schedule
+--run` and the tool decides whether anything is due, so `every` is how often a pass wants to
+run and cron's own period is how often it checks. `just_cache schedule` (no `--run`) is the
+read-only answer to "what runs next": it names each pass's cadence and prints either `due now
+(last run <time>)` or `next run <time>`, so the operator sees the plan without running
+anything — the next-run decision is a pure function of an injected clock, so it is testable
+without waiting for a schedule window. Last-run times are kept in a small
+`.just_cache-schedule.state` file beside the catalog — named under the `.just_cache` prefix
+the walk skips (invariant 8) and written only by an explicit `--run` (invariant 9) — rather
+than in the catalog, because "when did this pass last run" is not a fact the catalog records:
+scrub's `verified_at` is per location, so a run that skips every verified location would move
+no timestamp. A scheduled pass carries its own budget: the scrub in `schedule.toml` is the
+same `--rate` a manual scrub would use (pinned by pacing a 256 KiB read at 512 KiB/s through
+the binary), and each pass is **held back** — reported and left due, never started — while
+any root the catalog records is below its `min_free_gb` floor, because a scrub can write a
+repair and a reconcile a rebuild. The floor is a schedule-level pre-flight rather than a new
+gate inside `scrub`/`reconcile`: "is this a safe moment to start a writer" is a scheduling
+decision, and the reconcile command's own free-space gate is still open (above). Find-or-quiet
+is the exit contract: a due pass that finds something prints its report once and exits `1`
+(the house code a manual pass uses), a pass that finds nothing prints nothing, and with no
+`schedule.toml` nothing runs at all — `just_cache schedule` says so and exits `0`.
+`tests/schedule.rs` drives the real binary for these: nothing-configured runs nothing, the
+visible next-run, a repair reported once and then quiet, the configured rate pacing the read,
+and a floor holding a pass back without verifying a byte; the `schedule.rs` unit tests cover
+the next-run calculation, the config refusals naming their line, and a corrupt state file
+reading as never-run.
+
 ## 10. Non-goals
 
-- **Deciding *when* to reconcile is not this feature's job.** `just_cache reconcile` is an
-  on-demand command, exactly like `scrub`: the operator (or a cron entry) decides when a
-  disk has come back and it is time to fill it. Scheduling re-scan and repair passes is
-  P2, the same phase that owns scrub scheduling.
+- **The tool does not run a maintenance daemon.** `just_cache reconcile` and `just_cache
+  scrub` are on-demand commands, and #48 schedules them without one: `schedule.toml` names a
+  cadence and a budget per pass, and `just_cache schedule --run` — run from cron or a
+  systemd timer — runs whatever is due and records it. A long-lived supervisor is
+  deliberately not the mechanism: it would need a restart policy, log rotation and a pid
+  file for a job that is one command, and cron already exists on every host that would run
+  this.
 - **Ongoing verification of copies that are present is not reconcile's job either.** It
   stats each recorded location — one stat answers "is this copy absent", which is all it
   exists to ask — and leaves the read-back of present copies to `scrub`, the only place

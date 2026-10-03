@@ -46,6 +46,7 @@ re-added disk is missing.
 - 🔙 [Restoring a file](#restoring-a-file)
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
 - 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
+- ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
 - 🔨 [Building and testing](#building-and-testing)
 - 👷 [How this codebase is built](#how-this-codebase-is-built)
 - 🗺️ [Layout](#layout)
@@ -669,9 +670,11 @@ What it guarantees:
 Exit codes: `0` clean, `1` corruption (repaired *or* damaged — rot is evidence about the
 tier and cron should see it), `2` bad invocation (missing catalog file, `--rate 0`).
 
-A named limit: `scrub` is on demand; it does not schedule itself (that is P2), and a
-location verified once is skipped until its content changes under the catalog. `--rate`
-is what makes a cron-driven scrub safe to run against a tier that is serving reads.
+A named limit: `scrub` runs on demand, and `schedule.toml` can run it on its own cadence —
+see [Scheduling the maintenance passes](#scheduling-the-maintenance-passes) — carrying the
+configured `rate`, which is what makes a cron-driven scrub safe against a tier that is
+serving reads. A location verified once is skipped until its content changes under the
+catalog.
 
 ## Reconciling a re-added disk
 
@@ -706,7 +709,55 @@ What it guarantees:
 Exit codes: `0` every recorded floor already met, `1` something was rebuilt/adopted or
 could not be (a disk being out is evidence cron should see once), `2` bad invocation — a
 missing catalog file, since the recorded checksum a rebuild is proved against lives there.
-Like `scrub`, it runs on demand; deciding *when* to reconcile is P2.
+Like `scrub`, it runs on demand — or on the cadence `schedule.toml` gives it
+([Scheduling the maintenance passes](#scheduling-the-maintenance-passes)).
+
+## Scheduling the maintenance passes
+
+`scrub` and `reconcile` are on-demand commands, and a small `schedule.toml` lets them run
+themselves without the tool growing a daemon. Cron (or a systemd timer) runs the same
+command every so often, and `just_cache` decides whether anything is due:
+
+```sh
+# schedule.toml, beside the catalog
+[scrub]
+every = "7d"
+rate = 2048          # KiB/s — the same budget `scrub --rate` takes
+min_free_gb = 1.0    # hold the pass back while a tier is below this
+
+[reconcile]
+every = "1h"
+min_free_gb = 1.0
+
+# what runs next, and what each pass would do right now — read-only
+just_cache schedule --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+
+# cron: check every 15 minutes; only the passes that are due run
+*/15 * * * * just_cache schedule --run --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+What the contract is:
+
+- **`every` is how often a pass wants to run; cron's period is only how often it checks.**
+  A check that finds nothing due is quiet and exits `0`, so a fast cron entry is cheap.
+- **The next planned run is visible.** `just_cache schedule` prints, per pass, `due now (last
+  run <time>)` or `next run <time>`, plus the `rate` and free-space floor that will apply.
+- **A scheduled pass keeps its budget.** The scrub in `schedule.toml` uses the same `--rate`
+  as a manual scrub, so a cron-driven pass does not contend with a tier that is serving reads.
+- **A pass below its floor is held back, not started.** While any root the catalog records is
+  below `min_free_gb`, the pass is reported and left due — a scrub can write a repair and a
+  reconcile a rebuild, so neither is started against a disk that is already at its floor.
+- **Find something, report once; find nothing, stay quiet.** A due pass that finds something
+  prints its report once and exits `1` (the same code a manual pass uses); a clean pass prints
+  nothing. With no `schedule.toml`, nothing runs and the command says so.
+- **`--run --dry-run` changes nothing** and does not record the run, so the pass stays due.
+- **Last-run times live in `.just_cache-schedule.state` beside the catalog.** It is internal
+  bookkeeping under the `.just_cache` prefix the walk skips; the config file itself is never
+  created, and an explicitly named `--config` that is missing is an error.
+
+Exit codes: `0` nothing due or every due pass clean, `1` a pass found something or was held
+back by its floor, `2` a bad invocation (missing catalog, missing explicit `--config`, or a
+malformed `schedule.toml` naming its line).
 
 ## Building and testing
 
@@ -822,9 +873,10 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/audit.rs`](src/audit.rs) | Classifying the watched tree against the cold tiers, and the guarded `--repair`. |
 | [`src/scrub.rs`](src/scrub.rs) | Reading every stored copy back, repairing rot from a verified sibling, marking what cannot be repaired. |
 | [`src/reconcile.rs`](src/reconcile.rs) | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
+| [`src/schedule.rs`](src/schedule.rs) | The maintenance schedule: `schedule.toml`, which pass is due at a given time, the last-run state file, and the free-space floor a pass is held back by. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub` and `reconcile` subcommands) and the sweep loop. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile` and `schedule` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
@@ -833,6 +885,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
 | [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
 | [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
+| [`tests/schedule.rs`](tests/schedule.rs) | The schedule through the binary: nothing-configured runs nothing, the visible next-run, the configured rate pacing a read, a floor holding a pass back, and find-or-quiet. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
