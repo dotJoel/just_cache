@@ -475,8 +475,9 @@ where
     }
 
     for entry in candidates {
-        // Re-checked here, immediately before bytes move: a descriptor can be opened
-        // between selection and the move, and on a busy box that window is real.
+        // Re-checked here, immediately before bytes move: the sweep's snapshot cannot see
+        // a descriptor opened after it was taken, so this second open-file scan is the one
+        // that catches a file opened during the walk (invariant 3).
         if let Err(rejected) = scope.allows(entry) {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
@@ -486,7 +487,7 @@ where
             });
             continue;
         }
-        if let Err(in_use) = guards.check(entry) {
+        if let Err(in_use) = guards.recheck(entry) {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
                 destination: None,
@@ -608,8 +609,8 @@ pub fn migrate_replicated(
     }
 
     for entry in candidates {
-        // Same belt-and-braces re-check as the single-copy path: a descriptor can open
-        // between selection and the copy, and on a busy box that window is real.
+        // Same belt-and-braces re-check as the single-copy path: a fresh open-file scan
+        // immediately before the copy, because the sweep's snapshot predates the walk.
         if let Err(rejected) = scope.allows(entry) {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
@@ -619,7 +620,7 @@ pub fn migrate_replicated(
             });
             continue;
         }
-        if let Err(in_use) = guards.check(entry) {
+        if let Err(in_use) = guards.recheck(entry) {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
                 destination: None,
@@ -926,5 +927,77 @@ mod tests {
         assert_eq!(report.moved(), 0);
         assert!(watch.join("cold.bin").is_file(), "source must be untouched");
         assert!(!dest.join("cold.bin").exists());
+    }
+
+    /// The window the mover's re-check exists for: the sweep snapshot is taken, a
+    /// descriptor then opens, and the file is already past selection. The single-copy
+    /// mover must refuse it at the pre-move re-check; reverting that call to the
+    /// snapshot-only `check` makes this test move the file and fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_opened_mid_sweep_is_caught_before_the_move() {
+        use crate::opened::{FileId, OpenFiles};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("watch");
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let path = watch.join("opens-late.bin");
+        fs::write(&path, b"payload").unwrap();
+
+        // The sweep's snapshot, taken while nothing holds the file.
+        let guards = Guards::new(OpenFiles::snapshot(), true);
+
+        // A real descriptor opens after it, held by another process.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3< '{}'; sleep 20", path.display()))
+            .spawn()
+            .expect("spawn a holder process");
+        let target = FileId::of(&path).unwrap();
+        let mut seen = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if OpenFiles::snapshot().contains(target) {
+                seen = true;
+                break;
+            }
+        }
+
+        let entries = disk_management::list_files_recursive(&watch).unwrap();
+        let policy = Policy {
+            min_idle: Duration::ZERO,
+            observed_access_pin: 0,
+            limit: 10,
+            dry_run: false,
+        };
+        let mut journal = Journal::at(tmp.path().join("journal")).unwrap();
+
+        let report = migrate_least_used(
+            &entries,
+            &UsageTracker::new(),
+            &mut MoveContext {
+                policy: &policy,
+                scope: &Scope::everything(),
+                guards: &guards,
+                journal: &mut journal,
+            },
+            SystemTime::now(),
+            |_| Ok(Some(dest.clone())),
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(seen, "the holder must be visible to a fresh scan");
+        assert_eq!(
+            report.in_use(),
+            1,
+            "the pre-move re-check must report the file as open"
+        );
+        assert_eq!(report.moved(), 0);
+        assert!(path.is_file(), "the source must be left alone");
+        assert!(!dest.join("opens-late.bin").exists());
     }
 }

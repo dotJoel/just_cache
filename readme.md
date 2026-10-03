@@ -121,13 +121,15 @@ move — once when candidates are chosen, and again immediately before the bytes
 because a descriptor can be opened in between:
 
 - **Open by another process.** On Linux the sweep takes one snapshot of open descriptors
-  per sweep (from `/proc/*/fd`, matched by device + inode) and skips anything in it.
-  Taking the snapshot once per sweep rather than once per file matters: a process-table
-  scan per candidate would cost more than the copy it protects. The check is honest about
-  its own reach — without root it can only see this user's processes, and it says so
-  (`open-file check is partial: N of M process(es) could not be inspected without
-  privileges`) rather than implying a guarantee it cannot make. On platforms where
-  descriptors cannot be enumerated at all, it warns that files in use may be moved.
+  (from `/proc/*/fd`, matched by device + inode) as a cheap prefilter when candidates are
+  chosen, and then re-scans the process table once per candidate immediately before its
+  bytes move. The second scan is what catches a descriptor opened during the walk — the
+  window the snapshot cannot see — at the cost of a process-table scan for each file it is
+  about to move, not for every file in the tree. The check is honest about its own reach —
+  without root it can only see this user's processes, and it says so (`open-file check is
+  partial: N of M process(es) could not be inspected without privileges`) rather than
+  implying a guarantee it cannot make. On platforms where descriptors cannot be enumerated
+  at all, it warns that files in use may be moved.
 - **Hardlinked elsewhere.** A file with more than one link cannot be moved across
   filesystems without breaking the pair — the link is not merely broken, it is impossible,
   and the other name keeps pointing at the old bytes. Such files are skipped by default;

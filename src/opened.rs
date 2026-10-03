@@ -79,8 +79,11 @@ pub struct OpenFiles {
 impl OpenFiles {
     /// Take a snapshot of every open file this user can see.
     ///
-    /// Deliberately taken once per sweep, not once per candidate: a process-table scan
-    /// per file would cost more than the copy it is protecting.
+    /// One scan, taken when a sweep starts, and used as a cheap prefilter when candidates
+    /// are chosen: it keeps the walk from selecting a file that was already open without
+    /// paying a process-table scan for every file in the tree. It is not the final word —
+    /// a descriptor opened after it is taken is invisible to it, which is why the mover
+    /// re-scans through [`Guards::recheck`] immediately before the bytes move.
     #[cfg(target_os = "linux")]
     pub fn snapshot() -> Self {
         let own_pid = std::process::id();
@@ -273,10 +276,45 @@ impl Guards {
         self.check_hardlinks
     }
 
-    /// Is this file safe to move, given what is using it right now?
+    /// Is this file safe to move, given the sweep's snapshot of what is using it?
+    ///
+    /// The open half consults the snapshot taken when the sweep began, so this is a cheap
+    /// prefilter for candidate selection — **not** the check that guards the move. A
+    /// descriptor opened after the snapshot is invisible here; the mover calls
+    /// [`Guards::recheck`] immediately before the bytes move to catch that window.
     pub fn check(&self, entry: &FileEntry) -> Result<(), InUse> {
         if let Some(id) = FileId::of_entry(entry) {
             if self.open_files.contains(id) {
+                return Err(InUse::OpenElsewhere);
+            }
+        }
+        if self.check_hardlinks {
+            if let Some(links) = link_count(&entry.path) {
+                if links > 1 {
+                    return Err(InUse::Hardlinked { links });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check a file immediately before its bytes would move, against the process table
+    /// *as it is now* rather than the snapshot taken when the sweep started.
+    ///
+    /// The gap this closes is real: the sweep's snapshot can only see descriptors that
+    /// already existed when it was taken, so a file opened during the walk would be moved
+    /// out from under its writer (invariant 3). A fresh scan per candidate costs a
+    /// process-table walk, but only for the files a sweep is actually about to move — not
+    /// for every file in the tree — and the hardlink half is re-stat'ed live in the same
+    /// step. The scan and the rename/remove are still two steps, so a descriptor opened in
+    /// between is missed; that residual window is inherent to any userspace check and is
+    /// named in `docs/design.md` §9 rather than implied away.
+    pub fn recheck(&self, entry: &FileEntry) -> Result<(), InUse> {
+        if let Some(id) = FileId::of_entry(entry) {
+            let live = OpenFiles::snapshot();
+            // An unsupported platform has no process table to consult; the sweep-wide
+            // snapshot said so already, and a second scan cannot add what it could not see.
+            if live.coverage() != Coverage::Unsupported && live.contains(id) {
                 return Err(InUse::OpenElsewhere);
             }
         }
@@ -340,6 +378,54 @@ mod tests {
         let guards = Guards::new(open, false);
 
         assert_eq!(guards.check(&entry(&path)), Err(InUse::OpenElsewhere));
+    }
+
+    /// The sweep snapshot cannot see a descriptor opened after it was taken; the mover's
+    /// pre-move re-check must, because that mid-sweep window is exactly what it exists for.
+    /// Reverting `recheck` to consult the stale snapshot makes this fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_opened_after_the_snapshot_is_caught_by_the_recheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("opens-late.bin");
+        fs::write(&path, b"data").unwrap();
+
+        // The snapshot a sweep would take, while nothing holds the file.
+        let guards = Guards::new(OpenFiles::snapshot(), true);
+        assert_eq!(
+            guards.check(&entry(&path)),
+            Ok(()),
+            "a file nobody holds yet is not in use at selection time"
+        );
+
+        // A real descriptor opens, after that snapshot, held by another process.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3< '{}'; sleep 20", path.display()))
+            .spawn()
+            .expect("spawn a holder process");
+        let target = FileId::of(&path).unwrap();
+        let mut seen = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if OpenFiles::snapshot().contains(target) {
+                seen = true;
+                break;
+            }
+        }
+
+        // Re-check while the holder is still alive: killing it first would close the
+        // descriptor and make the test pass for the wrong reason.
+        let rechecked = guards.recheck(&entry(&path));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(seen, "the holder must be visible to a fresh scan");
+        assert_eq!(
+            rechecked,
+            Err(InUse::OpenElsewhere),
+            "the pre-move re-check must see a descriptor opened after the sweep snapshot"
+        );
     }
 
     #[test]
