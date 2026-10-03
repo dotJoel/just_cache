@@ -1,11 +1,14 @@
 # just_cache
 
-Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink
-behind, so every existing path keeps working.
+Move idle files from a fast filesystem to slower local roots without changing their
+names. `just_cache` journals each move and includes tools to catalog, locate, audit,
+scrub and restore copies, so cold-storage files can be inspected and managed, not just
+moved.
 
 Point it at a directory and one or more cold-storage roots. On each sweep it walks the
-tree, asks the filesystem when each file was last *used*, and moves the ones that have
-gone untouched onto the cold tier, replacing them with a symlink to the new location.
+tree, uses filesystem access time (where the mount records it) to find idle files, and
+moves eligible files to a cold root, leaving a symlink at the original path. Programs
+that do not follow symlinks may be unable to open these files.
 
 ```sh
 just_cache \
@@ -51,10 +54,29 @@ re-added disk is missing.
 
 ## Why
 
-Trees like caches, media libraries and build directories accumulate files that have not
-been read in months. Deleting them loses data; leaving them on a fast disk wastes it.
-`just_cache` moves those files to slower storage and leaves a symlink at the original
-path, so the fast disk is freed and every existing path still opens the same bytes.
+A scheduled move can free fast storage. The harder part is knowing what moved, what
+copies exist, and what to do when a move is interrupted or a stored copy changes.
+`just_cache` combines local hot-to-cold moves with a journal, recovery, and optional
+catalog and integrity commands.
+
+- Every move records and fsyncs its intent first. On the next run, recovery checks the
+  filesystem state rather than assuming the operation completed.
+- Scope, open-file and hardlink guards limit which files a sweep may move. Use `--dry-run`
+  to inspect a plan before changing files.
+- `sweep --copies N` can require N verified copies on distinct configured destination
+  roots before removing the source. Those roots may still be on the same host; this is
+  not off-host backup.
+- `catalog sync` records each file's content hash and locations in SQLite. `locate`,
+  `audit`, `restore` and `scrub` inspect those records, check stored copies, and restore
+  files. Cataloging and scrubbing are explicit commands, not automatic background
+  services.
+- The original path becomes a symlink. Software that does not follow symlinks may not see
+  the file.
+
+Today just_cache is a local mover with move recovery and explicit commands to record,
+locate, check, and restore copies. The larger plan — one namespace across local disks,
+LAN peers, cloud object storage and offline volumes — is not implemented yet. See
+[Design](#design) for that roadmap and its current boundary.
 
 ## Configuration
 
@@ -737,12 +759,19 @@ must not break — the rules that make this tool safe to point at someone's data
 
 ## Design
 
-This tool is one piece of a larger idea. [`docs/design.md`](docs/design.md) sketches it:
-one namespace over every storage tier you own — SSD, spinning disks, a LAN peer, cloud
-object storage, an offline disk in a drawer — with a fast cache overlay (RAM) in front
-of them, placement driven by observed use, and promotion on re-access, in the spirit of
-S3 storage classes. The mover in `src/` is the symlink namespace provider and the
-hot→warm driver of that design, not the whole of it.
+The current provider moves files between local filesystem roots and leaves symlinks in
+the watched tree. It does not yet provide a LAN, cloud-object or offline-volume tier.
+
+The design in [`docs/design.md`](docs/design.md) describes the intended extension: one
+catalog and namespace across local disks, LAN peers, cloud object storage and removable
+offline volumes, with recall latency and restore requirements made explicit. The offline
+tier would keep files discoverable in the catalog while naming the physical volume needed
+to retrieve them. Those providers, the FUSE namespace and automated lifecycle policy are
+planned work, not features in the current binary.
+
+That cross-provider namespace is the longer-term distinction from a local mover. Today,
+the practical benefit is a journaled local mover with commands for cataloging, locating,
+auditing, scrubbing and restoring files.
 
 ## License
 

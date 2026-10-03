@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>just_cache — tiered storage for the files you're not using</title>
-<meta name="description" content="Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink behind, so every existing path keeps working.">
+<title>just_cache — local cold storage you can inspect and verify</title>
+<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Cloud and offline tiers are planned, not yet supported.">
 <style>
   :root {
     --bg: #0b0f14;
@@ -157,7 +157,7 @@
 <header>
   <div class="wordmark"><span class="prompt">$</span> <span>~/storage</span> <span class="sep">::</span> <span>tiered&nbsp;mover</span></div>
   <h1>just_cache<span class="dot">.</span></h1>
-  <p class="lede">Move cold, rarely used files off a fast disk onto slower ones — and leave a symlink behind, so every existing path keeps working.</p>
+  <p class="lede">Move idle files to slower local storage without renaming their paths. just_cache journals moves and includes tools to catalog, locate, audit, scrub and restore copies.</p>
 </header>
 
 <div class="term">
@@ -177,29 +177,36 @@
 </div>
 
 <section id="why">
-  <div class="kicker">The problem</div>
-  <h2>Fast disks are the wrong place for old files</h2>
+  <div class="kicker">Why just_cache</div>
+  <h2>Move cold files and keep track of the copies</h2>
   <p class="lead">
-    Your fastest disk fills up with things nobody has opened in months — media libraries, build caches,
-    old snapshots, VM images. Deleting them loses data. Leaving them costs you the disk's speed and space.
+    A mover can relocate old files. just_cache adds a journal for interrupted moves and commands
+    to record, find, check and restore stored copies.
   </p>
   <p>
-    Conventional tiering asks your applications to change: move the file, update every config, every path,
-    every script. <strong>just_cache skips that part.</strong> It moves the file and leaves a <em>symlink</em>
-    at the original path — so every program, mount and muscle memory keeps working, and the bytes live on the
-    slower tier where they belong.
+    A sweep moves eligible files between local filesystem roots and leaves a <em>symlink</em> at
+    each original path. Programs that follow symlinks can keep using that path; some tools and
+    applications do not handle symlinks as ordinary files, so check your workload first.
   </p>
   <p>
-    That single trick is what makes tiered storage something you can actually run on a homelab or a workstation:
-    the hot tier stays hot because cold files keep drifting down to slower disks, and nothing above the
-    filesystem has to know it happened.
+    Every move records and fsyncs its intent before work begins. Optional <code class="inline">--copies N</code>
+    requires verified copies on distinct configured roots before retiring the source; the roots
+    can still be on the same host. With the catalog, <code class="inline">locate</code> reports recorded
+    locations, while <code class="inline">scrub</code> checks stored bytes against their recorded hashes
+    and can repair a damaged copy from a sibling copy whose bytes match its recorded hash.
+    These catalog and scrub operations are explicit commands.
+  </p>
+  <p>
+    The longer-term design extends this catalog and namespace to LAN, cloud-object and offline
+    volume tiers, with recall latency and cost declared per tier. Those providers are not implemented
+    yet; the current tool handles local filesystem roots. <a href="design.md">See the design and roadmap.</a>
   </p>
 </section>
 
 <section id="quickstart">
   <div class="kicker">Quick start</div>
   <h2>Get from fast to slow in one command</h2>
-  <p class="lead">Build it, point it at a tree and a cold root, run a sweep. Nothing is deleted, nothing is configured, and the paths your apps already use do not change.</p>
+  <p class="lead">Build it, point it at a watched tree and a cold root. A dry run shows the plan without touching files; a real sweep moves eligible files and leaves symlinks at their original paths.</p>
 
   <h3>1. Build</h3>
   <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">build</span></div><pre><code><span class="ps">$</span> cargo build --release</code></pre></div>
@@ -274,7 +281,7 @@
 <section id="more">
   <div class="kicker">The rest of the toolbox</div>
   <h2>Beyond moving files</h2>
-  <p class="lead">The mover is the core; a small set of read-only commands keeps the whole picture honest.</p>
+  <p class="lead">Catalog and recovery commands let you locate, check, and restore files explicitly.</p>
   <div class="features">
     <div class="feat"><div class="name">explain</div><p>Why is <em>this one file</em> still here? Answers one path in the mover's own evaluation order, read-only.</p></div>
     <div class="feat"><div class="name">catalog</div><p>Records where every object lives, keyed by content hash, in a SQLite catalog — identity survives a rename.</p></div>
