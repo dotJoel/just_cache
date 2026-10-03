@@ -466,6 +466,25 @@ from it. What is deliberately out of scope is deciding *when* to reconcile (§10
 scrub scheduling) and verifying copies that are present — a stat per location answers
 "is this copy absent", and anything more is the scrubber's job.
 
+Closed in P1 by `catalog sync` (#73): the catalog is now opened as the untrusted input it
+can be. Its default path is inside the watched tree, and SQLite opens a database with a
+plain `open(2)` and writes predictable `-journal`/`-wal`/`-shm` siblings beside it, so a
+symlink planted at any of those names used to make the tool write, truncate or unlink the
+link's target as its own user. Now the name is created with `O_CREAT|O_EXCL` and mode 0600
+(exact under any umask, because umask can only clear bits 0600 does not have), an existing
+name is refused unless it is a regular file (`symlink_metadata`, so a dangling link is
+refused rather than reported absent by `exists`), the sibling names are refused the same
+way *before* the database is created, and SQLite is opened with `SQLITE_OPEN_NOFOLLOW`.
+`open_existing` — the mover's read-only path — refuses a symlink too instead of following
+it. Nothing is read or written through the link. Left open and named rather than hidden: the
+foreign-owner refusal (a catalog owned by another uid inside a group- or world-writable
+directory) has no deterministic test, because producing it needs a second user or root, so
+it is only as good as the code that reads it; and the sibling check is a stat taken before
+SQLite's own open, so a writer that swaps a name in that window is not covered — a race no
+unprivileged test can win, and one that `SQLITE_OPEN_NOFOLLOW` narrows for the database file
+itself. What is *not* fixed here is a catalog an earlier version already created 0644: this
+change fixes creation, not the mode of a file already on disk (§10).
+
 Still open, and honestly so:
 
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears
@@ -697,5 +716,11 @@ Still open, and honestly so:
   state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
   volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
 - Multi-user quotas/permissions: single-trust-domain system.
+- **Tightening a catalog that already exists is not this guard's job.** #73 fixes how a
+  catalog is *created* and *opened*: a fresh one is 0600, and a symlink at its name or a
+  SQLite sibling is refused. A catalog an earlier version already created 0644 is left
+  exactly as it is — silently chmodding a file the operator already has would be a
+  surprising side effect of running `catalog sync` — and a caller who wants it private
+  changes the mode once, by hand.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.

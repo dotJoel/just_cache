@@ -46,7 +46,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
 
 use crate::digest;
@@ -169,6 +169,27 @@ pub enum CatalogError {
     },
     #[error("catalog query failed: {0}")]
     Query(#[from] rusqlite::Error),
+    #[error("refusing to open the catalog at {path}: it is a symbolic link")]
+    Symlink { path: PathBuf },
+    #[error("refusing to open the catalog at {path}: not a regular file")]
+    NotRegular { path: PathBuf },
+    #[error(
+        "refusing to open the catalog at {path}: owned by uid {owner}, and its directory is \
+         group- or world-writable so another user could have planted it"
+    )]
+    ForeignOwner { path: PathBuf, owner: u32 },
+    #[error("cannot stat the catalog at {path}: {source}")]
+    Stat {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot create the catalog at {path}: {source}")]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot walk {path}: {source}")]
     Walk {
         path: PathBuf,
@@ -522,9 +543,28 @@ impl Catalog {
     /// truth lives. What must never happen is *creating bytes elsewhere* — a missing
     /// `--dest` is still an error, because an unmounted tier must not become a directory
     /// on the wrong filesystem (invariant 1).
+    ///
+    /// Opening is also an untrusted-input boundary. The default path is inside the
+    /// watched tree, and SQLite opens a database with a plain `open(2)` and creates
+    /// predictable `-journal`/`-wal`/`-shm` siblings beside it — all of which a symlink
+    /// planted in a shared tree would redirect at some other file the tool's user can
+    /// write. So the name is created exclusively and privately (mode 0600, no umask
+    /// leakage) when absent, refused when it is a symlink or not a regular file, and
+    /// opened with `SQLITE_OPEN_NOFOLLOW`; the sibling names are checked the same way
+    /// because a journal is written before the first byte of a transaction lands.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, CatalogError> {
         let path = path.into();
-        let conn = Connection::open(&path).map_err(|source| CatalogError::Open {
+        // Siblings first: a refusal must not leave a freshly created catalog behind when
+        // the very name SQLite is about to write a journal to is the planted one.
+        refuse_siblings(&path)?;
+        create_or_check(&path)?;
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|source| CatalogError::Open {
             path: path.clone(),
             source,
         })?;
@@ -546,12 +586,16 @@ impl Catalog {
     /// allowed to bring a catalog into being (invariant 9 — only `catalog sync` does
     /// that), but when one is there it is the right place to note "I wrote a copy, and
     /// here is whether a digest vouched for it".
+    ///
+    /// `symlink_metadata`, not `exists`: a symlink at the name is a catalog this process
+    /// must refuse, and `exists` would follow it (and report a dangling one as absent).
     pub fn open_existing(path: impl Into<PathBuf>) -> Result<Option<Self>, CatalogError> {
         let path = path.into();
-        if !path.exists() {
-            return Ok(None);
+        match fs::symlink_metadata(&path) {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(CatalogError::Stat { path, source }),
+            Ok(_) => Self::open(path).map(Some),
         }
-        Self::open(path).map(Some)
     }
 
     /// The catalog that belongs to this watched root, when `--catalog` is not given.
@@ -1445,6 +1489,110 @@ impl Catalog {
             locations,
         }))
     }
+}
+
+/// Create the catalog file if it is absent, or verify that what is there is trustworthy.
+///
+/// `create_new` is `O_CREAT|O_EXCL`: it either creates the file atomically with mode
+/// 0600 or fails with `AlreadyExists` — which is also what an existing symlink produces,
+/// dangling or not, so a planted link can never be opened *as* the catalog. 0600 is exact
+/// under any umask because umask can only clear bits and this mode has none to clear.
+fn create_or_check(path: &Path) -> Result<(), CatalogError> {
+    match open_new_private(path) {
+        Ok(_created) => Ok(()),
+        // Something is already at the name. It must be a regular file this process owns
+        // (or owns trust for): anything else is someone else's file at a name this tool
+        // is about to write through.
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|source| CatalogError::Stat {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(CatalogError::Symlink {
+                    path: path.to_path_buf(),
+                });
+            }
+            if !metadata.is_file() {
+                return Err(CatalogError::NotRegular {
+                    path: path.to_path_buf(),
+                });
+            }
+            refuse_foreign_owner(path, &metadata)
+        }
+        Err(source) => Err(CatalogError::Create {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Create a file nobody else can read, at a name nobody else holds.
+fn open_new_private(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Refuse a symlink or other non-regular file at a SQLite sibling name.
+///
+/// SQLite names the rollback journal, the WAL and the shared-memory file after the
+/// database (`<db>-journal`, `-wal`, `-shm`). The journal exists before the first page of
+/// a transaction lands, so it is a name an attacker who can watch the tree gets to plant
+/// first. `SQLITE_OPEN_NOFOLLOW` protects the database file itself; these are checked
+/// here so a link at a sibling is refused, leaving every target untouched.
+fn refuse_siblings(path: &Path) -> Result<(), CatalogError> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let sibling = PathBuf::from(name);
+        let Ok(metadata) = fs::symlink_metadata(&sibling) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(CatalogError::Symlink { path: sibling });
+        }
+        if !metadata.is_file() {
+            return Err(CatalogError::NotRegular { path: sibling });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to trust a catalog owned by another user inside a writable directory.
+///
+/// The catalog is the tool's source of truth, and a file another user owns in a tree that
+/// user can write is a file they can also replace between syncs. The directory the
+/// catalog lives in stands in for "the tree": for the default path it *is* the watched
+/// root, and for `--catalog` it is the only directory this process had a say in.
+#[cfg(unix)]
+fn refuse_foreign_owner(path: &Path, metadata: &fs::Metadata) -> Result<(), CatalogError> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = metadata.uid();
+    if owner == rustix::process::geteuid().as_raw() {
+        return Ok(());
+    }
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let group_or_world_writable = fs::symlink_metadata(directory)
+        .map(|dir| dir.mode() & 0o022 != 0)
+        .unwrap_or(true);
+    if group_or_world_writable {
+        return Err(CatalogError::ForeignOwner {
+            path: path.to_path_buf(),
+            owner,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_foreign_owner(_path: &Path, _metadata: &fs::Metadata) -> Result<(), CatalogError> {
+    Ok(())
 }
 
 /// Walk the watched tree and the cold tiers and put down every fact they show.
