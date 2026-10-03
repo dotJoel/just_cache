@@ -798,6 +798,9 @@ pub struct CatalogReport {
     pub accesses: Option<u64>,
     /// `lifecycle.pinned_until` (unix seconds), when the catalog answered.
     pub pinned_until: Option<u64>,
+    /// True while that pin still holds. Reported separately from `pinned_until` so a machine
+    /// reader does not have to re-derive "expired" from a clock it may not share.
+    pub pin_live: bool,
 }
 
 impl CatalogReport {
@@ -811,6 +814,7 @@ impl CatalogReport {
             disagreements: Vec::new(),
             accesses: None,
             pinned_until: None,
+            pin_live: false,
         }
     }
 
@@ -829,6 +833,7 @@ impl CatalogReport {
         }
         format!(
             "{{\"consulted\":{},\"source\":{},\"note\":{},\"accesses\":{},\"pinned_until\":{},\
+             \"pin_live\":{},\
              \"disagreements\":[{}]}}",
             self.consulted,
             json_string(self.source),
@@ -839,6 +844,7 @@ impl CatalogReport {
             self.pinned_until
                 .map(|until| until.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            self.pin_live,
             disagreements.join(",")
         )
     }
@@ -1040,7 +1046,12 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
         .as_ref()
         .filter(|metadata| metadata.is_file() && !metadata.is_symlink())
         .map(|metadata| disk_management::last_use(metadata).0);
-    let catalog_report = catalog_report(catalog, metadata.as_ref(), filesystem_last_access);
+    let catalog_report = catalog_report(
+        catalog,
+        metadata.as_ref(),
+        filesystem_last_access,
+        unix_seconds(SystemTime::now()),
+    );
 
     let Some(metadata) = metadata else {
         return Explanation {
@@ -1204,7 +1215,21 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
     };
 
     // ---- 5. verdict --------------------------------------------------------------
-    let verdict = if pinned {
+    // A live catalog pin comes first: it is the operator's explicit "not this one", it wins
+    // over policy (§5), and the verdict says so with the instant it lapses. An *expired* pin
+    // does not appear here — policy governs again — but the catalog note still names it, so
+    // the expiry is shown rather than silently honoured as "no pin".
+    let live_pin = catalog
+        .and_then(|answer| answer.pinned_until)
+        .filter(|until| *until > unix_seconds(now));
+    let verdict = if let Some(until) = live_pin {
+        Verdict::WouldNeverMove {
+            reason: format!(
+                "pinned in the catalog until {} — a pin wins over policy (§5)",
+                format_rfc3339(until as i64)
+            ),
+        }
+    } else if pinned {
         Verdict::WouldNeverMove {
             reason: format!(
                 "accessed {observed_accesses} time(s) during this run, at or above the pin of \
@@ -1418,10 +1443,14 @@ fn tier_containing(dests: &[PathBuf], resolved: &Path) -> Option<(usize, PathBuf
 }
 
 /// Compare a catalog answer with the filesystem, if one was given.
+///
+/// `now` is the clock a pin's liveness is decided against; it is passed in rather than read
+/// here so a test can drive both the answer and the instant that judges it.
 fn catalog_report(
     catalog: Option<&CatalogAnswer>,
     metadata: Option<&fs::Metadata>,
     filesystem_last_access: Option<SystemTime>,
+    now: u64,
 ) -> CatalogReport {
     let Some(answer) = catalog else {
         return CatalogReport::filesystem_only();
@@ -1449,6 +1478,20 @@ fn catalog_report(
             }
         }
     }
+    // The pin is stated with its expiry *and* whether that expiry has passed: "pinned until
+    // <instant>" without "in force"/"expired" would leave the reader to compare clocks, and
+    // §9 asks for the lapse to be visible rather than implied.
+    let pin_live = answer.pinned_until.is_some_and(|until| until > now);
+    let pin_note = match answer.pinned_until {
+        Some(until) if pin_live => {
+            format!(", pinned until {} (in force)", format_rfc3339(until as i64))
+        }
+        Some(until) => format!(
+            ", pin expired {} (blocks nothing)",
+            format_rfc3339(until as i64)
+        ),
+        None => String::new(),
+    };
     CatalogReport {
         consulted: true,
         source: "catalog",
@@ -1456,10 +1499,7 @@ fn catalog_report(
             "catalog state {:?}, {} observed access(es){}; {}",
             answer.state,
             answer.accesses,
-            answer
-                .pinned_until
-                .map(|until| format!(", pinned until {until}"))
-                .unwrap_or_default(),
+            pin_note,
             answer
                 .rule
                 .as_ref()
@@ -1469,6 +1509,7 @@ fn catalog_report(
         disagreements,
         accesses: Some(answer.accesses),
         pinned_until: answer.pinned_until,
+        pin_live,
     }
 }
 

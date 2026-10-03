@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::catalog::Pins;
 use crate::disk_management::{self, DiskError, FileEntry, MoveOutcome};
 use crate::journal::Journal;
 use crate::opened::{Guards, InUse};
@@ -166,6 +167,13 @@ pub enum SkipReason {
     /// A `policy.toml` / `tiers.toml` this sweep reads. Never a move candidate: moving the
     /// rules that govern a sweep would change them behind the operator's back.
     ConfigFile,
+    /// A live `lifecycle.pinned_until` pin in the catalog protects this file (§5). This is
+    /// a point-in-time pin an operator set, not a rule's pattern pin: it wins over policy
+    /// while it holds, and once its expiry has passed it blocks nothing — the *lapse* is
+    /// what the expiry in the value makes visible.
+    PinnedUntil {
+        until: i64,
+    },
 }
 
 impl From<InUse> for SkipReason {
@@ -232,6 +240,11 @@ impl std::fmt::Display for SkipReason {
                 f,
                 "a configuration file this sweep reads, never a move candidate"
             ),
+            SkipReason::PinnedUntil { until } => write!(
+                f,
+                "pinned in the catalog until {} (a pin wins over policy)",
+                crate::catalog::format_rfc3339(*until)
+            ),
         }
     }
 }
@@ -255,6 +268,29 @@ pub struct MoveContext<'a> {
     /// Empty without a tier config. A rule's `to` tier is looked up here, which is how a
     /// rule chooses *which* disk a file goes to rather than the fastest one with room.
     pub dest_tiers: &'a [(String, PathBuf)],
+    /// The catalog's pins, when a catalog exists. A live pin blocks a move regardless of
+    /// whether a `policy.toml` governs the sweep (§5: a pin wins over policy), so this is
+    /// checked on both the rule-driven and the flag-driven path. `None` is a sweep with no
+    /// catalog — where no pin can exist.
+    pub pins: Option<&'a Pins>,
+}
+
+/// Unix seconds of a `SystemTime`, for comparing against `lifecycle.pinned_until`.
+fn unix_seconds(stamp: SystemTime) -> i64 {
+    stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The expiry of a *live* catalog pin protecting `relative`, if one does.
+///
+/// A pin at or before `now` has lapsed and blocks nothing: the caller must not treat an
+/// expired pin as a skip, because doing so would make expiry a hidden no-op instead of the
+/// visible event §9 asks for. The value is returned so the skip line can name the instant.
+fn live_pin(pins: Option<&Pins>, relative: &Path, now: SystemTime) -> Option<i64> {
+    let until = pins?.pinned_until(&relative.to_string_lossy())?;
+    (until > unix_seconds(now)).then_some(until)
 }
 
 /// One file a sweep chose, with the lifecycle rule that chose it when one did.
@@ -322,6 +358,12 @@ pub fn select_candidates<'a>(
         // breaking the pair.
         if let Err(in_use) = guards.check(entry) {
             skipped.push((entry, SkipReason::from(in_use)));
+            continue;
+        }
+        // A live catalog pin wins over the flag-driven idle gate exactly as it wins over a
+        // rule (§5): a pin is not policy, it is the operator saying "not this one yet".
+        if let Some(until) = live_pin(context.pins, &entry.relative, now) {
+            skipped.push((entry, SkipReason::PinnedUntil { until }));
             continue;
         }
 
@@ -396,6 +438,13 @@ fn select_by_rules<'a>(
         }
         if let Err(in_use) = guards.check(entry) {
             skipped.push((entry, SkipReason::from(in_use)));
+            continue;
+        }
+        // Checked before the observed-access pin and before the rule: a live pin is the
+        // strongest "leave it alone" an operator can express, and naming it as the reason is
+        // what makes the answer explainable rather than a silent rule that never fires.
+        if let Some(until) = live_pin(context.pins, &entry.relative, now) {
+            skipped.push((entry, SkipReason::PinnedUntil { until }));
             continue;
         }
         let accesses = tracker.observed_accesses(&entry.path);
@@ -568,6 +617,7 @@ impl MigrationReport {
                     | FileOutcome::Skipped(SkipReason::RuleNoDown { .. })
                     | FileOutcome::Skipped(SkipReason::RuleTargetNotSwept { .. })
                     | FileOutcome::Skipped(SkipReason::ConfigFile)
+                    | FileOutcome::Skipped(SkipReason::PinnedUntil { .. })
             )
         })
     }
@@ -656,6 +706,9 @@ where
     // The copy fields are read out before the journal is borrowed mutably below: the
     // references are `Copy`, so this does not keep the context borrowed.
     let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    // Same snapshot the selection used, taken before the mutable journal borrow so this is
+    // a plain `Copy` read rather than a second borrow of `context`.
+    let pins = context.pins;
     let journal: &mut Journal = context.journal;
     let mut report = MigrationReport::default();
 
@@ -689,6 +742,19 @@ where
                 path: entry.path.clone(),
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        // Belt and braces, like the scope and guard re-checks: a pin set between selection
+        // and this move would otherwise let one sweep move a just-pinned object. The cost is
+        // one map lookup; the alternative is a pin that holds "except for a moment".
+        if let Some(until) = live_pin(pins, &entry.relative, now) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::PinnedUntil { until }),
                 size: entry.size,
                 rule: candidate.rule.clone(),
             });
@@ -801,6 +867,7 @@ pub fn migrate_replicated(
 ) -> MigrationReport {
     let (candidates, skipped) = select_candidates(entries, tracker, context, now);
     let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let pins = context.pins;
     let journal: &mut Journal = context.journal;
     let mut report = MigrationReport::default();
 
@@ -833,6 +900,18 @@ pub fn migrate_replicated(
                 path: entry.path.clone(),
                 destination: None,
                 outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        // A live pin re-checked immediately before the copy, for the same reason the scope
+        // and guards are: a pin set after selection must still win over this sweep's policy.
+        if let Some(until) = live_pin(pins, &entry.relative, now) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::PinnedUntil { until }),
                 size: entry.size,
                 rule: candidate.rule.clone(),
             });
@@ -1065,6 +1144,7 @@ mod tests {
                 journal: &mut journal,
                 lifecycle: None,
                 dest_tiers: &[],
+                pins: None,
             },
             now,
         );
@@ -1100,6 +1180,7 @@ mod tests {
                 journal: &mut journal,
                 lifecycle: None,
                 dest_tiers: &[],
+                pins: None,
             },
             now,
         );
@@ -1144,6 +1225,7 @@ mod tests {
                 journal: &mut journal,
                 lifecycle: None,
                 dest_tiers: &[],
+                pins: None,
             },
             now,
         );
@@ -1194,6 +1276,7 @@ mod tests {
                 journal: &mut journal,
                 lifecycle: None,
                 dest_tiers: &[],
+                pins: None,
             },
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),
@@ -1260,6 +1343,7 @@ mod tests {
                 journal: &mut journal,
                 lifecycle: None,
                 dest_tiers: &[],
+                pins: None,
             },
             SystemTime::now(),
             |_| Ok(Some(dest.clone())),

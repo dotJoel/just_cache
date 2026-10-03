@@ -36,9 +36,9 @@ pub use audit::{
     RepairOutcome, SourceState, Verdict, VerdictKind, COPY_FLOOR, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
-    resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind, LocationRecord,
-    MalformedRow, ObjectRecord, Resolution, ResolveReport, RowPathError, ScrubSummary, ScrubTarget,
-    SyncReport, CATALOG_NAME,
+    format_rfc3339, resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind,
+    LocationRecord, MalformedRow, ObjectRecord, PinRecord, Pins, Resolution, ResolveReport,
+    RowPathError, ScrubSummary, ScrubTarget, SyncReport, CATALOG_NAME,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{

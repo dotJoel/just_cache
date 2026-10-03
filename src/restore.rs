@@ -63,7 +63,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::catalog::{self, Catalog};
+use crate::catalog::{self, Catalog, LocationRecord, ObjectRecord};
 use crate::digest;
 use crate::disk_management;
 
@@ -81,8 +81,8 @@ pub enum RestoreError {
 
     #[error(
         "refusing to remove the cold copy {copy} for {path}: it does not sit under any \
-         configured --dest root, so this command cannot vouch that it is a cold copy and \
-         not a file it must leave alone"
+         configured --dest root or catalog-recorded tier root, so this command cannot vouch \
+         that it is a cold copy and not a file it must leave alone"
     )]
     RemoveCopyOutsideDests { path: PathBuf, copy: PathBuf },
 
@@ -281,16 +281,44 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         return Err(RestoreError::ParentComponent { path });
     }
 
-    // The catalog's answer, when there is one, is the digest every check below compares
-    // against. Resolved once, up front: a catalog that does not name the path fails here,
-    // before anything is opened or copied.
-    let recorded = recorded_checksum(request.catalog, &relative, &path)?;
+    // The catalog's answer, when there is one: its record holds both the digest every check
+    // below compares against *and* the recorded locations — which is how a copy on a tier
+    // this invocation was not given as a `--dest` is still found. Resolved once, up front: a
+    // catalog that does not name the path fails here, before anything is opened or copied.
+    let record = catalog_object(request.catalog, &relative, &path)?;
+    let recorded = match &record {
+        Some(record) => Some(blake3::Hash::from_hex(&record.checksum).map_err(|_| {
+            RestoreError::CatalogChecksumMalformed {
+                path: path.clone(),
+                checksum: record.checksum.clone(),
+            }
+        })?),
+        None => None,
+    };
+    let recorded_locations: &[LocationRecord] = record
+        .as_ref()
+        .map(|record| record.locations.as_slice())
+        .unwrap_or(&[]);
+    // The roots a recorded location row may be joined against: the `--dest` roots this
+    // invocation was given, plus every root the catalog itself recorded at sync. A tier the
+    // catalog knows but this invocation was not handed is exactly the case a bare filesystem
+    // search cannot serve, and `resolve_location_path` still refuses any row that does not
+    // provably stay under one of these.
+    let roots = trusted_roots(request.dests, request.catalog)?;
+    let watch_tier = fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
 
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() => Err(RestoreError::HotPathIsDirectory { path }),
         // A real file at the path is the state restore is trying to reach. Never replace
         // it: compare, and either no-op (identical) or refuse (different).
-        Ok(metadata) if metadata.is_file() => match locate(&path, &relative, request.dests)? {
+        Ok(metadata) if metadata.is_file() => match locate(
+            &path,
+            &relative,
+            request.dests,
+            recorded_locations,
+            &watch_tier,
+            &roots,
+        )? {
             None => Ok(RestoreOutcome::AlreadyPresent { cold_copy: None }),
             Some(cold) => {
                 // Without a catalog the expected digest can only come from the cold copy;
@@ -315,11 +343,11 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                 // verify-before-delete is satisfied by the digest comparison just above.
                 // Without it there is nothing to do at all — this is the idempotent no-op.
                 if request.remove_copy {
-                    // `locate` already keeps only candidates under a `--dest`, but this is
-                    // the one delete that cannot be undone, so the containment is tested
-                    // again here, immediately before it, rather than trusted across the
-                    // distance to `locate`.
-                    ensure_removable(&cold, request.dests, &path)?;
+                    // `locate` already keeps only candidates the command can vouch for, but
+                    // this is the one delete that cannot be undone, so the containment is
+                    // tested again here, immediately before it, rather than trusted across
+                    // the distance to `locate`.
+                    ensure_removable(&cold, &roots, &path)?;
                     let cold_metadata =
                         fs::metadata(&cold).map_err(|error| RestoreError::Stat {
                             path: cold.clone(),
@@ -343,32 +371,38 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         },
         // Missing, a working symlink, or a broken one: put the object back.
         _ => {
-            let cold = locate(&path, &relative, request.dests)?.ok_or_else(|| {
-                RestoreError::NoColdCopy {
-                    path: path.clone(),
-                    dests: request.dests.to_vec(),
-                }
+            let cold = locate(
+                &path,
+                &relative,
+                request.dests,
+                recorded_locations,
+                &watch_tier,
+                &roots,
+            )?
+            .ok_or_else(|| RestoreError::NoColdCopy {
+                path: path.clone(),
+                dests: request.dests.to_vec(),
             })?;
             if request.remove_copy {
-                ensure_removable(&cold, request.dests, &path)?;
+                ensure_removable(&cold, &roots, &path)?;
             }
             restore_from(&path, &cold, request.remove_copy, recorded.as_ref())
         }
     }
 }
 
-/// The catalog's recorded checksum for one namespace path.
+/// The catalog's record for one namespace path.
 ///
 /// Returns `Ok(None)` only when no catalog is configured; with one, a path it does not
 /// name is an error rather than a quiet fall back to filesystem-only verification. The
 /// catalog is the source of truth for "does this object exist" (`docs/design.md` §3), and
 /// restoring an object it has never seen would mean skipping the independent check this
-/// command exists to perform.
-fn recorded_checksum(
+/// command exists to perform (and, now, its recorded location too).
+fn catalog_object(
     catalog: Option<&Catalog>,
     relative: &Path,
     path: &Path,
-) -> Result<Option<blake3::Hash>, RestoreError> {
+) -> Result<Option<ObjectRecord>, RestoreError> {
     let Some(catalog) = catalog else {
         return Ok(None);
     };
@@ -376,21 +410,61 @@ fn recorded_checksum(
     let record = catalog
         .record_for_path(&relative.to_string_lossy())
         .map_err(|error| RestoreError::Catalog { error })?;
-    let Some(record) = record else {
-        return Err(RestoreError::CatalogUnknownPath {
+    match record {
+        Some(record) => Ok(Some(record)),
+        None => Err(RestoreError::CatalogUnknownPath {
             path: path.to_path_buf(),
-        });
-    };
-    blake3::Hash::from_hex(&record.checksum)
-        .map(Some)
-        .map_err(|_| RestoreError::CatalogChecksumMalformed {
-            path: path.to_path_buf(),
-            checksum: record.checksum.clone(),
-        })
+        }),
+    }
+}
+
+/// Every root a recorded `(tier, storage_key)` may be joined against: the `--dest` roots
+/// this invocation was given, plus the roots `catalog sync` recorded.
+///
+/// The second set is what lets restore reach an object on a configured tier that is not one
+/// of this invocation's `--dest` arguments. It does not widen what may be touched blindly:
+/// [`catalog::resolve_location_path`] still requires the row's `tier` to be one of these
+/// roots exactly, and the resulting path is checked to be a regular file before it becomes a
+/// candidate.
+fn trusted_roots(
+    dests: &[PathBuf],
+    catalog: Option<&Catalog>,
+) -> Result<Vec<PathBuf>, RestoreError> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dest in dests {
+        let root = fs::canonicalize(dest).unwrap_or_else(|_| dest.clone());
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if let Some(catalog) = catalog {
+        for root in catalog
+            .roots()
+            .map_err(|error| RestoreError::Catalog { error })?
+        {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    Ok(roots)
 }
 
 /// Find the cold copy for one relative path, refusing if the candidates disagree.
-fn locate(hot: &Path, relative: &Path, dests: &[PathBuf]) -> Result<Option<PathBuf>, RestoreError> {
+///
+/// `recorded_locations` are the catalog's `location` rows for the object, and `roots` are
+/// the roots those rows may be joined against. They are consulted after the filesystem
+/// layout because a name that still resolves names the copy the mover *actually* left, but
+/// they are the only way to reach an object whose copy is on a tier this invocation was not
+/// given as a `--dest` (or whose namespace path and storage key have diverged).
+fn locate(
+    hot: &Path,
+    relative: &Path,
+    dests: &[PathBuf],
+    recorded_locations: &[LocationRecord],
+    watch_tier: &Path,
+    roots: &[PathBuf],
+) -> Result<Option<PathBuf>, RestoreError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // A resolving symlink at the path names the copy the mover left — but only when its
@@ -402,7 +476,7 @@ fn locate(hot: &Path, relative: &Path, dests: &[PathBuf]) -> Result<Option<PathB
     // escapes every root is a foreign link and is dropped.
     if let Ok(target) = fs::read_link(hot) {
         let resolved = resolve_link(hot, &target);
-        if is_regular_file(&resolved) && under_any_dest(&resolved, dests) {
+        if is_regular_file(&resolved) && under_any_root(&resolved, dests) {
             candidates.push(resolved);
         }
     }
@@ -413,8 +487,28 @@ fn locate(hot: &Path, relative: &Path, dests: &[PathBuf]) -> Result<Option<PathB
     // itself a symlink out of it is no more a cold copy than a link target that escapes.
     for dest in dests {
         let mirrored = dest.join(relative);
-        if is_regular_file(&mirrored) && under_any_dest(&mirrored, dests) {
+        if is_regular_file(&mirrored) && under_any_root(&mirrored, dests) {
             candidates.push(mirrored);
+        }
+    }
+
+    // Copies the catalog recorded that the filesystem layout above cannot reach — a copy on
+    // a configured tier this invocation was not given as a `--dest`, or one whose storage
+    // key no longer mirrors the namespace path. A hot location is skipped: it is the file at
+    // the path, not a cold copy to restore from. Every row is proved to stay under a trusted
+    // root by `resolve_location_path` before it becomes a path, exactly as scrub and
+    // reconcile do (issue #72), so a hand-edited row is refused rather than touched.
+    for location in recorded_locations {
+        if Path::new(&location.tier) == watch_tier {
+            continue;
+        }
+        let Ok(candidate) =
+            catalog::resolve_location_path(&location.tier, &location.storage_key, roots)
+        else {
+            continue;
+        };
+        if is_regular_file(&candidate) {
+            candidates.push(candidate);
         }
     }
 
@@ -784,31 +878,32 @@ fn is_regular_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// True when `candidate` resolves to a path inside one of the `dests`.
+/// True when `candidate` resolves to a path inside one of `roots`.
 ///
 /// Both sides are canonicalized, so this is real containment rather than the lexical
-/// prefix test `strip_prefix` does: a path that reaches a destination through `..` or a
+/// prefix test `strip_prefix` does: a path that reaches a root through `..` or a
 /// further symlink still counts, while one that leaves every root on the way — or whose
 /// root cannot be canonicalized because it is not there — does not. This is the same test
 /// `audit::resolve_target` applies to a watched symlink (src/audit.rs).
-fn under_any_dest(candidate: &Path, dests: &[PathBuf]) -> bool {
+fn under_any_root(candidate: &Path, roots: &[PathBuf]) -> bool {
     let Ok(canonical) = fs::canonicalize(candidate) else {
         return false;
     };
-    dests.iter().any(|dest| {
-        fs::canonicalize(dest)
-            .map(|root| canonical.starts_with(&root))
+    roots.iter().any(|root| {
+        fs::canonicalize(root)
+            .map(|resolved| canonical.starts_with(&resolved))
             .unwrap_or(false)
     })
 }
 
 /// Refuse `--remove-copy` on a path the command cannot prove is a cold copy.
 ///
-/// `locate` already returns only candidates under a `--dest`, so this is belt-and-braces:
-/// the delete it guards is the one step in the command that cannot be undone, and the
-/// containment was proved some distance away, so it is repeated here rather than assumed.
-fn ensure_removable(copy: &Path, dests: &[PathBuf], path: &Path) -> Result<(), RestoreError> {
-    if under_any_dest(copy, dests) {
+/// `locate` already returns only candidates the command can vouch for, so this is
+/// belt-and-braces: the delete it guards is the one step in the command that cannot be
+/// undone, and the containment was proved some distance away, so it is repeated here rather
+/// than assumed.
+fn ensure_removable(copy: &Path, roots: &[PathBuf], path: &Path) -> Result<(), RestoreError> {
+    if under_any_root(copy, roots) {
         Ok(())
     } else {
         Err(RestoreError::RemoveCopyOutsideDests {
