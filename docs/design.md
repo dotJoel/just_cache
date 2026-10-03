@@ -896,7 +896,16 @@ Still open, and honestly so:
 - **Root-owned files cannot be relocated** by a non-root sweep: the copy fails on
   chown. Failing is right (a silently wrong owner is worse), but a privileged mode is
   not built.
-- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS).
+- Access tracking depends on atime semantics of the host mounts (`noatime`, ZFS), and the
+  tool's own reads count as use: `catalog sync` hashes a file, and on a mount that maintains
+  atime under the `relatime` rule — every normal Linux mount — that read refreshes atime, so
+  a sync postpones that file's move by up to a whole idle window. The fix that has not been
+  made is to open the tool's read-only hashing with `O_NOATIME` (it owns the file in the
+  common case and can fall back when it does not), so the stamp means "the user read it"
+  rather than "we did". Until then, a test that asserts a move from an idleness precondition
+  has to re-stamp the file after the last read of it — `tests/pins.rs` does, and says why —
+  because on a `noatime` box (where those tests were written) the polluting read is invisible
+  and the failure only appears on CI.
 - **`explain` never moved files, and now reads the catalog when one exists.** The command
   evaluates scope, guards and policy in the mover's order and reports the outermost reason,
   and its "where does this live / when was it last accessed" answers are cross-checked
