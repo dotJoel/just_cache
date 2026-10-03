@@ -148,9 +148,7 @@ impl Drop for Fixture {
     }
 }
 
-const CATCH_ALL: &str = "[[rule]]\nname = \"tiering\"\nmatch = \"**\"\n\\
-                         down = { after_idle = \"30d\", from = \"ssd\", to = \"hdd_parked\" }\n\\
-                         up = { on_access = true }\n";
+const CATCH_ALL: &str = "[[rule]]\nname = \"tiering\"\nmatch = \"**\"\ndown = { after_idle = \"30d\", from = \"ssd\", to = \"hdd_parked\" }\nup = { on_access = true }\n";
 
 #[test]
 fn a_rule_moves_on_its_idle_gate_and_explain_records_which_rule_fired() {
@@ -219,8 +217,7 @@ fn dry_run_evaluates_the_same_rule_without_moving_anything() {
         "dry-run should report the same rule decision:\n{text}"
     );
     assert!(
-        fx.watch.join("shows/old.mkv").is_file()
-            && !fx.watch.join("shows/old.mkv").is_symlink(),
+        fx.watch.join("shows/old.mkv").is_file() && !fx.watch.join("shows/old.mkv").is_symlink(),
         "dry-run must leave the source untouched"
     );
     assert!(!fx.cold.join("shows/old.mkv").exists());

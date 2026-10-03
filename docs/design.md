@@ -927,22 +927,26 @@ one (so a per-path rule overrides a catch-all), and only then does the idle gate
 rule's `to` tier must be a configured tier that is also a `--dest` root this sweep was
 given, and `down` must go *slower*; a rule naming an unconfigured tier, a `volatile` tier
 (§2.1), an unparseable duration or an `up` with no `down`, or a `policy.toml` with rules
-but no `tiers.toml`, is a usage error naming the rule — never a silent skip. Every
-transition records the rule that fired in `lifecycle.rule`, and `show`/`explain` name it,
-so `just_cache explain <path>` answers "which rule fired or which exclusion stopped it",
-including "no `policy.toml`" when there is none — with no policy the flag-driven
-`--min-idle-days` decision stands unchanged. A rule's `to` is what routes the move: with a
-policy the sweep no longer pours candidates into the fastest disk with room, it sends each
-file to the tier its rule names (`--copies` still replicates across the destinations).
+but no `tiers.toml`, is a usage error naming the rule — never a silent skip. A transition's
+rule is written to `lifecycle.rule` when the existing catalog already has that namespace
+name, and `show`/`explain` name it, so `just_cache explain <path>` answers "which rule fired
+or which exclusion stopped it", including "no `policy.toml`" when there is none — with no
+policy the flag-driven `--min-idle-days` decision stands unchanged. A sweep never creates a
+catalog (invariant 9): if there is no catalog row to update, the rule is still reported for
+the move and a warning tells the operator to run `catalog sync`. A rule's `to` is what
+routes the move: with a policy the sweep no longer pours candidates into the fastest disk
+with room, it sends each file to the tier its rule names (`--copies` still replicates across
+the destinations).
 Two deliberate bounds are named rather than implied: a multi-step chain (`ssd →
 hdd_parked → offsite`) is written as one rule per step, because the §5 snippet above
 repeats the `down` key and TOML forbids that — a later issue may accept a `down` array;
 and `up` is *reported*, not performed, because promotion is the recall path's job (§8, P2).
 `tests/policy.rs` drives the real binary for the accepted behaviours: a rule moving on its
-idle gate with the rule recorded and named by `explain`, a pin protecting a file, a
-per-path override beating a catch-all, a config file in the watched tree left alone, an
-explicit `--policy` naming a file elsewhere, no policy meaning the flags still decide, and
-refusals (unconfigured tier, volatile target, bad duration) naming their rule.
+idle gate with the rule recorded and named by `explain`, `up.on_access` named for an
+offloaded path, dry-run making the same decision without moving bytes, a pin protecting a
+file, a per-path override beating a catch-all, a config file in the watched tree left
+alone, an explicit `--policy` naming a file elsewhere, no policy meaning the flags still
+decide, and refusals (unconfigured tier, volatile target, bad duration) naming their rule.
 
 ## 10. Non-goals
 

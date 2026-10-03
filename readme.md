@@ -165,9 +165,11 @@ error naming the rule — never a silent skip. A `policy.toml` with rules but no
 is refused for the same reason. With no `policy.toml` the flag-driven `--min-idle-days`
 decision stands, and `explain` says so rather than inventing a rule.
 
-Every transition **records which rule fired** (`lifecycle.rule` in the catalog), and
-`just_cache explain <path>` answers "where is this file and why" — naming the rule that
-fired, the rule that has not fired yet, or the exclusion that stopped it:
+Every transition **records which rule fired** (`lifecycle.rule` in the catalog) when the
+existing catalog has that namespace name. A sweep never creates a catalog (invariant 9);
+if there is no row to update, the move still reports its rule and warns to run `catalog
+sync`. `just_cache explain <path>` answers "where is this file and why" — naming the rule
+that fired, the rule that has not fired yet, or the exclusion that stopped it:
 
 ```sh
 $ just_cache explain shows/old.mkv --watch /mnt/cache --dest /mnt/cold

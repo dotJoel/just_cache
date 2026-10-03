@@ -1720,15 +1720,31 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
         }
     }
 
-    // Record which rule decided each transition (§5: every transition records the rule
-    // that fired). Open-if-present, like the replica record above: a sweep never creates a
-    // catalog, so with none the rule rides in the report and the next `catalog sync`
-    // brings the name in. Dry-run records nothing, because nothing transitioned.
+    // Record which rule decided each transition (§5). A sweep never creates a catalog
+    // (invariant 9), so it updates only an existing catalog row and warns if a move cannot
+    // be persisted. The per-file report still names the rule; dry-run records nothing,
+    // because nothing transitioned.
     if lifecycle.is_some() {
-        if let Ok(Some(existing_catalog)) =
-            catalog::Catalog::open_existing(catalog::Catalog::default_path(watch))
-        {
-            record_lifecycle_rules(&existing_catalog, watch, &report);
+        match catalog::Catalog::open_existing(catalog::Catalog::default_path(watch)) {
+            Ok(Some(existing_catalog)) => record_lifecycle_rules(&existing_catalog, watch, &report),
+            Ok(None)
+                if report.records.iter().any(|record| {
+                    matches!(
+                        record.outcome,
+                        FileOutcome::Moved | FileOutcome::LinkedExisting
+                    ) && record.rule.is_some()
+                }) =>
+            {
+                eprintln!(
+                    "just_cache: policy-governed moves completed without an existing catalog; \
+                     the sweep does not create one, so run `catalog sync` to persist lifecycle.rule"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "just_cache: policy-governed moves completed, but could not open the existing \
+                 catalog to record lifecycle.rule: {err}"
+            ),
         }
     }
 
@@ -1804,7 +1820,18 @@ fn record_lifecycle_rules(catalog: &catalog::Catalog, watch: &Path, report: &Mig
         let Ok(relative) = record.path.strip_prefix(watch) else {
             continue;
         };
-        let _ = catalog.record_lifecycle_rule(&relative.to_string_lossy(), rule);
+        match catalog.record_lifecycle_rule(&relative.to_string_lossy(), rule) {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "just_cache: moved {} by rule `{rule}`, but it is not in the catalog; run \
+                 `catalog sync` before the next policy sweep to record lifecycle.rule",
+                record.path.display()
+            ),
+            Err(err) => eprintln!(
+                "just_cache: moved {} by rule `{rule}`, but could not record lifecycle.rule: {err}",
+                record.path.display()
+            ),
+        }
     }
 }
 
