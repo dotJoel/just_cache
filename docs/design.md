@@ -92,10 +92,8 @@ Hard rules:
 
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
-than accepted and then treated as a filesystem. `fs` is the only kind with a driver, so the
-`object`, `peer` and `offline` tiers this section configures are still a description of where
-the phase is going — which is exactly why they are refused by name instead of being quietly
-served by the `path` they carry. The boundary rule (rule 2) is the type's own answer,
+than accepted and then treated as a filesystem. **As implemented (#141):** `fs` and
+`object` have drivers; `peer` and `offline` are still refused by name. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -1558,6 +1556,27 @@ tier no command touches yet); one key per config, no rotation or KMS (the issue'
 scope); and the format has no streaming-encrypt-from-a-pipe form, which would need a
 trailer and a different header — a want, not a need, until a driver pipes instead of
 reading a file.
+
+**Closed by #141:** the object-store tier driver exists. An `object` tier in `tiers.toml`
+(endpoint, bucket, region, credential source, chunk size) is parsed and its bytes actually
+move to and from an S3-compatible object store, chunked and resumable, encrypted through
+the envelope, with recall verified against the catalog's plaintext digest — the same
+contract every tier edge follows. Resumable upload state lives in a catalog row
+(`resumable_upload` table). A `min`/`hours` object tier refuses inline recall with
+`EAGAIN` and names `just_cache restore <path>`. Credentials come from a file path or an
+environment variable, never argv, and never appear in logs, error messages, `--json` or
+catalog rows. The HTTP transport hand-rolls `std::net::TcpStream` with `rustls` for
+TLS — the gateway serves plain HTTP on loopback, but S3 requires HTTPS; `rustls` (pure
+Rust) is the minimal addition and stays inside `src/object_store.rs`. Tests run against
+an in-repo fake S3 endpoint over loopback that verifies the AWS SigV4 signature. The
+sweep does not yet dispatch to an object tier as a `--dest` (the CLI still requires a
+filesystem path); the driver is callable from integration tests and is ready for wiring.
+**Still open, and named**: inline recall for object tiers is not wired into the FUSE
+mount (the `recall` module dispatches but the mount does not yet call it for object
+tiers); the sweep's `--dest` dispatch for object tiers; an object tier's `path` field is
+still required by the parser and is not yet repurposed as the local scratch path; and a
+manual run against a real S3 bucket is documented below, since CI cannot cover a cloud
+endpoint deterministically.
 
 ## 10. Non-goals
 

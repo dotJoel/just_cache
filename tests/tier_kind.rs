@@ -1,11 +1,12 @@
 //! The tier seam, through the parser a real config goes through.
 //!
-//! §2 says a tier's `kind` is "which transport driver serves this tier". Only `fs` has a
-//! driver today, so what these tests pin is the refusal: a kind nothing serves must not be
-//! accepted and then served as an ordinary local directory, which is what a free-text
-//! `kind` did until this seam existed (invariant 3 — refuse what you do not understand).
-//! The two facts the seam has to answer are pinned here too: which kinds have a driver, and
-//! which ones put bytes on the far side of the machine boundary (rule 2, the envelope).
+//! §2 says a tier's `kind` is "which transport driver serves this tier". `fs` and `object`
+//! have drivers today; `peer` and `offline` do not, so what these tests pin is the refusal
+//! for the latter two: a kind nothing serves must not be accepted and then served as an
+//! ordinary local directory, which is what a free-text `kind` did until this seam existed
+//! (invariant 3 — refuse what you do not understand). The two facts the seam has to answer
+//! are pinned here too: which kinds have a driver, and which ones put bytes on the far side
+//! of the machine boundary (rule 2, the envelope).
 
 use std::path::Path;
 
@@ -15,6 +16,14 @@ fn config(kind: &str) -> String {
     format!(
         "[tiers.tier]\nkind = \"{kind}\"\npath = \"/mnt/tier\"\nvolatility = \"persistent\"\n\
          recall = \"ms\"\ncopies = 1\n"
+    )
+}
+
+fn config_object(kind: &str) -> String {
+    format!(
+        "[tiers.tier]\nkind = \"{kind}\"\npath = \"/mnt/tier\"\nvolatility = \"persistent\"\n\
+         recall = \"min\"\ncopies = 1\nendpoint = \"s3.example.com\"\nbucket = \"my-bucket\"\n\
+         region = \"us-east-1\"\ncredential_source = \"$S3_KEY\"\n"
     )
 }
 
@@ -28,12 +37,19 @@ fn the_kind_always_answers_the_seam_questions() {
     );
 
     for kind in TierKind::ALL {
-        if kind == TierKind::Fs {
-            assert!(kind.is_served(), "fs is the one kind with a driver");
-            assert!(
-                !kind.crosses_machine_boundary(),
-                "a local root keeps its bytes on this machine, so rule 2 does not apply"
-            );
+        if kind == TierKind::Fs || kind == TierKind::Object {
+            assert!(kind.is_served(), "{kind} is served by a driver");
+            if kind == TierKind::Fs {
+                assert!(
+                    !kind.crosses_machine_boundary(),
+                    "a local root keeps its bytes on this machine, so rule 2 does not apply"
+                );
+            } else {
+                assert!(
+                    kind.crosses_machine_boundary(),
+                    "`{kind}` leaves this machine — the envelope is required"
+                );
+            }
         } else {
             assert!(
                 !kind.is_served(),
@@ -41,7 +57,7 @@ fn the_kind_always_answers_the_seam_questions() {
             );
             assert!(
                 kind.crosses_machine_boundary(),
-                "`{kind}` leaves this machine — bytes (object, peer) or the volume itself \
+                "`{kind}` leaves this machine — bytes (peer) or the volume itself \
                  (offline) — so the envelope is required"
             );
         }
@@ -52,7 +68,7 @@ fn the_kind_always_answers_the_seam_questions() {
 /// the line — the input that used to parse and then behave as a local directory.
 #[test]
 fn a_kind_with_no_driver_is_refused_by_name() {
-    for kind in ["object", "peer", "offline"] {
+    for kind in ["peer", "offline"] {
         let error = TierSet::parse(&config(kind), Path::new("/tmp/tiers.toml"))
             .expect_err("an unserved kind must be refused");
         let text = error.to_string();
@@ -69,6 +85,33 @@ fn a_kind_with_no_driver_is_refused_by_name() {
             "an unserved kind is an invalid config, not a syntax error"
         );
     }
+}
+
+/// An `object` tier now has a driver: it parses with its required fields, and a missing
+/// field is refused by line rather than passing through silently.
+#[test]
+fn an_object_tier_parses_with_its_required_fields() {
+    let set = TierSet::parse(&config_object("object"), Path::new("/tmp/tiers.toml")).unwrap();
+    let tier = set.get("tier").unwrap();
+    assert_eq!(tier.kind, TierKind::Object);
+    assert!(tier.object_config.is_some());
+    let obj = tier.object_config.as_ref().unwrap();
+    assert_eq!(obj.endpoint, "s3.example.com");
+    assert_eq!(obj.bucket, "my-bucket");
+    assert_eq!(obj.region, "us-east-1");
+}
+
+/// An object tier missing a required field is refused with the field name and line.
+#[test]
+fn an_object_tier_without_endpoint_is_refused_by_line() {
+    let text = concat!(
+        "[tiers.tier]\nkind = \"object\"\npath = \"/mnt/tier\"\nvolatility = \"persistent\"\n",
+        "recall = \"min\"\ncopies = 1\nbucket = \"b\"\nregion = \"us\"\n",
+        "credential_source = \"$X\"\n"
+    );
+    let err = TierSet::parse(text, Path::new("/tmp/tiers.toml")).unwrap_err();
+    assert!(err.to_string().contains("endpoint"), "{err}");
+    assert!(err.to_string().contains("line 2"), "{err}");
 }
 
 /// A kind nothing recognises is refused with the set the design names, so a typo is answered

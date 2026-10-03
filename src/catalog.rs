@@ -212,6 +212,20 @@ CREATE TABLE IF NOT EXISTS digest_cache (
     inode       INTEGER NOT NULL,
     object_id   BLOB NOT NULL          -- the BLAKE3 digest, a value not a reference
 );
+-- Resumable upload state for the object-store driver (#141): one row per in-progress
+-- multipart upload. The row is written when a multipart upload begins, updated after
+-- each chunk lands, and deleted when the upload completes or is aborted. An interrupted
+-- upload resumes from the first missing chunk — the row says where to start — and a
+-- partial upload is never adopted as a copy: no location row exists for it.
+CREATE TABLE IF NOT EXISTS resumable_upload (
+    object_id    TEXT NOT NULL,         -- hex-encoded object id
+    tier         TEXT NOT NULL,         -- the configured tier name
+    storage_key  TEXT NOT NULL,         -- the object key in the bucket
+    upload_id    TEXT NOT NULL,         -- the S3 upload id, to complete or abort
+    total_chunks INTEGER NOT NULL,      -- how many chunks the full upload has
+    committed    INTEGER NOT NULL DEFAULT 0,  -- how many chunks have landed
+    PRIMARY KEY (object_id, tier)
+);
 ";
 
 #[derive(Debug, Error)]
@@ -2653,6 +2667,84 @@ impl Catalog {
             names,
             locations,
         }))
+    }
+
+    // ----- resumable upload state for the object-store driver (#141) -----
+
+    /// Begin recording a multipart upload so an interrupted upload can resume.
+    ///
+    /// Called before the first chunk lands. An existing row for this object in this
+    /// tier is replaced — a re-start after a crash picks up where the last committed
+    /// chunk left off.
+    pub fn begin_upload(
+        &self,
+        object_id: &str,
+        tier: &str,
+        storage_key: &str,
+        upload_id: &str,
+        total_chunks: u64,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT INTO resumable_upload (object_id, tier, storage_key, upload_id, total_chunks, committed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0) \
+             ON CONFLICT(object_id, tier) DO UPDATE SET \
+                 storage_key = excluded.storage_key, \
+                 upload_id = excluded.upload_id, \
+                 total_chunks = excluded.total_chunks, \
+                 committed = 0",
+            params![object_id, tier, storage_key, upload_id, total_chunks as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record that one more chunk has landed so a resume starts from the right place.
+    pub fn record_upload_progress(
+        &self,
+        object_id: &str,
+        committed: u64,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "UPDATE resumable_upload SET committed = ?1 WHERE object_id = ?2",
+            params![committed as i64, object_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the upload state after a successful complete or an abort.
+    pub fn complete_upload(&self, object_id: &str) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "DELETE FROM resumable_upload WHERE object_id = ?1",
+            params![object_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the upload state — synonymous with `complete_upload`, used after an
+    /// abort rather than after success.
+    pub fn clear_upload(&self, object_id: &str) -> Result<(), CatalogError> {
+        self.complete_upload(object_id)
+    }
+
+    /// Get the resumable upload state for an object in a tier, if one exists.
+    ///
+    /// Returns `Some((upload_id, committed_chunks))` or `None` when no upload is in
+    /// progress.
+    pub fn resume_upload(
+        &self,
+        object_id: &str,
+        tier: &str,
+    ) -> Result<Option<(String, u64)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT upload_id, committed FROM resumable_upload WHERE object_id = ?1 AND tier = ?2",
+        )?;
+        let result = stmt.query_row(params![object_id, tier], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        });
+        match result {
+            Ok((upload_id, committed)) => Ok(Some((upload_id, committed))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(CatalogError::Query(e)),
+        }
     }
 }
 
