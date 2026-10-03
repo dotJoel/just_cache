@@ -199,7 +199,8 @@
   <p>
     The longer-term design extends this catalog and namespace to LAN, cloud-object and offline
     volume tiers, with recall latency and cost declared per tier. Those providers are not implemented
-    yet; the current tool handles local filesystem roots. <a href="design.md">See the design and roadmap.</a>
+    yet; the namespace today is served locally by the symlink tree, a FUSE mount and a WebDAV
+    gateway. <a href="design.md">See the design and roadmap.</a>
   </p>
 </section>
 
@@ -269,7 +270,7 @@
   <h2>Cold is measured, not guessed</h2>
   <p class="lead">A file moves only when every gate passes — and the tool tells you which gate stopped it.</p>
   <div class="features">
-    <div class="feat"><div class="name">Last use</div><p>Idle time comes from the filesystem's access time, not from a name or a size. A file read yesterday is warm; one untouched for months is a candidate.</p></div>
+    <div class="feat"><div class="name">Last use</div><p>Idle time comes from the filesystem's access time for a file reached through its symlink. A file read through the mount is judged by the accesses the mount observed itself, so a <code class="inline">noatime</code> filesystem cannot make a warm file look cold.</p></div>
     <div class="feat"><div class="name">In use = not cold</div><p>A file held open by another process, or hardlinked elsewhere, is skipped and counted separately — never moved out from under a reader.</p></div>
     <div class="feat"><div class="name">Scope is law</div><p><code class="inline">--include</code> / <code class="inline">--exclude</code> and the size window are the outermost gate, checked before every other rule and again right before bytes move.</p></div>
     <div class="feat"><div class="name">Verify before delete</div><p>A copy is hashed and matched to the source before the original is removed. Same size is not enough; a mismatch is refused.</p></div>
@@ -290,6 +291,11 @@
     <div class="feat"><div class="name">restore</div><p>Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
     <div class="feat"><div class="name">scrub</div><p>Reads every stored copy back and checks it against the recorded checksum; repairs rot from a verified sibling.</p></div>
     <div class="feat"><div class="name">reconcile</div><p>Rebuilds copies a re-added disk is missing, each one proved against the catalog before it is recorded.</p></div>
+    <div class="feat"><div class="name">pin</div><p>Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
+    <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
+    <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
+    <div class="feat"><div class="name">cache</div><p>A RAM or SSD overlay in front of a durable tier: promotion copies bytes, eviction is LRU against a size cap, and residency is never data of record.</p></div>
+    <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin, a damaged copy or an unmounted tier makes the delete unsafe.</p></div>
   </div>
 </section>
 
@@ -297,10 +303,13 @@
   <div class="kicker">Where this goes</div>
   <h2>One namespace over every tier you own</h2>
   <p class="lead">
-    The mover is one piece of a larger design: SSD, spinning disks, a LAN peer, cloud object storage, an
-    offline disk in a drawer — one namespace over all of it, with a fast cache overlay in front and
-    placement driven by observed use, in the spirit of S3 storage classes. The mover in this repo is the
-    symlink namespace provider and the hot→cold driver of that design. <a href="design.md">The full design sketch is in design.md.</a>
+    The design is one namespace over SSD, spinning disks, a LAN peer, cloud object storage and an
+    offline disk in a drawer, with a fast cache overlay in front and placement driven by observed
+    use, in the spirit of S3 storage classes. Local tiers are what this repo does today: the mover
+    is the hot→cold driver and the symlink namespace provider, and the catalog's namespace is also
+    served by a FUSE mount and a WebDAV gateway. The cache overlay and mount-observed use are
+    implemented; LAN, cloud-object and offline tiers are not.
+    <a href="design.md">The full design sketch is in design.md.</a>
   </p>
 </section>
 

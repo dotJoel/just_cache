@@ -45,6 +45,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🗃️ [The catalog](#the-catalog)
 - 🧾 [Auditing consistency](#auditing-consistency)
 - 🧭 [Finding an object](#finding-an-object)
+- 🗑️ [Deleting an object](#deleting-an-object)
 - 🔙 [Restoring a file](#restoring-a-file)
 - 📌 [Pinning a file](#pinning-a-file)
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
@@ -80,9 +81,10 @@ catalog and integrity commands.
   the file.
 
 Today just_cache is a local mover with move recovery and explicit commands to record,
-locate, check, and restore copies. The larger plan — one namespace across local disks,
-LAN peers, cloud object storage and offline volumes — is not implemented yet. See
-[Design](#design) for that roadmap and its current boundary.
+locate, check, restore and delete copies, plus a FUSE mount and a WebDAV gateway over the
+same catalog. The larger plan — one namespace across local disks, LAN peers, cloud object
+storage and offline volumes — is not implemented yet. See [Design](#design) for that
+roadmap and its current boundary.
 
 ## Configuration
 
@@ -135,9 +137,38 @@ cost = "$0.02"
 ```
 
 `locate` and `audit` then speak in those names, and `locate` states a copy's `recall`
-class even though nothing acts on it yet. A `volatile` tier (`recall = "us"`, for a RAM
-or SSD cache) is **refused as a `--dest`**: §2.1 — anything volatile is a mirror, never a
-home. `catalog sync` records each configured tier's `copies` as its floor.
+class. `recall` decides whether a read through the mount may pull the bytes up inline: `ms`
+and `s` do, `min` and `hours` refuse and point at `just_cache restore <path>` instead. A
+`volatile` tier (`recall = "us"`, for a RAM or SSD cache) is **refused as a `--dest`**: §2.1
+— anything volatile is a mirror, never a home. `catalog sync` records each configured tier's
+`copies` as its floor.
+
+### Cache overlays: `[[cache]]`
+
+A cache overlay is a fast copy in front of a durable tier. It is configured beside the tiers
+and is **never a tier of record**: it never appears in `location`, never counts toward a copy
+floor, and is refused as a destination root or a policy target. Losing it loses no data.
+
+```toml
+[[cache]]
+name = "ram"                      # unique; not a tier name
+over = "hdd"                      # the tier this cache sits in front of
+kind = "fs"
+path = "/mnt/ram-cache"           # its owned directory, outside every tier root
+max_size = "8GiB"                 # eviction is LRU against this cap
+promote_on = "read"               # a read promotes a copy
+evict = "lru"
+write_policy = "write-invalidate" # a write drops the copy
+```
+
+A file meeting `promote_on` gets a copy in the overlay; nothing moves, so no authoritative
+location changes. Eviction is LRU against `max_size`, and a file larger than the cap is never
+promoted. A write, truncate or rename through the mount lands on the home tier and drops the
+copy first; a hit whose home changed behind the mount is dropped and re-read from home.
+`just_cache cache status` lists what each overlay holds, every line marked `EPHEMERAL` — the
+overlay reopens empty after a restart, and its `cache_residency` rows are cleared with it.
+`writeback`, a non-`lru` eviction, an `over` that is missing or volatile, a path overlapping
+a tier root, and a reused name are each refused with the line that broke.
 
 The default file lives beside the watch root and is read only when it is already there —
 a command never creates it. An explicitly named `--tiers` file is different: if it is
@@ -495,6 +526,35 @@ not a second source of truth: deleting it, or the whole catalog, costs the next 
 time and nothing else. The one change the key cannot see is a rewrite that preserves size
 *and* mtime *and* inode; `catalog sync --force-rehash` reads every file again for that case.
 
+## Deleting an object
+
+A delete is a catalog transition, not a filesystem one — the catalog is the source of truth
+for where bytes live, so `catalog delete` releases the name and, when that was the object's
+last name, every recorded copy of it:
+
+```sh
+just_cache catalog delete shows/old.mkv \
+  --watch /mnt/cache/media --dest /mnt/disk-slow/media
+```
+
+- **One committed step.** The name row and (for a last name) the object's `location` rows go
+  in a single transaction; the files to unlink are recorded in the same commit and removed
+  after it. A crash mid-delete cannot leave a name pointing at bytes the catalog no longer
+  vouches for, and the next `catalog sync` or `resolve --apply` finishes the removal first.
+- **Reference counting is by object.** An object reached by two names survives deleting one
+  — only that name's own hot file or symlink goes. Its bytes are released when the last name
+  goes. A delete that would leave the remaining names with no copy is refused.
+- **It refuses rather than doing part of the job**, naming the reason: the path is not
+  catalogued, the object is pinned, a copy is recorded as damaged (the only evidence of what
+  those bytes should be), a tier is not mounted (its bytes cannot be removed, and dropping
+  their rows would orphan them unseen), or a row does not resolve under a recorded root.
+- **It is auditable.** The name is gone from `audit` and `locate`, and no orphan copy is left
+  counted as good. Deleting from an unmounted tier, and a general garbage collector for bytes
+  no delete reaches, are out of scope.
+
+Through the mount, `unlink` and `rmdir` perform the same transition instead of answering
+`EROFS` (see [Mounting the namespace](#mounting-the-namespace)).
+
 ## Auditing consistency
 
 The mover leaves one of a few states behind, and they can drift apart: a crash between
@@ -845,10 +905,28 @@ What the mount is:
   and it never rewrites the catalog, so the next `catalog sync` picks up a rewrite exactly
   as it picks up any other.
 - **Rename is confined to the watch root.** A hot name can be renamed (the tree shows it
-  afterwards); a name whose bytes are on a cold tier refuses with `EROFS`. Deletion is not
-  implemented (`unlink`/`rmdir` answer `EROFS`): it is a catalog transition (§3), a
-  separate issue. Access observation and inline recall are likewise the issues after this
-  one, not here.
+  afterwards); a name whose bytes are on a cold tier refuses with `EROFS`. `unlink` and
+  `rmdir` run the catalog's deletion transition (§3): the name is released and, when it was
+  the object's last, its recorded copies are released with it — in one committed step,
+  refusing with a named reason (a pin, a damaged copy, a tier that is not mounted) rather
+  than deleting part of it. `rmdir` answers `ENOTEMPTY` while catalogued names remain below
+  the directory.
+- **A read of an offloaded object recalls it inline.** The mount pulls the bytes up from
+  their tier of record through the same verified path `restore` uses, then serves the read
+  from the hot copy; a caller never gets `ENOENT` for an object the catalog holds. A tier
+  whose `recall` class is `min` or `hours` refuses instead — a read that blocks for minutes
+  is an application timeout, and a timeout looks like a broken file — and says to run
+  `just_cache restore <path>`. Two concurrent reads of one object place one copy: the first
+  reader recalls, the others wait for its result. `--recall promote` (the default) keeps the
+  recalled copy as the tier of record; `--recall read-through` serves it and places nothing.
+- **Access through the mount is observed, not inferred.** Every open the mount serves adds
+  to the object's `lifecycle` counter and stamps its last access, so a file read through the
+  mount is judged by that observation rather than by a filesystem timestamp — which is what
+  makes the idle rule hold on a `noatime` mount. Observations are buffered and flushed on
+  close, at least every 5 seconds while a file stays open, and at unmount; a killed daemon
+  loses at most the observations since the last flush. `explain` reports the source as
+  `via provider` for such a file. A write or rename through the mount is not an access and
+  creates no transition.
 - **It fails closed.** No catalog is a usage error (a mount over none would present an
   empty namespace); a catalog with no recorded roots, or a mountpoint that is missing or
   not empty, is refused; a name whose bytes are gone answers `EIO`, never an empty file.
@@ -1058,8 +1136,11 @@ must not break — the rules that make this tool safe to point at someone's data
 
 ## Design
 
-The current provider moves files between local filesystem roots and leaves symlinks in
-the watched tree. It does not yet provide a LAN, cloud-object or offline-volume tier.
+The providers that exist are local: the symlink mover over filesystem roots, a FUSE mount
+that serves the catalog's namespace as a real filesystem, and a WebDAV gateway for consumers
+that cannot mount. A `[[cache]]` overlay can sit in front of a durable tier, and a file read
+through the mount is judged by observed access rather than by atime. There is no LAN,
+cloud-object or offline-volume tier.
 
 The design in [`docs/design.md`](docs/design.md) describes the intended extension: one
 catalog and namespace across local disks, LAN peers, cloud object storage and removable

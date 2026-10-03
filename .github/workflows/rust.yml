@@ -118,8 +118,13 @@ jobs:
     # so this cannot be a trigger-level `paths-ignore` (GitHub leaves a required check
     # "Pending" when the whole workflow is skipped, and the PR cannot merge). Instead the
     # workflow always runs and reports green, and the cargo steps below are gated on
-    # whether any changed file lives outside docs/. The skip fires only when we can
-    # positively see docs-only changes; anything unknown keeps the full build.
+    # whether any changed file lives outside the documentation set. The skip fires only
+    # when we can positively see docs-only changes; anything unknown keeps the full build.
+    #
+    # The documentation set is not just `docs/`: the readme, SECURITY.md, any other
+    # markdown and the ignore file are prose too. A root-level `readme.md` edit used to
+    # count as a code change and pay for a full compile-and-test cycle (#136), which is
+    # exactly the cost this step exists to avoid.
     - name: Detect whether any code changed
       id: code-change
       run: |
@@ -133,8 +138,12 @@ jobs:
         if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
           files="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
         fi
+        # Anything not matching this is code: a source file, a manifest, a test, a
+        # workflow, a fixture, or a file we have not thought about — the last case is
+        # why the pattern is an allow-list of documentation rather than a deny-list.
+        docs_pattern='^(docs/|LICENSE|SECURITY\.md|\.gitignore|[^/]*\.md$)'
         skip=true
-        if [ -z "$files" ] || printf '%s\n' "$files" | grep -vq '^docs/'; then
+        if [ -z "$files" ] || printf '%s\n' "$files" | grep -vEq "$docs_pattern"; then
           skip=false
         fi
         if [ "$skip" = "true" ]; then
