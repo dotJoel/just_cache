@@ -269,6 +269,16 @@ struct AuditArgs {
     /// How many findings the readable summary lists (JSON always has them all).
     #[arg(long, value_name = "N", default_value_t = audit::DEFAULT_EXAMPLES)]
     examples: usize,
+
+    /// Answer from the catalog rows alone: no walk, no `stat`, no hash, no tier access.
+    ///
+    /// For a catalog whose tier is not mounted (or a tree that is gone). The report names
+    /// the recorded state, floors, damage marks and scrub state it could read, and states
+    /// the findings it could not make (`missing-copy`, `unknown-path`, a checksum of
+    /// record, and the other kinds that need the tree). Requires a catalog; `--watch` and
+    /// `--dest` are labels only and are never touched.
+    #[arg(long)]
+    no_filesystem: bool,
 }
 
 /// The `catalog` subcommand and its own subcommands.
@@ -985,9 +995,15 @@ fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
 }
 
 fn run_audit(args: AuditArgs) -> ExitCode {
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
+    // A catalog-only audit makes no filesystem access at all, so the path checks that every
+    // other mode runs first — the watch tree exists, each `--dest` is a mounted directory —
+    // are exactly the accesses it must not make. `--watch`/`--dest` still have to parse (the
+    // invocation is what it is) but they are labels: the answer comes from the catalog rows.
+    if !args.no_filesystem {
+        if let Err(message) = validate_paths(&args.watch, &args.dest) {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
     }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
@@ -996,9 +1012,11 @@ fn run_audit(args: AuditArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
+    if !args.no_filesystem {
+        if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
     }
 
     // The catalog is the arbiter when it exists; the walk-based audit is the bootstrap and
@@ -1012,7 +1030,34 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         .clone()
         .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
 
-    let report = if catalog_path.is_file() {
+    let report = if args.no_filesystem {
+        // Catalog-only: the catalog must exist — there is no other source, and a mode that
+        // silently fell back to the tree would be the filesystem access it promised not to
+        // make. `--catalog` is effectively required here; the default path is still tried so
+        // a catalog beside the (possibly unmounted) watch root works.
+        if !catalog_path.is_file() {
+            eprintln!(
+                "just_cache: --no-filesystem needs a catalog, but {} does not exist (create \
+                 it with `just_cache catalog sync`, then run this against it)",
+                catalog_path.display()
+            );
+            return ExitCode::from(EXIT_USAGE);
+        }
+        let catalog = match catalog::Catalog::open(&catalog_path) {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        match audit::catalog_audit_no_filesystem(&catalog, &args.watch, &args.dest) {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        }
+    } else if catalog_path.is_file() {
         let catalog = match catalog::Catalog::open(&catalog_path) {
             Ok(catalog) => catalog,
             Err(err) => {
@@ -1087,7 +1132,9 @@ fn run_audit(args: AuditArgs) -> ExitCode {
                     return ExitCode::from(EXIT_USAGE);
                 }
             },
-            AuditSource::Catalog { .. } => Some(audit::catalog_repair(&report)),
+            AuditSource::Catalog { .. } | AuditSource::CatalogOnly { .. } => {
+                Some(audit::catalog_repair(&report))
+            }
         }
     } else {
         None
@@ -1143,8 +1190,9 @@ fn run_audit(args: AuditArgs) -> ExitCode {
     // neither the findings nor the exit code: a "never scrubbed" copy is a gap in
     // verification, not an inconsistency between the tree and its tiers. Under `--json` it
     // is the report's `scrub` object, part of the document printed above; on the terminal
-    // the same counts print here.
-    if !args.json {
+    // the same counts print here. A catalog-only audit already carries the summary inside
+    // its own section, so it is not printed a second time here.
+    if !args.json && !args.no_filesystem {
         if let Some(scrub) = &report.scrub {
             for line in scrub.summary_lines() {
                 println!("{line}");

@@ -816,11 +816,6 @@ Still open, and honestly so:
   the scrub §6 describes, and it would double the I/O an audit costs. Catalog mode hashes
   the primary location and only *stats* the others, so a corrupt non-primary replica is not
   caught by an audit; catching it is the scrubber's job.
-- **There is no catalog-only (`--no-filesystem`) audit.** #19 allows one "where even that is
-  unavailable"; not built. Every catalog-mode audit makes one pass over the watched tree,
-  which is also what lets it see a path the catalog does not know. An answer with no
-  filesystem at all (a catalog for a tier that is not mounted) is a thing the schema could
-  support and no command does yet.
 - **Catalog-mode `repair` marks for resync in its report, not in a row.** There is still no
   durable per-row `needs_resync` flag. The copy floor's growth to a per-tier value did not
   need a versioned migration, because it landed as a *new table* (`tier`, which `CREATE TABLE
@@ -1173,6 +1168,27 @@ inode is not detected, so `catalog sync --force-rehash` re-reads every file on d
 rebuilds the cache as it goes. Deliberately out of scope: a scrub still reads every byte by
 definition, and an audit's hash is a verification rather than the same "is this the file I
 last saw" question — neither consults the cache.
+Closed by #51: `audit --no-filesystem` answers from the catalog rows alone — no walk, no
+`stat`, no hash, no tier access — for a catalog whose tier is not mounted (or a host where
+the tree is gone). It reports what the rows can honestly say: the recorded object/name/
+location counts, the recorded per-tier floors, an object whose *recorded* locations fall
+below the floor for its copy-of-record's tier (`under-replicated`), a location a scrub
+marked damaged (`damaged-copy`), a row that could never be joined into a path
+(`malformed-catalog` — the check is lexical), and the scrub-state summary, all in a
+`no-filesystem` object in `--json` and a readable block that prints only the classes it
+could check. It states out loud the findings it *cannot* make, from
+`VerdictKind::filesystem_only`: `missing-copy`, `checksum-mismatch`, `copy-floor`,
+`name-vanished`, `unknown-path`, `unknown-version`, `dangling-symlink`, `unexpected-target`,
+`duplicate`, `orphaned-copy`, and `replica-lost` — every one needs the tree — as an `unchecked`
+list in the JSON and a `cannot be checked without the tree:` line in the summary, precisely so
+a `0` is not read as "checked and clean". `--watch`/`--dest` are labels only in this mode and
+are never touched (the path checks every other mode runs are skipped), the source is named
+`catalog-only`, exit codes are unchanged (0/1/2), and it is read-only: nothing is written to
+the catalog or the tree, and `--repair` marks for resync exactly as catalog mode does.
+`tests/audit_catalog_only.rs` builds a catalog, deletes the watch root and every tier root,
+and asserts the answer still comes back — which is what proves the abstention, since a
+command that validated or walked those paths would exit 2. The mode deliberately does not
+verify whether recorded copies still exist; that is the whole limit it names.
 
 ## 10. Non-goals
 
@@ -1264,3 +1280,9 @@ last saw" question — neither consults the cache.
   make it cost far less than its length is measured by the length and refused against the
   floor conservatively. The mover measures allocation because it has the file in hand;
   reconcile has only the row.
+- **A catalog-only audit cannot say whether a recorded copy still exists.** #51 reports
+  what the rows say and never touches a tier, so it cannot turn a `location` row into
+  "the file is there" — that stat is exactly what catalog mode above adds, and what this
+  mode exists to avoid. It reports the recorded floor and damage state instead, marks the
+  rest `unchecked`, and leaves the filesystem answer to a catalog-mode run once a tier is
+  mounted. Making the mode reconstruct paths to probe them would defeat its purpose.
