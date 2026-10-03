@@ -289,8 +289,12 @@ fn place(
 ) -> ReplicaStatus {
     match fs::symlink_metadata(dest) {
         Ok(metadata) => {
-            if metadata.is_dir() {
-                return ReplicaStatus::Failed("destination path is a directory".to_string());
+            // Only a regular file can be an adopted copy. A symlink is neither a
+            // directory nor a copy: hashing through it would count a link whose target
+            // can vanish, satisfying the floor with a name the tool cannot vouch for
+            // (invariant 6). `!is_dir()` was not enough, because a symlink passes it.
+            if !metadata.is_file() {
+                return ReplicaStatus::Failed("destination path is not a regular file".to_string());
             }
             let size = metadata.len();
             if size != entry.size {
@@ -508,6 +512,64 @@ mod tests {
         let outcome = replicate(&entry(&src, "a.bin", 4), &[d1], 1, 0);
         assert!(outcome.meets_floor());
         assert_eq!(outcome.replicas[0].status, ReplicaStatus::Adopted);
+    }
+
+    /// A symlink at a destination is not a copy, even when it resolves to byte-identical
+    /// bytes: `place` must not return `Adopted`, and the link must not satisfy the floor.
+    ///
+    /// The symlink's *target text* is exactly the source's size and its target hashes to the
+    /// object, so the old `!is_dir()` check — which compares the link's length and then hashes
+    /// through the link — adopted it. Requiring `is_file()` refuses it.
+    #[test]
+    fn a_symlink_at_a_destination_is_not_adopted_and_does_not_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d1 = tmp.path().join("d1");
+        let d2 = tmp.path().join("d2");
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+
+        let link_text = "identical.bin";
+        let bytes: Vec<u8> = (0..link_text.len()).map(|i| (i % 251 + 1) as u8).collect();
+        let src = tmp.path().join("a.bin");
+        fs::write(&src, &bytes).unwrap();
+        // The link resolves, relative to its own directory, to a byte-identical file.
+        fs::write(d2.join(link_text), &bytes).unwrap();
+        std::os::unix::fs::symlink(link_text, d2.join("a.bin")).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(d2.join("a.bin")).unwrap().len(),
+            bytes.len() as u64,
+            "the link's own length must equal the source's for this test to mean anything"
+        );
+
+        let outcome = replicate(
+            &entry(&src, "a.bin", bytes.len() as u64),
+            &[d1, d2.clone()],
+            2,
+            0,
+        );
+
+        assert!(
+            !outcome.meets_floor(),
+            "a symlink must not satisfy the floor: {outcome:?}"
+        );
+        assert_eq!(outcome.verified, 1, "only the real copy counts");
+        assert_eq!(
+            outcome.replicas.iter().filter(|p| p.is_valid()).count(),
+            1,
+            "the symlink placement must not be valid: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .replicas
+                .iter()
+                .any(|placement| placement.dest_root == d2
+                    && matches!(&placement.status, ReplicaStatus::Failed(msg) if msg.contains("not a regular file"))),
+            "{outcome:?}"
+        );
+        assert!(
+            fs::symlink_metadata(d2.join("a.bin")).unwrap().is_symlink(),
+            "the symlink is left exactly as it was"
+        );
     }
 
     #[test]

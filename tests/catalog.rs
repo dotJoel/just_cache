@@ -346,6 +346,105 @@ fn a_catalog_can_live_at_an_explicit_path_and_records_only_real_tiers() {
     }
 }
 
+/// A symlink planted at the catalog's own name must be refused, and the link's target —
+/// any file the tool's user can write — left byte-for-byte untouched. Before the guard,
+/// SQLite opened straight through the link and initialized the target as a database,
+/// which grew a 0-byte victim to ~90 KiB.
+#[test]
+fn a_symlink_at_the_catalog_path_is_refused_and_the_target_is_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("a.bin"), b"payload").unwrap();
+
+    // An empty file is the sharpest victim: SQLite treats it as a new database and
+    // writes a schema into it. A refusal must leave it at zero bytes.
+    let victim = tmp.path().join("victim.sqlite");
+    fs::write(&victim, b"").unwrap();
+    link(&victim, &hot.join(CATALOG_NAME));
+
+    let output = sync(&hot, &cold);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a symlinked catalog must be refused, not opened:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symbolic link"),
+        "the refusal must name the reason:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"",
+        "the symlink target must be untouched"
+    );
+    // The link itself still exists — the tool refused it rather than deleting it.
+    assert!(fs::symlink_metadata(hot.join(CATALOG_NAME))
+        .unwrap()
+        .is_symlink());
+}
+
+/// The same guard for SQLite's predictable sibling names: a rollback journal is created
+/// before the first page of a transaction lands, so a link at `<catalog>-journal` is a
+/// name an attacker who can watch the tree gets to plant first.
+#[test]
+fn a_symlink_at_a_sqlite_sibling_name_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("a.bin"), b"payload").unwrap();
+
+    let victim = tmp.path().join("journal-victim");
+    fs::write(&victim, b"JOURNAL VICTIM").unwrap();
+    let journal = hot.join(format!("{CATALOG_NAME}-journal"));
+    link(&victim, &journal);
+
+    let output = sync(&hot, &cold);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("symbolic link"),
+        "the refusal must name the reason:\n{stderr}"
+    );
+    assert_eq!(fs::read(&victim).unwrap(), b"JOURNAL VICTIM");
+    assert!(
+        fs::symlink_metadata(&journal).unwrap().is_symlink(),
+        "the planted sibling is left where it was found"
+    );
+    // And the refusal must not have created a catalog at all.
+    assert!(
+        fs::symlink_metadata(hot.join(CATALOG_NAME)).is_err(),
+        "a refused open must not leave a catalog behind"
+    );
+}
+
+/// A catalog created by the tool is private to its user: 0600, not the process umask's
+/// 0644. The catalog discloses the watched tree's whole inventory, its sizes and digests.
+#[test]
+fn a_freshly_created_catalog_is_private_to_its_user() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("a.bin"), b"payload").unwrap();
+
+    assert_exit(&sync(&hot, &cold), 0);
+    let metadata = fs::symlink_metadata(hot.join(CATALOG_NAME)).unwrap();
+    assert_eq!(
+        metadata.mode() & 0o777,
+        0o600,
+        "a newly created catalog must be mode 0600"
+    );
+}
+
 fn canonical(path: &Path) -> String {
     fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())

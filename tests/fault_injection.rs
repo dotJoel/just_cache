@@ -86,6 +86,34 @@ fn run_sweep(mut command: Command, watch: &Path, dests: &[&Path]) -> Output {
         .expect("just_cache runs")
 }
 
+/// A single-destination sweep with the fault hook set, for windows that live in the mover
+/// (`replace-verified-dest`) rather than in replication. No `--copies` floor: the point is
+/// the mover's own verification-and-removal, not the replica loop.
+fn fault_mover_sweep(watch: &Path, dest: &Path, fault: &str) -> Output {
+    let mut command = bin();
+    command.env("JUST_CACHE_FAULT", fault);
+    run_mover_sweep(command, watch, dest)
+}
+
+fn run_mover_sweep(mut command: Command, watch: &Path, dest: &Path) -> Output {
+    command
+        .arg("--watch")
+        .arg(watch)
+        .arg("--dest")
+        .arg(dest)
+        .args([
+            "--min-idle-days",
+            "0",
+            "--min-observed-accesses",
+            "0",
+            "--min-free-gb",
+            "0",
+            "--once",
+        ])
+        .output()
+        .expect("just_cache runs")
+}
+
 fn catalog_sync(watch: &Path, dests: &[&Path], copies: usize) -> Output {
     let mut command = bin();
     command.args(["catalog", "sync", "--watch"]).arg(watch);
@@ -545,4 +573,39 @@ fn a_copy_vanishing_after_retirement_is_reported_by_audit_and_sync() {
         bytes,
         "and it must not have touched the surviving copy"
     );
+}
+
+/// A destination replaced *after* its bytes verified as identical: the mover must keep the
+/// source. This is the second half of #71 — the identity re-check makes the removal
+/// conditional on the name still resolving to the object whose digest was compared, so a
+/// swap in that window cannot leave the source's bytes deleted with no verified copy.
+#[test]
+fn a_destination_replaced_after_verification_keeps_the_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("fi-replaced");
+    let dest = tmp.path().join("fi-replaced-cold");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    let bytes = payload(4096);
+    fs::write(watch.join("clip.bin"), &bytes).unwrap();
+    // An identical copy already at the destination is the resumed state of an interrupted
+    // move; the mover verifies it and would normally retire the source in its favour.
+    fs::write(dest.join("clip.bin"), &bytes).unwrap();
+
+    let output = fault_mover_sweep(&watch, &dest, "replace-verified-dest=1");
+    assert_exit(&output, 1);
+    let text = text_of(&output);
+    assert!(
+        text.contains("was replaced after its content was verified"),
+        "the refusal must be reported:\n{text}"
+    );
+
+    // The source is kept: with the verified copy gone, it may be the only copy left.
+    let source = watch.join("clip.bin");
+    assert!(
+        !fs::symlink_metadata(&source).unwrap().is_symlink(),
+        "the source must not be retired when the destination no longer verifies"
+    );
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    assert!(support::partial_files(&dest).is_empty());
 }

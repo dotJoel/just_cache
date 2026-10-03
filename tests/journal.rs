@@ -52,7 +52,7 @@ fn a_name_lost_between_the_move_and_the_link_is_restored() {
     journal.compact().unwrap();
     assert!(!hot.exists(), "the crash window means the name is gone");
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert_eq!(report.restored(), 1);
     assert_eq!(report.trouble(), 0);
 
@@ -84,7 +84,7 @@ fn a_copy_of_the_wrong_size_is_never_linked_to() {
         .intent(Path::new("shows/episode.mkv"), &cold_copy, 4096)
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert_eq!(report.restored(), 0);
     assert_eq!(report.trouble(), 1, "a refusal is something to look at");
     assert!(
@@ -115,7 +115,7 @@ fn a_move_that_never_started_is_forgotten() {
         )
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert!(matches!(
         report.outcomes[0].1,
         journal::Recovery::NeverStarted
@@ -139,7 +139,7 @@ fn a_move_that_actually_finished_is_not_repaired_twice() {
         .intent(Path::new("shows/episode.mkv"), &cold_copy, 13)
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert_eq!(report.outcomes[0].1, journal::Recovery::AlreadyLinked);
     assert!(fs::symlink_metadata(&hot).unwrap().is_symlink());
     assert!(journal_of(&watch).is_empty());
@@ -167,7 +167,7 @@ fn both_copies_present_is_left_to_the_sweep_which_adopts_it() {
         )
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert!(matches!(
         report.outcomes[0].1,
         journal::Recovery::LeftForTheSweep { .. }
@@ -219,7 +219,7 @@ fn an_interrupted_copy_is_removed_when_the_source_is_intact() {
         )
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert!(matches!(
         report.outcomes[0].1,
         journal::Recovery::PartialRemoved { .. }
@@ -249,7 +249,7 @@ fn an_interrupted_copy_is_kept_when_nothing_else_survived() {
         )
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert!(matches!(
         report.outcomes[0].1,
         journal::Recovery::PartialKept { .. }
@@ -277,7 +277,7 @@ fn data_loss_is_reported_and_remembered() {
         )
         .unwrap();
 
-    let report = journal::repair(&mut journal, &watch).unwrap();
+    let report = journal::repair(&mut journal, &watch, std::slice::from_ref(&cold)).unwrap();
     assert!(matches!(
         report.outcomes[0].1,
         journal::Recovery::DataLost { .. }
@@ -416,5 +416,263 @@ fn the_cli_restores_a_lost_name_on_its_next_run() {
     let report = String::from_utf8_lossy(&audit.stdout);
     assert!(audit.status.success(), "audit should be clean: {report}");
     assert!(report.contains("healthy: 1"), "{report}");
+    let _ = tmp;
+}
+/// Quote a path for a hand-written journal line. Temp paths carry no characters this would
+/// need to escape, but the records below deliberately name paths the tool did not write,
+/// so the test spells them the same way the encoder would.
+fn json_str(path: &Path) -> String {
+    let text = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{text}\"")
+}
+
+/// A journal line is writer-controlled input: anyone who can write the watched tree can
+/// write the journal, and a truncated or hand-edited journal reaches the same state with no
+/// attacker at all. A record whose path escapes the tree, or whose destination is outside
+/// every `--dest` root, must be refused without touching what it names — before the fix, a
+/// `..`/absolute `rel` made the sweep create a symlink anywhere on the filesystem, or
+/// delete a `.just_cache-partial-*` file beside any destination.
+#[test]
+fn a_journal_record_that_escapes_the_tree_is_refused() {
+    let (tmp, watch, cold) = scenario();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    // Names a hostile record would create from `rel` with no containment check.
+    let planted_link = outside.join("planted_link");
+    let absolute_link = outside.join("absolute_link");
+    // A file outside the tree that the delete branch would act beside (`dest` is under the
+    // real `--dest` root, so only the escaping `rel` is wrong).
+    let victim = outside.join("victim.bin");
+    fs::write(&victim, b"the only copy").unwrap();
+    let partial = cold.join("shows").join(format!(
+        "{}999-3.tmp",
+        just_cache::disk_management::PARTIAL_PREFIX
+    ));
+    fs::write(&partial, b"an interrupted copy").unwrap();
+
+    // A destination outside every `--dest` root: the record's `rel` is clean, so before the
+    // fix the sweep would link `watch/shows/clean.bin` at a file in `rogue`.
+    let rogue = tmp.path().join("rogue/shows/clean.bin");
+    fs::create_dir_all(rogue.parent().unwrap()).unwrap();
+    fs::write(&rogue, b"abcd").unwrap();
+
+    let cold_copy = cold.join("shows/episode.mkv");
+    fs::write(&cold_copy, b"abcd").unwrap();
+
+    let planted = format!(
+        "{{\"stage\":\"intent\",\"rel\":\"../outside/planted_link\",\"dest\":{},\"size\":4,\"at\":100}}",
+        json_str(&cold_copy)
+    );
+    let absolute = format!(
+        "{{\"stage\":\"intent\",\"rel\":{},\"dest\":{},\"size\":4,\"at\":100}}",
+        json_str(&absolute_link),
+        json_str(&cold_copy)
+    );
+    let deletes = format!(
+        "{{\"stage\":\"intent\",\"rel\":\"../outside/victim.bin\",\"dest\":{},\"size\":1,\"at\":100}}",
+        json_str(&cold.join("shows/victim.bin"))
+    );
+    let rogue_destination = format!(
+        "{{\"stage\":\"intent\",\"rel\":\"shows/clean.bin\",\"dest\":{},\"size\":4,\"at\":100}}",
+        json_str(&rogue)
+    );
+    fs::write(
+        watch.join(JOURNAL_NAME),
+        format!("{planted}\n{absolute}\n{deletes}\n{rogue_destination}\n"),
+    )
+    .unwrap();
+
+    let output = bin()
+        .args([
+            "--watch",
+            watch.to_str().unwrap(),
+            "--dest",
+            cold.to_str().unwrap(),
+            "--min-idle-days",
+            "30",
+            "--min-free-gb",
+            "0",
+            "--once",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Nothing outside the tree may have been created or removed.
+    assert!(
+        !planted_link.exists(),
+        "a `..` record must not plant a link outside the tree"
+    );
+    assert!(
+        !absolute_link.exists(),
+        "an absolute record must not plant a link outside the tree"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"the only copy",
+        "a record must not delete a file outside the tree"
+    );
+    assert!(
+        partial.exists(),
+        "a `..` record must not remove a partial under the destination"
+    );
+    assert!(
+        !watch.join("shows/clean.bin").exists(),
+        "a destination outside every --dest root must not be linked to"
+    );
+
+    // Every record is reported, and kept so the operator can look at the lines.
+    assert!(
+        stdout.contains("REFUSED a journal record"),
+        "a refused record must be visible: {stdout}"
+    );
+    assert_eq!(
+        journal_of(&watch).unfinished_count(),
+        4,
+        "refused records are kept and reported on the next run"
+    );
+    let _ = tmp;
+}
+
+/// A symlink planted at the journal name must be refused, not followed: following it would
+/// append every intent record into — or, on the append open, redirect writes into — a file
+/// the planter chose. The symlink target keeps its contents and the run says why.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_journal_name_is_refused_and_the_target_survives() {
+    let (tmp, watch, cold) = scenario();
+    let victim = tmp.path().join("victim.txt");
+    fs::write(&victim, b"SECRET-DATA-THAT-MUST-SURVIVE\n").unwrap();
+    fs::write(watch.join("shows/episode.mkv"), b"payload").unwrap();
+    std::os::unix::fs::symlink(&victim, watch.join(JOURNAL_NAME)).unwrap();
+
+    let output = bin()
+        .args([
+            "--watch",
+            watch.to_str().unwrap(),
+            "--dest",
+            cold.to_str().unwrap(),
+            "--min-idle-days",
+            "30",
+            "--min-free-gb",
+            "0",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a symlinked journal must stop the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say what it refused: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"SECRET-DATA-THAT-MUST-SURVIVE\n",
+        "the link target must be untouched"
+    );
+    assert!(
+        fs::symlink_metadata(watch.join(JOURNAL_NAME))
+            .unwrap()
+            .is_symlink(),
+        "the link itself must be left as it was"
+    );
+    assert!(
+        !fs::symlink_metadata(watch.join("shows/episode.mkv"))
+            .unwrap()
+            .is_symlink(),
+        "and nothing may have moved"
+    );
+    let _ = tmp;
+}
+
+/// The compaction temp is the other fixed name. `create_new` refuses the planted link rather
+/// than truncating through it, so the file it points at keeps its bytes, and the end-of-sweep
+/// compaction that hits it is reported rather than swallowed.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_compaction_temp_is_refused_and_the_target_survives() {
+    let (tmp, watch, cold) = scenario();
+    let victim = tmp.path().join("victim.txt");
+    fs::write(&victim, b"SECRET-DATA-THAT-MUST-SURVIVE\n").unwrap();
+    // A warm file so the sweep itself has nothing to do; the only write is the compaction.
+    fs::write(watch.join("shows/episode.mkv"), b"payload").unwrap();
+    let temporary = watch.join(JOURNAL_NAME).with_extension("compacting");
+    std::os::unix::fs::symlink(&victim, &temporary).unwrap();
+
+    let output = bin()
+        .args([
+            "--watch",
+            watch.to_str().unwrap(),
+            "--dest",
+            cold.to_str().unwrap(),
+            "--min-idle-days",
+            "30",
+            "--min-free-gb",
+            "0",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the refused compaction must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say what it refused: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"SECRET-DATA-THAT-MUST-SURVIVE\n",
+        "the link target must never be truncated into"
+    );
+    assert!(
+        fs::symlink_metadata(&temporary).unwrap().is_symlink(),
+        "the planted link is left for a human, not deleted"
+    );
+    let _ = tmp;
+}
+
+/// The journal records every in-flight move, destination included, so it must not be
+/// world-readable. Created under `umask 0` — where an un-hinted create would be 0666 — it
+/// still comes out 0600.
+#[cfg(unix)]
+#[test]
+fn a_newly_created_journal_is_mode_0600_even_under_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, watch, cold) = scenario();
+    fs::write(watch.join("shows/episode.mkv"), b"still warm").unwrap();
+
+    // The umask is per-process, so it is set in a child: `sh -c 'umask 0; exec …'`.
+    let script = format!(
+        "umask 0; exec '{}' --watch '{}' --dest '{}' --min-idle-days 30 --min-free-gb 0 --once",
+        env!("CARGO_BIN_EXE_just_cache"),
+        watch.display(),
+        cold.display()
+    );
+    let status = Command::new("sh").args(["-c", &script]).status().unwrap();
+    assert!(status.success());
+
+    let mode = fs::metadata(watch.join(JOURNAL_NAME))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the journal must be created with an explicit mode, not the umask"
+    );
     let _ = tmp;
 }

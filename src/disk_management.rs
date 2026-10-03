@@ -31,8 +31,13 @@
 //! an error, because a file that moved with the wrong owner is recoverable and a file
 //! that refused to move is not.
 
-use std::fs::{self, File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -107,6 +112,27 @@ pub enum DiskError {
         actual: u64,
         expected: u64,
     },
+    /// A component of the destination path *beneath* the `--dest` root is a symlink.
+    /// Following it would place the copy — and, after the source is retired, the symlink
+    /// pointing at it — outside the root the operator named (SECURITY.md's escape case),
+    /// so the move is refused and nothing is written.
+    #[error(
+        "refusing to write {path}: destination component {component} is a symlink, which \
+         would place the copy outside the destination root"
+    )]
+    DestinationSymlink { path: PathBuf, component: PathBuf },
+    /// A component of the destination path *beneath* the `--dest` root is not a directory.
+    /// A path that cannot be built is refused rather than reinterpreted.
+    #[error("refusing to write {path}: destination component {component} is not a directory")]
+    DestinationNotDirectory { path: PathBuf, component: PathBuf },
+    /// The destination that verified as an identical copy of the source no longer resolves
+    /// to that object. Removing the source now would leave no verified copy at all, so the
+    /// source is kept and the move is reported as failed.
+    #[error(
+        "refusing to remove {from}: destination {dest} was replaced after its content was \
+         verified; the verified copy is gone and the source is kept"
+    )]
+    DestinationReplaced { from: PathBuf, dest: PathBuf },
 }
 
 /// A file found under the watched root.
@@ -309,6 +335,319 @@ pub fn destination_with_room(dest: &Path, needed: u64, min_free: u64) -> Option<
     }
 }
 
+/// Identity of a file on disk: the `(device, inode)` pair that names *this exact object*,
+/// independent of any name it currently has. Used to notice that a verified destination was
+/// replaced by a different file before the source is removed — the failure that would
+/// otherwise delete the source's bytes with no verified copy left anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+/// The directory a destination file will be written into, opened once and held open.
+///
+/// Resolution walks the components *beneath* the destination root with `O_NOFOLLOW`, so a
+/// symlink anywhere in the path is refused instead of followed: writing through one puts
+/// the copy outside the root the operator named (SECURITY.md's escape case). Holding the
+/// descriptor is what makes the guarantee outlive the check — the partial is created and
+/// the completed copy is published with `openat`/`renameat` relative to this descriptor, so
+/// a component swapped to a symlink after resolution cannot redirect the writes.
+struct DestDir {
+    #[cfg(unix)]
+    dir: OwnedFd,
+    /// The same directory as a path, for messages and for the path-based metadata helpers
+    /// (`chmod`/`chown`/xattr/times) that have no descriptor form in this crate. The
+    /// in-scope escape is a symlink that already exists in the destination tree, and that
+    /// was refused above; the residual window is a component replaced by a process with
+    /// write access to the root's ancestors, which SECURITY.md scopes out.
+    path: PathBuf,
+    /// Directories this call created while resolving, deepest last. The mid-copy fault
+    /// seam removes exactly these: the tool made them in this call, so nothing else can be
+    /// inside them yet.
+    created: Vec<PathBuf>,
+}
+
+impl DestDir {
+    /// Open an already-resolved parent directory without the beneath checks. Used by
+    /// `copy_into_place`, whose caller (replication) has already chosen the destination.
+    fn open_path(parent: &Path) -> io::Result<DestDir> {
+        let created = if parent.as_os_str().is_empty() || parent.exists() {
+            Vec::new()
+        } else {
+            vec![parent.to_path_buf()]
+        };
+        fs::create_dir_all(parent)?;
+        Ok(DestDir {
+            #[cfg(unix)]
+            dir: open_dir(parent)?,
+            path: parent.to_path_buf(),
+            created,
+        })
+    }
+
+    /// Resolve `relative_parent` beneath `root`, creating missing directories, and refuse
+    /// any component that is a symlink or is not a directory.
+    fn beneath(root: &Path, relative_parent: &Path) -> Result<DestDir, DiskError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::Mode;
+            use rustix::io::Errno;
+
+            let mut dir = open_dir(root).map_err(|source| DiskError::StatError {
+                path: root.to_path_buf(),
+                source,
+            })?;
+            let mut walked = PathBuf::new();
+            let mut created = Vec::new();
+
+            for component in relative_parent.components() {
+                let name = match component {
+                    Component::CurDir => continue,
+                    Component::Normal(name) => name.to_os_string(),
+                    // The walk builds a relative path; `..` or a root here would be a path
+                    // that can leave the root, so refuse rather than reinterpret it.
+                    _ => {
+                        return Err(DiskError::DestinationNotDirectory {
+                            path: root.join(relative_parent),
+                            component: walked.clone(),
+                        })
+                    }
+                };
+                walked.push(&name);
+
+                let next = match open_dir_at(&dir, &name) {
+                    Ok(next) => next,
+                    Err(Errno::NOENT) => {
+                        rustix::fs::mkdirat(&dir, &name, Mode::from_bits_truncate(0o755))
+                            .map_err(|err| component_error(&dir, root, &walked, &name, err))?;
+                        created.push(root.join(&walked));
+                        open_dir_at(&dir, &name)
+                            .map_err(|err| component_error(&dir, root, &walked, &name, err))?
+                    }
+                    Err(err) => return Err(component_error(&dir, root, &walked, &name, err)),
+                };
+                dir = next;
+            }
+
+            Ok(DestDir {
+                dir,
+                path: root.join(relative_parent),
+                created,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let path = root.join(relative_parent);
+            let created = if relative_parent.as_os_str().is_empty() || path.exists() {
+                Vec::new()
+            } else {
+                vec![path.clone()]
+            };
+            fs::create_dir_all(&path).map_err(|source| DiskError::StatError {
+                path: path.clone(),
+                source,
+            })?;
+            Ok(DestDir { path, created })
+        }
+    }
+
+    /// Create the private partial file inside the resolved directory.
+    fn create_partial(&self, name: &OsStr) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let fd = rustix::fs::openat(
+                &self.dir,
+                name,
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )?;
+            Ok(File::from(fd))
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.path.join(name))
+        }
+    }
+
+    /// Open an existing file in the resolved directory, never following a final symlink.
+    /// `None` means nothing is there; `ELOOP` is surfaced to the caller so a symlinked
+    /// final component is refused rather than mistaken for an absent destination.
+    fn open_existing(&self, name: &OsStr) -> io::Result<Option<File>> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use rustix::io::Errno;
+            match rustix::fs::openat(
+                &self.dir,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => Ok(Some(File::from(fd))),
+                Err(Errno::NOENT) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match fs::symlink_metadata(self.path.join(name)) {
+                Ok(_) => Ok(Some(File::open(self.path.join(name))?)),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    /// Rename a name inside this directory onto another name inside it. Because both ends
+    /// are relative to the held descriptor, this is atomic and cannot be redirected by a
+    /// later change to any component of the path.
+    fn rename_within(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            rustix::fs::renameat(&self.dir, from, &self.dir, to).map_err(Into::into)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::rename(self.path.join(from), self.path.join(to))
+        }
+    }
+
+    /// Rename an absolute source path into this directory.
+    fn rename_from(&self, src: &Path, to: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            rustix::fs::renameat(rustix::fs::CWD, src, &self.dir, to).map_err(Into::into)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::rename(src, self.path.join(to))
+        }
+    }
+
+    /// Unlink a name inside this directory.
+    fn remove(&self, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            rustix::fs::unlinkat(&self.dir, name, rustix::fs::AtFlags::empty()).map_err(Into::into)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::remove_file(self.path.join(name))
+        }
+    }
+
+    /// The identity of the file currently at `name`, or `None` when nothing is there.
+    fn identity(&self, name: &OsStr) -> io::Result<Option<DestIdentity>> {
+        match self.open_existing(name)? {
+            Some(file) => Ok(Some(file_identity(&file)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(Into::into)
+}
+
+/// Open one component beneath a held directory, refusing a symlink (`O_NOFOLLOW`) and
+/// anything that is not a directory (`O_DIRECTORY`).
+#[cfg(unix)]
+fn open_dir_at<Fd: AsFd>(dir: Fd, name: &OsStr) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat(
+        dir,
+        name,
+        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+}
+
+/// Turn the errno from resolving one destination component into a named refusal.
+///
+/// `O_DIRECTORY | O_NOFOLLOW` reports a symlink as `ENOTDIR` on Linux — the link itself is
+/// not a directory — so a `NOTDIR` is disambiguated with a non-following stat before the
+/// refusal is named. A symlink and a plain non-directory are the two shapes this issue is
+/// about, and anything else is reported against the full path.
+#[cfg(unix)]
+fn component_error<Fd: AsFd>(
+    dir: Fd,
+    root: &Path,
+    component: &Path,
+    name: &OsStr,
+    err: rustix::io::Errno,
+) -> DiskError {
+    use rustix::fs::{AtFlags, FileType};
+    use rustix::io::Errno;
+
+    let path = root.join(component);
+    if err == Errno::NOTDIR {
+        let is_symlink = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            return DiskError::DestinationSymlink {
+                path,
+                component: component.to_path_buf(),
+            };
+        }
+        return DiskError::DestinationNotDirectory {
+            path,
+            component: component.to_path_buf(),
+        };
+    }
+    if err == Errno::LOOP {
+        DiskError::DestinationSymlink {
+            path,
+            component: component.to_path_buf(),
+        }
+    } else {
+        DiskError::StatError {
+            path,
+            source: err.into(),
+        }
+    }
+}
+
+/// `(device, inode)` for an open file. On platforms without them, the pair is a constant
+/// and the replacement check below is a no-op — those platforms cannot create the
+/// symlinks this tool relies on in the first place.
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<DestIdentity> {
+    let stat = rustix::fs::fstat(file)?;
+    Ok(DestIdentity {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_file: &File) -> io::Result<DestIdentity> {
+    Ok(DestIdentity { dev: 0, ino: 0 })
+}
+
+/// True when an open failed because the final component is a symlink (`ELOOP`).
+fn is_symlink_error(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
 /// Move `entry` from the watched tree onto `dest_root`, leaving a symlink in the
 /// original location that points at the new home.
 ///
@@ -351,8 +690,32 @@ pub fn move_file_with_symlink(
     // their final locations.
     let link_target = symlink_target(src, &dest);
 
-    let already_there = match fs::symlink_metadata(&dest) {
-        Ok(dest_metadata) => {
+    let dest_name = match entry.relative.file_name() {
+        Some(name) => name.to_os_string(),
+        None => {
+            return Err(DiskError::StatError {
+                path: dest,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination path has no file name",
+                ),
+            })
+        }
+    };
+    let relative_parent = entry.relative.parent().unwrap_or_else(|| Path::new(""));
+
+    // Resolve (and create) the destination directory *beneath* the root, refusing a
+    // symlinked component. This is the containment gate: the partial is created and the
+    // finished copy is renamed into place relative to this descriptor, so neither can
+    // land outside `dest_root` even if the path changes afterwards.
+    let dir = DestDir::beneath(dest_root, relative_parent)?;
+
+    let already_there = match dir.open_existing(&dest_name) {
+        Ok(Some(mut file)) => {
+            let dest_metadata = file.metadata().map_err(|source| DiskError::StatError {
+                path: dest.clone(),
+                source,
+            })?;
             if dest_metadata.is_dir() {
                 return Err(DiskError::DestinationConflict {
                     path: dest,
@@ -372,7 +735,10 @@ pub fn move_file_with_symlink(
             // destination identical, so a checksum is the honest way to tell the
             // resumed state from a same-size stranger that must not be adopted —
             // adopting it would delete the source and lose the data.
-            let identical = same_contents(src, &dest).map_err(|source| DiskError::StatError {
+            let identical = digest_reader(&mut file).map_err(|source| DiskError::StatError {
+                path: dest.clone(),
+                source,
+            })? == file_digest(src).map_err(|source| DiskError::StatError {
                 path: src.clone(),
                 source,
             })?;
@@ -383,19 +749,50 @@ pub fn move_file_with_symlink(
                     src_size: entry.size,
                 });
             }
-            true
+            // The identity of the object whose bytes were just verified, captured from
+            // the very descriptor they were read through. The removal below is allowed
+            // only while the name still resolves to this exact object.
+            Some(file_identity(&file).map_err(|source| DiskError::StatError {
+                path: dest.clone(),
+                source,
+            })?)
         }
-        Err(_) => false,
+        Ok(None) => None,
+        Err(err) if is_symlink_error(&err) => {
+            return Err(DiskError::DestinationSymlink {
+                path: dest,
+                component: PathBuf::from(&dest_name),
+            })
+        }
+        Err(source) => return Err(DiskError::StatError { path: dest, source }),
     };
 
-    if already_there {
+    if let Some(verified) = already_there {
+        // The deterministic seam for "the destination is swapped after it verified and
+        // before the source is removed". Inert in production (see `faults.rs`).
+        maybe_replace_verified_dest(&dir, &dest_name, &dest);
+        // Re-stat through the same descriptor immediately before the removal. If the name
+        // no longer resolves to the object whose bytes we verified, deleting the source
+        // would leave no verified copy anywhere, so the source is kept.
+        let now = dir
+            .identity(&dest_name)
+            .map_err(|source| DiskError::StatError {
+                path: dest.clone(),
+                source,
+            })?;
+        if now != Some(verified) {
+            return Err(DiskError::DestinationReplaced {
+                from: src.clone(),
+                dest: dest.clone(),
+            });
+        }
         fs::remove_file(src).map_err(|source| DiskError::MoveError {
             from: src.clone(),
             to: dest.clone(),
             source,
         })?;
     } else {
-        transfer(src, &dest, entry.size)?;
+        transfer_into(src, &dir, &dest_name, &dest, entry.size)?;
     }
 
     create_symlink(&link_target, src).map_err(|source| DiskError::SymlinkError {
@@ -404,41 +801,82 @@ pub fn move_file_with_symlink(
         source,
     })?;
 
-    Ok(if already_there {
+    Ok(if already_there.is_some() {
         MoveOutcome::LinkedExisting
     } else {
         MoveOutcome::Moved
     })
 }
 
-/// Whether two files hold the same bytes, compared with BLAKE3 (the content identity
-/// the design's catalog is built on, §3), not by length.
-fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
-    Ok(file_digest(a)? == file_digest(b)?)
+/// The deterministic seam for the window between a destination's content being verified
+/// and the source being removed: the destination is replaced by a different file, which is
+/// exactly what a racing process (or an attacker) would do to make the removal delete the
+/// last verified copy. Inert unless `JUST_CACHE_FAULT` sets `replace-verified-dest`; see
+/// `faults.rs`.
+///
+/// The replacement is written under a private name *before* the destination is unlinked, so
+/// the kernel has already allocated it a distinct inode. Unlinking and then writing in place
+/// lets the fresh file take over the inode the old one just freed, and then the `(device,
+/// inode)` the guard re-stats is unchanged and the seam silently does nothing — which is what
+/// happened on CI (ext4 recycled the inode; the local filesystem did not). Creating the
+/// replacement first is what "the name now resolves to a different object" actually means.
+fn maybe_replace_verified_dest(dir: &DestDir, dest_name: &OsStr, dest: &Path) {
+    let Some(crate::faults::Fault {
+        mode: crate::faults::FaultMode::ReplaceVerifiedDest,
+        ..
+    }) = crate::faults::Fault::from_env()
+    else {
+        return;
+    };
+    if !crate::faults::claim_replace_verified_dest() {
+        return;
+    }
+    let staged = dest.with_file_name(format!(".just_cache-fault-replaced-{}", std::process::id()));
+    // A seam that half-fires is worse than one that does not fire: the test would assert a
+    // refusal that never happened. Leave the destination alone if the staging write fails.
+    if fs::write(&staged, b"replaced after verification").is_err() {
+        return;
+    }
+    if dir.remove(dest_name).is_err() || fs::rename(&staged, dest).is_err() {
+        let _ = fs::remove_file(&staged);
+        return;
+    }
+    eprintln!(
+        "just_cache: JUST_CACHE_FAULT=replace-verified-dest replaced {} after its content was \
+         verified",
+        dest.display()
+    );
+}
+
+/// Digest the bytes of an already-open file. Used where the identity of the descriptor —
+/// not just the path it was opened through — is part of the guarantee.
+fn digest_reader(file: &mut File) -> io::Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    io::copy(file, &mut hasher)?;
+    Ok(hasher.finalize())
 }
 
 fn file_digest(path: &Path) -> io::Result<blake3::Hash> {
     let mut file = File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    io::copy(&mut file, &mut hasher)?;
-    Ok(hasher.finalize())
+    digest_reader(&mut file)
 }
 
-/// Move `src` to `dest`, falling back to copy-then-delete when the two paths live on
-/// different filesystems (`rename` cannot cross a mount point, and a "slower disk" is
-/// almost always a different mount).
-fn transfer(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|source| DiskError::MoveError {
-            from: src.to_path_buf(),
-            to: dest.to_path_buf(),
-            source,
-        })?;
-    }
-
-    match fs::rename(src, dest) {
+/// Move `src` into `dir`'s `dest_name`, falling back to copy-then-delete when the two paths
+/// live on different filesystems (`rename` cannot cross a mount point, and a "slower disk"
+/// is almost always a different mount). Both branches work relative to the held descriptor,
+/// so the destination cannot be redirected out of the resolved directory.
+fn transfer_into(
+    src: &Path,
+    dir: &DestDir,
+    dest_name: &OsStr,
+    dest: &Path,
+    expected: u64,
+) -> Result<(), DiskError> {
+    match dir.rename_from(src, dest_name) {
         Ok(()) => Ok(()),
-        Err(err) if is_cross_device(&err) => copy_then_remove(src, dest, expected),
+        Err(err) if is_cross_device(&err) => {
+            copy_then_remove_into(src, dir, dest_name, dest, expected)
+        }
         Err(source) => Err(DiskError::MoveError {
             from: src.to_path_buf(),
             to: dest.to_path_buf(),
@@ -462,14 +900,32 @@ fn is_cross_device(err: &io::Error) -> bool {
     }
 }
 
-/// The cross-device fallback: copy the bytes *and* the metadata into a temporary file
-/// next to the destination, then make it visible with an atomic rename, then drop the
-/// source.
-///
-/// The temporary lives in the destination directory so the final rename stays on one
-/// filesystem, which is what makes it atomic — a reader never sees a half-copied file.
-fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
-    copy_into_place(src, dest, expected)?;
+/// The cross-device fallback, relative to a resolved destination directory: copy the bytes
+/// *and* the metadata into a private partial, publish it with an atomic rename, re-check
+/// that the published name still resolves to what was placed, then drop the source.
+fn copy_then_remove_into(
+    src: &Path,
+    dir: &DestDir,
+    dest_name: &OsStr,
+    dest: &Path,
+    expected: u64,
+) -> Result<(), DiskError> {
+    let placed = copy_into_place_at(src, dir, dest_name, expected)?;
+    // Re-stat through the same descriptor immediately before the removal. If the name no
+    // longer resolves to the file this call placed, deleting the source would leave no
+    // verified copy anywhere, so the source is kept.
+    let now = dir
+        .identity(dest_name)
+        .map_err(|source| DiskError::StatError {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+    if now != Some(placed) {
+        return Err(DiskError::DestinationReplaced {
+            from: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+        });
+    }
     fs::remove_file(src).map_err(|source| DiskError::MoveError {
         from: src.to_path_buf(),
         to: dest.to_path_buf(),
@@ -491,27 +947,49 @@ fn copy_then_remove(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskEr
 /// tool can vouch for.
 pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<(), DiskError> {
     // Anything that fails from here on is reported as a failed move against this pair,
-    // except `SourceChanged`, which has already said precisely what went wrong. Defined
-    // before the first fallible step so creating the nested directories can use it too.
+    // except `SourceChanged`, which has already said precisely what went wrong.
     let failed_move = |source: io::Error| DiskError::MoveError {
         from: src.to_path_buf(),
         to: dest.to_path_buf(),
         source,
     };
 
-    let mut created_nested = false;
-    if let Some(parent) = dest.parent() {
-        // The destination root itself is never created (invariant 1): callers only reach
-        // here for a root they have already checked exists. This creates the *nested*
-        // directories a mirrored relative path needs on an existing root. Whether *this*
-        // call made them matters only to the mid-copy fault seam below: it is the one
-        // directory the seam may remove, because the tool created it in this call and
-        // nothing else can be inside it.
-        created_nested = !parent.as_os_str().is_empty() && !parent.exists();
-        fs::create_dir_all(parent).map_err(failed_move)?;
-    }
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let partial = partial_sibling(dir);
+    // The destination root itself is never created (invariant 1): callers only reach here
+    // for a root they have already checked exists. This resolves the *nested* directories a
+    // mirrored relative path needs on an existing root.
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let dir = DestDir::open_path(parent).map_err(failed_move)?;
+    let dest_name = dest.file_name().ok_or_else(|| {
+        failed_move(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path has no file name",
+        ))
+    })?;
+
+    copy_into_place_at(src, &dir, dest_name, expected).map(|_| ())
+}
+
+/// [`copy_into_place`] once the destination directory is already resolved and held open.
+///
+/// Returns the identity of the file placed, so a caller that is about to delete the source
+/// can re-check it first. Every step that touches the destination works relative to
+/// `dir`'s descriptor (`openat`, `renameat`), so a path component that changed after
+/// resolution cannot redirect the write.
+fn copy_into_place_at(
+    src: &Path,
+    dir: &DestDir,
+    dest_name: &OsStr,
+    expected: u64,
+) -> Result<DestIdentity, DiskError> {
+    let dest = dir.path.join(dest_name);
+    let failed_move = |source: io::Error| DiskError::MoveError {
+        from: src.to_path_buf(),
+        to: dest.clone(),
+        source,
+    };
+
+    let partial_name = partial_name();
+    let partial = dir.path.join(&partial_name);
 
     // The mid-copy seam, armed only when the test-only `unlink-mid-copy` fault is set.
     // `copy_contents` below sees only `File` handles, so it cannot unlink a name; the
@@ -534,9 +1012,11 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
         if !crate::faults::claim_unlink_mid_copy() {
             return;
         }
-        let _ = fs::remove_file(&partial);
-        if created_nested {
-            let _ = fs::remove_dir_all(dir);
+        let _ = dir.remove(&partial_name);
+        if !dir.created.is_empty() {
+            for created in dir.created.iter().rev() {
+                let _ = fs::remove_dir_all(created);
+            }
         }
         eprintln!(
             "just_cache: JUST_CACHE_FAULT=unlink-mid-copy removed {} after {written} bytes of \
@@ -553,7 +1033,7 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
         _ => None,
     };
 
-    let copied = (|| -> Result<u64, DiskError> {
+    let copied = (|| -> Result<(File, u64), DiskError> {
         let src_file = File::open(src).map_err(failed_move)?;
         let src_metadata = src_file.metadata().map_err(failed_move)?;
         // Compare against the size the scan promised, not just against the live file:
@@ -567,11 +1047,7 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
                 actual: src_metadata.len(),
             });
         }
-        let mut dest_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .map_err(failed_move)?;
+        let mut dest_file = dir.create_partial(&partial_name).map_err(failed_move)?;
 
         copy_contents_observed(&src_file, &mut dest_file, src_metadata.len(), observer)
             .map_err(failed_move)?;
@@ -579,14 +1055,14 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
         // briefly differ from the source for anything that can see the destination.
         preserve_metadata(src, &partial, &src_metadata).map_err(failed_move)?;
         dest_file.sync_all().map_err(failed_move)?;
-        Ok(src_metadata.len())
+        Ok((dest_file, src_metadata.len()))
     })();
 
-    let live_len = match copied {
-        Ok(live_len) => live_len,
+    let (dest_file, live_len) = match copied {
+        Ok(placed) => placed,
         Err(err) => {
             // No partial was renamed into place, so nothing of ours survives.
-            let _ = fs::remove_file(&partial);
+            let _ = dir.remove(&partial_name);
             return Err(err);
         }
     };
@@ -595,35 +1071,36 @@ pub(crate) fn copy_into_place(src: &Path, dest: &Path, expected: u64) -> Result<
     // must never replace the original. Two comparisons, because they catch different
     // failures: the copy must match what the scan promised, and it must match what the
     // live file had when the copy started.
-    match fs::symlink_metadata(&partial) {
+    match dest_file.metadata() {
         Ok(metadata) if metadata.len() == expected && metadata.len() == live_len => {}
         Ok(metadata) => {
             let actual = metadata.len();
-            let _ = fs::remove_file(&partial);
+            let _ = dir.remove(&partial_name);
             return Err(DiskError::ShortCopy {
                 path: src.to_path_buf(),
-                dest: dest.to_path_buf(),
+                dest: dest.clone(),
                 actual,
                 expected,
             });
         }
         Err(source) => {
-            let _ = fs::remove_file(&partial);
-            return Err(DiskError::MoveError {
-                from: src.to_path_buf(),
-                to: dest.to_path_buf(),
-                source,
-            });
+            let _ = dir.remove(&partial_name);
+            return Err(failed_move(source));
         }
     }
 
+    // The identity of the bytes about to be published, read from the open descriptor: an
+    // inode survives the rename, so this is what a later re-check of the name must match.
+    let identity = file_identity(&dest_file).map_err(failed_move)?;
+
     // Same directory, so this rename stays on one filesystem and is atomic.
-    fs::rename(&partial, dest).map_err(|source| DiskError::MoveError {
-        from: partial.clone(),
-        to: dest.to_path_buf(),
-        source,
-    })?;
-    Ok(())
+    dir.rename_within(&partial_name, dest_name)
+        .map_err(|source| DiskError::MoveError {
+            from: partial.clone(),
+            to: dest.clone(),
+            source,
+        })?;
+    Ok(identity)
 }
 
 /// Copy the logical contents of `src` into `dest`, with holes kept as holes.
@@ -985,17 +1462,24 @@ fn nanos() -> u128 {
         .unwrap_or(0)
 }
 
+/// A fresh, private temporary *name* for an in-flight copy, without a directory. The mover
+/// joins it to a resolved destination directory and opens it relative to that descriptor;
+/// `partial_sibling` builds the same name for callers that only have a path.
+pub(crate) fn partial_name() -> OsString {
+    OsString::from(format!(
+        "{PARTIAL_PREFIX}{}-{}.tmp",
+        std::process::id(),
+        nanos()
+    ))
+}
+
 /// A fresh, private temporary name in `dir` for an in-flight copy.
 ///
 /// Shared by the mover's cross-device path and by `restore`, so both leave the same
 /// `.just_cache-partial-*` marker that the walk skips (invariant 8): a crash mid-restore
 /// can never leave a name the next sweep would try to move onto a cold tier.
 pub(crate) fn partial_sibling(dir: &Path) -> PathBuf {
-    dir.join(format!(
-        "{PARTIAL_PREFIX}{}-{}.tmp",
-        std::process::id(),
-        nanos()
-    ))
+    dir.join(partial_name())
 }
 
 /// Free bytes available on the filesystem holding `path`.
@@ -1165,7 +1649,10 @@ mod tests {
         .is_ok();
 
         let expected = fs::metadata(&src).unwrap().len();
-        copy_then_remove(&src, &dest, expected).expect("copy path should succeed");
+        let dir = DestDir::open_path(tmp.path()).unwrap();
+        let dest_name = dest.file_name().unwrap().to_os_string();
+        copy_then_remove_into(&src, &dir, &dest_name, &dest, expected)
+            .expect("copy path should succeed");
         assert!(
             !src.exists(),
             "the source is deleted after a successful copy"
