@@ -83,6 +83,17 @@ fn scrub(catalog: &Path, extra: &[&str]) -> Output {
     command.output().expect("just_cache runs")
 }
 
+/// Like [`sync`], but with more than one `--dest` root (a replicated tier).
+fn sync_multi(watch: &Path, dests: &[&Path], catalog: &Path) -> Output {
+    let mut command = bin();
+    command.args(["catalog", "sync", "--watch"]).arg(watch);
+    for dest in dests {
+        command.arg("--dest").arg(dest);
+    }
+    command.arg("--catalog").arg(catalog);
+    command.output().expect("just_cache runs")
+}
+
 fn summary(catalog: &Path) -> just_cache::catalog::ScrubSummary {
     Catalog::open(catalog)
         .expect("catalog opens")
@@ -535,4 +546,152 @@ fn the_default_catalog_name_is_beside_the_watch_root() {
         just_cache::Catalog::default_path(&watch),
         watch.join(CATALOG_NAME)
     );
+}
+
+/// Two locations of one object, both rotted in place, are both marked damaged when the
+/// only repair candidate is itself an already-verified copy that has rotted since (#75).
+///
+/// The setup is the mixed state the bug needs: `hot` was verified by an earlier run and
+/// `cold` was recorded afterwards, so only `cold` is read in the first pass. `cold` comes
+/// back corrupt, which selects `hot` as the fallback repair source — and `hot`, re-read,
+/// is corrupt too. Before the fix that second verdict was discarded: `hot` stayed
+/// `AlreadyVerified`, was never marked damaged, and every later scrub would skip it
+/// without reading it.
+#[test]
+fn a_rotted_already_verified_sibling_is_marked_damaged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    let catalog = tmp.path().join("catalog.sqlite");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let bytes = payload(16 * 1024);
+    fs::write(hot.join("a.bin"), &bytes).unwrap();
+
+    // The cold root exists but holds nothing yet, so the first sync records one location.
+    assert_exit(&sync(&hot, &cold, &catalog), 0);
+    assert_eq!(summary(&catalog).locations, 1);
+    assert_exit(&scrub(&catalog, &[]), 0);
+    assert_eq!(summary(&catalog).verified, 1, "hot is verified by this run");
+
+    // The cold copy appears now and is ingested without touching hot's scrub_state, so
+    // hot is already-verified while cold has never been read.
+    fs::write(cold.join("a.bin"), &bytes).unwrap();
+    assert_exit(&sync(&hot, &cold, &catalog), 0);
+    let before = summary(&catalog);
+    assert_eq!(before.locations, 2);
+    assert_eq!(before.verified, 1);
+    assert_eq!(before.never_scrubbed, 1);
+
+    // Rot both copies in place, same size: only a checksum can see it.
+    corrupt_in_place(&hot.join("a.bin"));
+    corrupt_in_place(&cold.join("a.bin"));
+
+    let output = scrub(&catalog, &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(text.contains("DAMAGED"), "damage must be named:\n{text}");
+    assert!(
+        text.contains("nothing deleted"),
+        "the report must say nothing was removed:\n{text}"
+    );
+
+    // Both locations are marked and neither is counted as verified any more. This is the
+    // crux: the already-verified sibling must not keep its scrub_state row.
+    let after = summary(&catalog);
+    assert_eq!(after.damaged, 2, "both locations are marked damaged");
+    assert_eq!(after.verified, 0, "a damaged location is not 'verified'");
+    assert_eq!(
+        after.never_scrubbed, 2,
+        "the dropped verdict must force a re-read next time"
+    );
+    assert!(
+        text.contains("already verified (skipped)"),
+        "the rotted fallback must not still be reported as a skip:\n{text}"
+    );
+    assert!(
+        !text.contains("1 already verified"),
+        "the failed fallback must not be counted as already verified:\n{text}"
+    );
+}
+
+/// A clean already-verified sibling *after* a rotted one in the group is found and used as
+/// the repair source; the rotted candidate is not mistaken for a source (#75).
+#[test]
+fn a_clean_sibling_later_in_the_group_is_the_repair_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Names are prefixed so the canonical tier strings sort in a known order: the rotted
+    // already-verified copy (`a`) comes before the clean one (`m`) in the group.
+    let a_tier = tmp.path().join("01-a");
+    let watch = tmp.path().join("02-m");
+    let z_tier = tmp.path().join("03-z");
+    let catalog = tmp.path().join("catalog.sqlite");
+    fs::create_dir_all(&a_tier).unwrap();
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&z_tier).unwrap();
+    let bytes = payload(24 * 1024);
+    fs::write(a_tier.join("a.bin"), &bytes).unwrap();
+    fs::write(watch.join("a.bin"), &bytes).unwrap();
+
+    // Two locations are ingested and verified; the third tier is empty for now.
+    assert_exit(&sync_multi(&watch, &[&a_tier, &z_tier], &catalog), 0);
+    assert_eq!(summary(&catalog).locations, 2);
+    assert_exit(&scrub(&catalog, &[]), 0);
+    assert_eq!(summary(&catalog).verified, 2);
+
+    // A copy appears on the third tier and is ingested unverified.
+    fs::write(z_tier.join("a.bin"), &bytes).unwrap();
+    assert_exit(&sync_multi(&watch, &[&a_tier, &z_tier], &catalog), 0);
+    assert_eq!(summary(&catalog).locations, 3);
+    assert_eq!(summary(&catalog).never_scrubbed, 1);
+
+    // Rot the first (already-verified) and third (unread) copies; the middle stays clean.
+    corrupt_in_place(&a_tier.join("a.bin"));
+    corrupt_in_place(&z_tier.join("a.bin"));
+
+    let output = scrub(&catalog, &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    let clean = fs::canonicalize(&watch).unwrap().join("a.bin");
+    assert!(
+        text.contains(&clean.display().to_string()),
+        "the clean sibling later in the group must be the repair source:\n{text}"
+    );
+    assert_eq!(
+        fs::read(a_tier.join("a.bin")).unwrap(),
+        bytes,
+        "the rotted already-verified copy is repaired from the later clean sibling"
+    );
+    assert_eq!(
+        fs::read(z_tier.join("a.bin")).unwrap(),
+        bytes,
+        "the corrupt unread copy is repaired too"
+    );
+    assert_eq!(
+        fs::read(watch.join("a.bin")).unwrap(),
+        bytes,
+        "the clean source is untouched"
+    );
+    let after = summary(&catalog);
+    assert_eq!(after.damaged, 0, "a repair is not damage");
+    assert_eq!(after.verified, 3, "every copy now verifies");
+}
+
+/// `sync` with more than one `--dest` root records every copy in one object group.
+#[test]
+fn sync_accepts_multiple_destinations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let one = tmp.path().join("one");
+    let two = tmp.path().join("two");
+    let catalog = tmp.path().join("catalog.sqlite");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&one).unwrap();
+    fs::create_dir_all(&two).unwrap();
+    let bytes = payload(1024);
+    for dir in [&watch, &one, &two] {
+        fs::write(dir.join("a.bin"), &bytes).unwrap();
+    }
+    assert_exit(&sync_multi(&watch, &[&one, &two], &catalog), 0);
+    assert_eq!(summary(&catalog).locations, 3);
 }
