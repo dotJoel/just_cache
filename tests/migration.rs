@@ -302,6 +302,62 @@ fn an_excluded_directory_survives_a_sweep_even_when_it_is_the_coldest_thing_ther
     assert!(!cold.join("app/node_modules").exists());
 }
 
+/// Issue #79: `--exclude 'node_modules/'` used to exclude nothing, because the matched
+/// paths are watch-relative and carry no trailing separator, so the protected directory
+/// was moved anyway. The trailing separator must be normalized away, not taken literally.
+#[test]
+fn an_exclude_with_a_trailing_separator_still_protects_the_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("app/node_modules/react")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("app/node_modules/react/index.js"), b"{}").unwrap();
+    fs::write(watch.join("app/index.js"), b"console.log(1)").unwrap();
+
+    let entries = scan(&watch);
+    let scope = Scope::build(&[], &["node_modules/".to_string()], 0, None).unwrap();
+    assert!(
+        scope.warnings().is_empty(),
+        "a trailing separator is valid spelling: {:?}",
+        scope.warnings()
+    );
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &scope,
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.moved(), 1);
+    assert_eq!(
+        fs::read(watch.join("app/node_modules/react/index.js")).unwrap(),
+        b"{}",
+        "the file under an excluded directory must not be moved"
+    );
+    assert_eq!(
+        fs::read(watch.join("app/index.js")).unwrap(),
+        b"console.log(1)",
+        "only the unexcluded file was moved"
+    );
+    assert!(
+        !cold.join("app/node_modules").exists(),
+        "nothing from the excluded directory reached the cold tier"
+    );
+}
+
 #[test]
 fn the_size_window_skips_tiny_and_enormous_files() {
     let tmp = tempfile::tempdir().unwrap();

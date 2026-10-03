@@ -175,6 +175,34 @@ fn scope_is_reported_ahead_of_a_warm_stamp() {
     );
 }
 
+/// An `--exclude` that can never match a watch-relative path protects nothing; issue #79
+/// requires it to be reported rather than silently ignored.
+#[test]
+fn an_exclude_that_can_never_match_is_reported() {
+    let tree = tree();
+    let path = tree.watch.join("cold.bin");
+    fs::write(&path, b"payload").unwrap();
+    set_times(&path, days_ago(90));
+
+    let output = explain(&[
+        path.to_str().unwrap(),
+        "--watch",
+        tree.watch.to_str().unwrap(),
+        "--dest",
+        tree.cold.to_str().unwrap(),
+        "--exclude",
+        "/var/log/scratch",
+        "--min-idle-days",
+        "30",
+    ]);
+
+    let err = stderr(&output);
+    assert!(
+        err.contains("warning:") && err.contains("/var/log/scratch"),
+        "a pattern that can never match must be reported, not ignored: {err}"
+    );
+}
+
 #[test]
 fn a_size_floor_is_named_with_both_numbers() {
     let tree = tree();
