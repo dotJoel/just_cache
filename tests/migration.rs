@@ -302,6 +302,62 @@ fn an_excluded_directory_survives_a_sweep_even_when_it_is_the_coldest_thing_ther
     assert!(!cold.join("app/node_modules").exists());
 }
 
+/// Issue #79: `--exclude 'node_modules/'` used to exclude nothing, because the matched
+/// paths are watch-relative and carry no trailing separator, so the protected directory
+/// was moved anyway. The trailing separator must be normalized away, not taken literally.
+#[test]
+fn an_exclude_with_a_trailing_separator_still_protects_the_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join("app/node_modules/react")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(watch.join("app/node_modules/react/index.js"), b"{}").unwrap();
+    fs::write(watch.join("app/index.js"), b"console.log(1)").unwrap();
+
+    let entries = scan(&watch);
+    let scope = Scope::build(&[], &["node_modules/".to_string()], 0, None).unwrap();
+    assert!(
+        scope.warnings().is_empty(),
+        "a trailing separator is valid spelling: {:?}",
+        scope.warnings()
+    );
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &scope,
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(report.moved(), 1);
+    assert_eq!(
+        fs::read(watch.join("app/node_modules/react/index.js")).unwrap(),
+        b"{}",
+        "the file under an excluded directory must not be moved"
+    );
+    assert_eq!(
+        fs::read(watch.join("app/index.js")).unwrap(),
+        b"console.log(1)",
+        "only the unexcluded file was moved"
+    );
+    assert!(
+        !cold.join("app/node_modules").exists(),
+        "nothing from the excluded directory reached the cold tier"
+    );
+}
+
 #[test]
 fn the_size_window_skips_tiny_and_enormous_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -577,4 +633,71 @@ fn a_sweep_reports_failures_without_stopping_the_rest() {
         .iter()
         .any(|record| record.path.ends_with("good.bin") && record.outcome == FileOutcome::Moved));
     assert!(fs::read_to_string(watch.join("good.bin")).unwrap() == "good");
+}
+
+/// Invariant 8 covers a prefixed *directory*, not just a prefixed file: an interrupted
+/// cross-device copy or a restored partial can leave a `.just_cache-partial-*` subtree in
+/// the watched tree, and descending it would offer its files as migration candidates.
+/// This is end-to-end through the real walk and sweep, so it fails if the prefix test is
+/// applied only to regular files after the type branches.
+#[test]
+fn a_file_under_an_internal_prefixed_directory_is_neither_scanned_nor_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(watch.join(".just_cache-partial-x/nested")).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(
+        watch.join(".just_cache-partial-x/in-flight.bin"),
+        b"half a copy",
+    )
+    .unwrap();
+    fs::write(
+        watch.join(".just_cache-partial-x/nested/deeper.bin"),
+        b"half a copy too",
+    )
+    .unwrap();
+    fs::write(watch.join("cold.bin"), b"a real candidate").unwrap();
+
+    let entries = scan(&watch);
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.relative.to_string_lossy().contains(".just_cache")),
+        "no path under a prefixed directory may be a candidate: {entries:?}"
+    );
+
+    let policy = Policy {
+        min_idle: std::time::Duration::ZERO,
+        observed_access_pin: 0,
+        limit: 10,
+        dry_run: false,
+    };
+    let report = file_movement::migrate_least_used(
+        &entries,
+        &UsageTracker::new(),
+        &mut MoveContext {
+            policy: &policy,
+            scope: &Scope::everything(),
+            guards: &Guards::permissive(),
+            journal: &mut journal_for(&tmp),
+        },
+        SystemTime::now(),
+        |_| Ok(Some(cold.clone())),
+    );
+
+    assert_eq!(
+        report.moved(),
+        1,
+        "only the real candidate moves; the prefixed subtree is not offered"
+    );
+    assert_eq!(
+        fs::read(watch.join(".just_cache-partial-x/in-flight.bin")).unwrap(),
+        b"half a copy",
+        "a file under an internal-prefixed directory must not be moved"
+    );
+    assert!(
+        !cold.join(".just_cache-partial-x").exists(),
+        "nothing from the prefixed subtree may reach the cold tier"
+    );
 }

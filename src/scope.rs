@@ -5,7 +5,7 @@
 //! scope is checked before usage, size or any other consideration, so a file that is out
 //! of scope can never be moved by a rule that later grows more eager.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use thiserror::Error;
@@ -142,6 +142,10 @@ pub struct Scope {
     include_sources: Vec<String>,
     exclude: GlobSet,
     exclude_sources: Vec<String>,
+    /// Patterns that can never match a watch-relative path, in the order the flags were
+    /// read. Kept rather than printed here: `scope` is a library, and only the CLI knows
+    /// how it wants to say "warning". The CLI drains these through [`Scope::warnings`].
+    warnings: Vec<String>,
     min_size: u64,
     max_size: Option<u64>,
 }
@@ -158,19 +162,23 @@ impl Scope {
         min_size: u64,
         max_size: Option<u64>,
     ) -> Result<Self, ScopeError> {
+        let mut warnings = Vec::new();
         let (include_set, include_sources) = if include.is_empty() {
             (None, Vec::new())
         } else {
-            let (set, sources) = build_set(include)?;
+            let (set, sources, mut warns) = build_set(include, "--include")?;
+            warnings.append(&mut warns);
             (Some(set), sources)
         };
-        let (exclude_set, exclude_sources) = build_set(exclude)?;
+        let (exclude_set, exclude_sources, mut warns) = build_set(exclude, "--exclude")?;
+        warnings.append(&mut warns);
         Ok(Self {
             include: include_set,
             include_patterns: include.to_vec(),
             include_sources,
             exclude: exclude_set,
             exclude_sources,
+            warnings,
             min_size,
             max_size,
         })
@@ -245,6 +253,15 @@ impl Scope {
         &self.include_patterns
     }
 
+    /// Patterns that were accepted but can never match anything, one human sentence each.
+    ///
+    /// A no-op pattern is a bug in the invocation, not a quiet shrug: an `--exclude` that
+    /// protects nothing is the difference between "this directory is safe" and "this
+    /// directory was swept", so the caller is expected to surface every one of these.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     pub fn min_size(&self) -> u64 {
         self.min_size
     }
@@ -255,13 +272,26 @@ impl Scope {
 }
 
 /// Build a set and remember which configured pattern each glob came from.
-fn build_set(patterns: &[String]) -> Result<(GlobSet, Vec<String>), ScopeError> {
+///
+/// `flag` is the CLI spelling (`--include`/`--exclude`) so a warning can name the option
+/// the user actually typed. Returns the compiled set, the per-glob source pattern, and one
+/// sentence per pattern that can never match.
+fn build_set(
+    patterns: &[String],
+    flag: &str,
+) -> Result<(GlobSet, Vec<String>, Vec<String>), ScopeError> {
     let mut builder = GlobSetBuilder::new();
     let mut sources = Vec::new();
+    let mut warnings = Vec::new();
     for pattern in patterns {
+        let (pattern, warning) = normalize_pattern(pattern, flag);
+        if let Some(warning) = warning {
+            warnings.push(warning);
+        }
         let mut variants = vec![pattern.clone()];
         // A bare name is meant "anywhere": expand it so `--exclude node_modules` and
-        // `--exclude *.part` behave the way they read.
+        // `--exclude *.part` behave the way they read. Normalization runs first, so a
+        // written `node_modules/` also lands here and gains the same any-depth behaviour.
         if !pattern.contains('/') && !pattern.contains('*') && !pattern.contains('?') {
             variants.push(format!("**/{pattern}"));
             variants.push(format!("**/{pattern}/**"));
@@ -277,11 +307,54 @@ fn build_set(patterns: &[String]) -> Result<(GlobSet, Vec<String>), ScopeError> 
     }
     builder
         .build()
-        .map(|set| (set, sources))
+        .map(|set| (set, sources, warnings))
         .map_err(|source| ScopeError::BadGlob {
             pattern: patterns.join(", "),
             source,
         })
+}
+
+/// Rewrite a written pattern into the form that matches watch-relative paths, and report
+/// it when no rewrite can save it.
+///
+/// Two spellings read naturally but match nothing, because every path the engine tests is
+/// relative to the watched root and so has no trailing separator and no leading `./`:
+/// `node_modules/` and `./node_modules` are both meant, but compiled as written the first
+/// matched no ancestor directory and the exclusion silently did nothing (issue #79). The
+/// fix is to trim the trailing separator and the `./` prefix before compiling, so the
+/// pattern means what it reads.
+///
+/// An absolute pattern or one that walks upward with `..` is *not* repaired: there is no
+/// watch-relative path it could ever match, and stripping the prefix would silently turn
+/// it into a different, broader pattern the user did not ask for. It is reported instead,
+/// so "this exclusion protects nothing" is visible rather than a false sense of safety.
+fn normalize_pattern(pattern: &str, flag: &str) -> (String, Option<String>) {
+    let normalized = pattern
+        .strip_prefix("./")
+        .unwrap_or(pattern)
+        .trim_end_matches('/')
+        .to_string();
+
+    // Judge the pattern as written, not as rewritten: the warning has to describe what
+    // the user typed, and an absolute `/x` must be reported even though trimming leaves
+    // it looking like a plausible relative path.
+    let warning = if Path::new(pattern).is_absolute() {
+        Some(format!(
+            "{flag} pattern {pattern:?} is absolute and can never match a watch-relative \
+             path; it will match nothing"
+        ))
+    } else if Path::new(pattern)
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        Some(format!(
+            "{flag} pattern {pattern:?} walks upward with '..' and can never match a \
+             watch-relative path; it will match nothing"
+        ))
+    } else {
+        None
+    };
+    (normalized, warning)
 }
 
 /// Index of the first glob that matches the path or any ancestor directory of it.
@@ -417,6 +490,71 @@ mod tests {
             Err(Rejected::OutOfScope)
         );
         assert!(scope.allows(&entry("media/.gitignore", 10)).is_ok());
+    }
+
+    #[test]
+    fn a_trailing_separator_still_excludes_the_directory_it_names() {
+        // The repro from issue #79: `node_modules/` compiled as written matched nothing,
+        // because every path tested is watch-relative with no trailing separator. After
+        // normalization it means the same as `node_modules` and protects the subtree.
+        let scope = scope(&[], &["node_modules/"]);
+        assert_eq!(
+            scope.allows(&entry("app/node_modules/react/index.js", 10)),
+            Err(Rejected::OutOfScope)
+        );
+        assert!(scope.allows(&entry("app/src/index.js", 10)).is_ok());
+        assert!(
+            scope.warnings().is_empty(),
+            "a trailing separator is a spelling, not a mistake: {:?}",
+            scope.warnings()
+        );
+    }
+
+    #[test]
+    fn a_trailing_separator_on_a_nested_path_excludes_its_contents() {
+        let scope = scope(&[], &["media/.git/"]);
+        assert_eq!(
+            scope.allows(&entry("media/.git/objects/ab/cdef", 10)),
+            Err(Rejected::OutOfScope)
+        );
+        assert!(scope.allows(&entry("media/.gitignore", 10)).is_ok());
+    }
+
+    #[test]
+    fn a_leading_dot_slash_is_normalized_away() {
+        let scope = scope(&[], &["./node_modules"]);
+        assert_eq!(
+            scope.allows(&entry("app/node_modules/react/index.js", 10)),
+            Err(Rejected::OutOfScope)
+        );
+    }
+
+    #[test]
+    fn an_absolute_pattern_is_reported_and_matches_nothing() {
+        let scope = scope(&[], &["/var/log/scratch"]);
+        assert!(
+            scope.allows(&entry("var/log/scratch/a.bin", 10)).is_ok(),
+            "an absolute pattern can never match a watch-relative path"
+        );
+        assert_eq!(scope.warnings().len(), 1, "{:?}", scope.warnings());
+        assert!(
+            scope.warnings()[0].contains("--exclude pattern \"/var/log/scratch\"")
+                && scope.warnings()[0].contains("absolute"),
+            "the warning must name the flag and the pattern: {}",
+            scope.warnings()[0]
+        );
+    }
+
+    #[test]
+    fn a_parent_dir_pattern_is_reported() {
+        let scope = scope(&["../outside/**"], &[]);
+        assert_eq!(scope.warnings().len(), 1, "{:?}", scope.warnings());
+        assert!(
+            scope.warnings()[0].contains("--include pattern \"../outside/**\"")
+                && scope.warnings()[0].contains("'..'"),
+            "the warning must name the include flag and the '..' reason: {}",
+            scope.warnings()[0]
+        );
     }
 
     #[test]
