@@ -12,13 +12,18 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: this job mounts a tmpfs and asserts filesystem
+    # behaviour (cross-device copies, sparseness, mtime/atime), so the image it runs on is
+    # part of what the result means. The `ubuntu-latest` label migrates runner images on
+    # its own schedule and announces it with a notice on every run; pin the image and move
+    # it deliberately instead.
+    runs-on: ubuntu-24.04
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Cache cargo registry and build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
