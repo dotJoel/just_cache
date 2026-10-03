@@ -95,9 +95,16 @@ jobs:
     # repo already keeps.
     - name: Create the release
       run: |
+        flags=()
+        # A pre-release tag (v0.3.0-rc.1 — semver puts a hyphen there) must not
+        # stand in the "Latest" slot while it is a preview.
+        case "$GITHUB_REF_NAME" in
+          *-*) flags+=(--prerelease) ;;
+        esac
         gh release create "$GITHUB_REF_NAME" \
           --verify-tag \
           --generate-notes \
+          "${flags[@]}" \
           "$ASSET_TAR" "$ASSET_SHA"
       env:
         GH_TOKEN: ${{ github.token }}
