@@ -424,6 +424,22 @@ drops the cold copy only after the restored file verifies. Without a catalog the
 is byte-for-byte what it was before (verify against the cold copy; a pre-corrupt copy
 cannot be caught — there is nothing independent to compare against, see below).
 
+Hardened as a security fix (#70): `restore` now proves a cold copy lives under a `--dest`
+root before it acts on one. A symlink in the watched tree is writable by anyone who can
+write the tree, so its target is not accepted as a copy on trust: with an unchecked target,
+`restore --remove-copy` deletes an arbitrary file the operator can read, and a plain
+`restore` copies an out-of-tree file into the watched tree. The link target is now accepted
+only when `canonicalize` puts it under a canonicalized `--dest` root — the same containment
+`audit::resolve_target` applies to a watched symlink — and a target that escapes every root
+is a *foreign link*, dropped rather than guessed at. The mirrored candidate is held to the
+same test, so a name inside a tier that is itself a symlink out of it is no more a copy; and
+`--remove-copy` re-tests containment immediately before its one unrecoverable delete rather
+than trusting a proof made in `locate`. Finally, a path argument whose relative part carries
+a `..` component is refused before any lookup, copy or delete: `absolute()` is lexical and
+does not resolve `..`, so `T/../escaped.bin` would otherwise strip to `../escaped.bin` and
+name a file outside the tree. `tests/restore.rs` drives all three refusals through the real
+binary, and each fails when the fix is reverted.
+
 Closed in P1 by `just_cache audit` reading the catalog (#19): "audit is a query" (§3) is
 now true rather than an aspiration. When a catalog exists — `--catalog <FILE>`, or the
 default `.just_cache-catalog.sqlite` beside the watch root — the audit answers from the
@@ -465,6 +481,21 @@ is a usage error here, because the recorded checksum a rebuild is proved against
 from it. What is deliberately out of scope is deciding *when* to reconcile (§10, like
 scrub scheduling) and verifying copies that are present — a stat per location answers
 "is this copy absent", and anything more is the scrubber's job.
+
+Closed in P1 by the journal-record containment check (#68): `journal::repair` no longer acts
+on the paths a record names without first proving they are paths it is allowed to touch. A
+`rel` that is absolute, or that contains a `..` component, is refused — `watch_root.join`
+discards the root for an absolute path and does not resolve `..`, so either shape let a
+hand-edited or truncated journal line make the sweep create a symlink (with a
+size-checked-but-never-hashed destination) or delete a `.just_cache-partial-*` file
+anywhere on the filesystem, before the first move ran. The joined source is also required
+to sit under the watched root, the same `strip_prefix` containment `restore` applies
+(§4), and a record's `dest` must sit under one of the `--dest` roots the invocation was
+given. A refused record is reported as `REFUSED a journal record` and kept in the journal
+so the operator sees the line on the next run; nothing it names is touched. This is the
+`SECURITY.md` in-scope case (a journal line that escapes the watched tree or a destination
+root), and `tests/journal.rs` writes such lines and asserts the outside paths are
+untouched — the test fails if the check is removed.
 
 Closed in P1 by `catalog sync` (#73): the catalog is now opened as the untrusted input it
 can be. Its default path is inside the watched tree, and SQLite opens a database with a
@@ -715,6 +746,12 @@ Still open, and honestly so:
 - Mounting an offline volume or streaming recall from an object store: `locate` reports the
   state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
   volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
+- **`restore` refuses a lexically-unresolved path rather than resolving it.** A path
+  argument carrying a `..` component, or a link target that escapes every `--dest`, is a
+  refusal, not something to `canonicalize` and then act on: canonicalizing to decide what a
+  path "really" is would lose the symlink state `restore` exists to see, and would make the
+  command act on a name the operator did not give it. The operator re-runs with the path as
+  the filesystem spells it (§9, #70).
 - Multi-user quotas/permissions: single-trust-domain system.
 - **Tightening a catalog that already exists is not this guard's job.** #73 fixes how a
   catalog is *created* and *opened*: a fresh one is 0600, and a symlink at its name or a
