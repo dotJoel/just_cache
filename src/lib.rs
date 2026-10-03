@@ -58,8 +58,9 @@ pub use explain::{
     RuleReport, ScopeReport, Verdict as ExplainVerdict,
 };
 pub use file_movement::{
-    log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
-    MigrationRecord, MigrationReport, Policy, ReplicationDetail, SkipReason, UsageTracker,
+    log_file_movement, migrate_least_used, migrate_replicated, migrate_to_object,
+    select_candidates, FileOutcome, MigrationRecord, MigrationReport, Policy, ReplicationDetail,
+    SkipReason, UsageTracker,
 };
 #[cfg(unix)]
 pub use fuse::{serve as mount_serve, MountError, MountRequest};

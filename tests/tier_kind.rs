@@ -23,7 +23,8 @@ fn config_object(kind: &str) -> String {
     format!(
         "[tiers.tier]\nkind = \"{kind}\"\npath = \"/mnt/tier\"\nvolatility = \"persistent\"\n\
          recall = \"min\"\ncopies = 1\nendpoint = \"s3.example.com\"\nbucket = \"my-bucket\"\n\
-         region = \"us-east-1\"\ncredential_source = \"$S3_KEY\"\n"
+         region = \"us-east-1\"\ncredential_source = \"$S3_KEY\"\n\
+         encryption_key = \"$ENC_KEY\"\n"
     )
 }
 
@@ -107,7 +108,7 @@ fn an_object_tier_without_endpoint_is_refused_by_line() {
     let text = concat!(
         "[tiers.tier]\nkind = \"object\"\npath = \"/mnt/tier\"\nvolatility = \"persistent\"\n",
         "recall = \"min\"\ncopies = 1\nbucket = \"b\"\nregion = \"us\"\n",
-        "credential_source = \"$X\"\n"
+        "credential_source = \"$X\"\nencryption_key = \"$ENC_KEY\"\n"
     );
     let err = TierSet::parse(text, Path::new("/tmp/tiers.toml")).unwrap_err();
     assert!(err.to_string().contains("endpoint"), "{err}");

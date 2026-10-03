@@ -699,6 +699,14 @@ struct RawTier {
     /// the value must start with `$` (e.g. `$S3_CREDS`).
     #[serde(default)]
     credential_source: Option<toml::Spanned<String>>,
+    /// Envelope encryption key: a file path or `$ENV_VAR`. Required for `kind = "object"`
+    /// (bytes cross the machine boundary, §2 rule 2). Same format as `credential_source`.
+    #[serde(default)]
+    encryption_key: Option<toml::Spanned<String>>,
+    /// When true, use plain HTTP instead of TLS. Exposed as a tiers.toml field for
+    /// loopback testing; a real prod config must never set this.
+    #[serde(default)]
+    insecure: bool,
     #[serde(default)]
     chunk_size: Option<toml::Spanned<String>>,
 }
@@ -846,6 +854,21 @@ impl RawTier {
                 crate::object_store::CredentialSource::File(PathBuf::from(cred_str))
             };
 
+            let encryption_key = self.encryption_key.ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `object` requires `encryption_key` \
+                         (a file path or an environment variable prefixed with `$`; the key is \
+                         64 hex characters, 32 bytes — docs/design.md §2 rule 2)",
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let enc_key_str = encryption_key.get_ref().trim();
+            let enc_key = if let Some(var) = enc_key_str.strip_prefix('$') {
+                crate::object_store::CredentialSource::Env(var.to_string())
+            } else {
+                crate::object_store::CredentialSource::File(PathBuf::from(enc_key_str))
+            };
+
             let prefix = self
                 .prefix
                 .map(|p| p.into_inner().trim().to_string())
@@ -870,9 +893,10 @@ impl RawTier {
                 bucket: bucket_str,
                 prefix,
                 region: region_str,
+                insecure: self.insecure,
                 credentials: cred,
                 chunk_size,
-                insecure: false,
+                encryption_key: enc_key,
             })
         } else {
             None

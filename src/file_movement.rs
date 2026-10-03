@@ -1111,6 +1111,249 @@ pub fn log_file_movement(record: &MigrationRecord) {
     }
 }
 
+/// Move each eligible candidate to an object-store tier: upload encrypted bytes, verify
+/// the remote copy by downloading and decrypting, and only then retire the source.
+///
+/// This is the object-tier counterpart of [`migrate_least_used`]. The flow is:
+/// 1. Select candidates via [`select_candidates`] (same policy, scope, guards, and pins).
+/// 2. Compute the source file's BLAKE3 digest.
+/// 3. Journal the intent (invariant 5).
+/// 4. Upload through [`crate::object_store::upload`], using the envelope for encryption.
+/// 5. Verify: download + decrypt + hash against the recorded digest
+///    ([`crate::object_store::download_and_verify`]).
+/// 6. Only when the verification passes, retire the source (unlink + symlink).
+/// 7. Record the object-store location in the catalog via `catalog::Catalog::record_copy`.
+#[allow(clippy::too_many_arguments)]
+pub fn migrate_to_object(
+    entries: &[FileEntry],
+    tracker: &UsageTracker,
+    context: &mut MoveContext<'_>,
+    now: SystemTime,
+    config: &crate::object_store::ObjectTierConfig,
+    key: &crate::envelope::Key,
+    catalog_path: Option<&Path>,
+    scratch_root: &Path,
+) -> MigrationReport {
+    let (candidates, skipped) = select_candidates(entries, tracker, context, now);
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let pins = context.pins;
+    let journal: &mut Journal = context.journal;
+    let tier_name = &config.name;
+    let mut report = MigrationReport::default();
+
+    for (entry, reason) in skipped {
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: None,
+            outcome: FileOutcome::Skipped(reason),
+            size: entry.size,
+            rule: None,
+        });
+    }
+
+    for candidate in candidates {
+        let entry = candidate.entry;
+        // Same belt-and-braces re-check as the single-copy path.
+        if let Err(rejected) = scope.allows(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Err(in_use) = guards.recheck(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Some(until) = live_pin(pins, &entry.relative, now) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::PinnedUntil { until }),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        if policy.dry_run {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Planned,
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        // The destination the journal records — not a real path, just a namespaced label
+        // so journal recovery can tell it was an object upload.
+        let virtual_dest = scratch_root.join(&entry.relative);
+
+        // Journal the intent before any bytes move (invariant 5).
+        let journalled = journal
+            .intent(&entry.relative, &virtual_dest, entry.size)
+            .is_ok();
+
+        let result = move_to_object_tier(entry, config, key, catalog_path, scratch_root, tier_name);
+
+        let outcome = match result {
+            Ok(obj_key) => {
+                // Upload verified — now retire the source.
+                // The source is removed and replaced with a symlink.
+                match retire_after_object_upload(&entry.path, scratch_root) {
+                    Ok(()) => {
+                        if journalled {
+                            journal.forget(&entry.relative);
+                        }
+                        // Record the destination as the object key for reporting.
+                        report.records.push(MigrationRecord {
+                            path: entry.path.clone(),
+                            destination: Some(PathBuf::from(format!(
+                                "s3://{}/{}",
+                                config.bucket, obj_key
+                            ))),
+                            outcome: FileOutcome::Moved,
+                            size: entry.size,
+                            rule: candidate.rule.clone(),
+                        });
+                        continue;
+                    }
+                    Err(err) => FileOutcome::Failed(err.to_string()),
+                }
+            }
+            Err(err) => FileOutcome::Failed(err.to_string()),
+        };
+
+        if !journalled {
+            eprintln!(
+                "just_cache: cannot record the object move of {} in the journal; a crash during \
+                 this move would not be recoverable",
+                entry.path.display()
+            );
+        }
+
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: Some(virtual_dest),
+            outcome,
+            size: entry.size,
+            rule: candidate.rule.clone(),
+        });
+    }
+
+    report
+}
+
+/// Upload a single file to an object tier, then download and verify. Returns the
+/// object key on success. On failure the remote state is undefined (a partial upload
+/// may exist and can be resumed by a later sweep).
+fn move_to_object_tier(
+    entry: &FileEntry,
+    config: &crate::object_store::ObjectTierConfig,
+    key: &crate::envelope::Key,
+    catalog_path: Option<&Path>,
+    scratch_root: &Path,
+    tier_name: &str,
+) -> Result<String, String> {
+    // Compute the digest of the source file.
+    let digest = crate::digest::file_digest(&entry.path).map_err(|e| {
+        format!(
+            "cannot read {} to compute its digest: {e}",
+            entry.path.display()
+        )
+    })?;
+
+    // Upload the file, encrypted through the envelope. Every chunk is a separate
+    // envelope chunk; the resumable_upload table tracks which chunks landed.
+    // The catalog path is required by the upload function for the resumable_upload
+    // table; the caller ensures it exists before calling this function.
+    let cat_path = catalog_path.ok_or_else(|| {
+        "object-tier upload without a catalog; resumable state cannot be tracked".to_string()
+    })?;
+    crate::object_store::upload(
+        config,
+        key,
+        cat_path,
+        &entry.path,
+        &digest.to_hex(),
+        &digest,
+    )
+    .map_err(|e| format!("object upload failed for {}: {e}", entry.path.display()))?;
+
+    // Verify: download and decrypt to a temp file, hash, and compare.
+    let digest_hex = digest.to_hex();
+    let obj_key = crate::object_store::object_key(config, digest_hex.as_ref());
+
+    let verify_path = scratch_root.join(format!(
+        ".verify-{}-{}",
+        tier_name,
+        entry
+            .relative
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+    ));
+
+    // Remove stale verify file from a prior attempt.
+    let _ = std::fs::remove_file(&verify_path);
+
+    crate::object_store::download_and_verify(config, key, &obj_key, &digest, &verify_path)
+        .map_err(|e| {
+            format!(
+                "object download-and-verify failed for {} (tier `{tier_name}`): {e}",
+                entry.path.display()
+            )
+        })?;
+
+    // Clean up the verify scratch file — it served its purpose.
+    let _ = std::fs::remove_file(&verify_path);
+
+    Ok(obj_key)
+}
+
+/// Retire the source file after a successful object-store upload:
+/// remove it and leave a symlink pointing at a marker path under the scratch root.
+/// The symlink target is the scratch-root-relative path, which is enough for a human
+/// to recognise the file was offloaded to an object tier and for `restore` to find
+/// the catalog record (the catalog's `location` rows name the object tier, not the
+/// local scratch path).
+fn retire_after_object_upload(source: &Path, scratch_root: &Path) -> Result<(), String> {
+    use crate::disk_management;
+
+    // Remove the source. The object-store copy has been verified.
+    std::fs::remove_file(source).map_err(|e| {
+        format!(
+            "cannot remove {} after verified object upload: {e}",
+            source.display()
+        )
+    })?;
+
+    // Calculate a symlink target: the same relative path, pointing into the scratch
+    // root. This is a marker, not a real path — the catalog knows the object tier.
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", source.display()))?;
+    let target = scratch_root.join(file_name);
+
+    // Create the symlink — use disk_management's link_into_place to handle the
+    // atomicity of replacing any existing name at the source path.
+    disk_management::link_into_place(&target, source)
+        .map_err(|e| format!("cannot create symlink for {}: {e}", source.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

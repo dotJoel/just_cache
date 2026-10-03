@@ -73,13 +73,29 @@ pub struct ObjectTierConfig {
     pub credentials: CredentialSource,
     /// Chunk size for uploads, in bytes.
     pub chunk_size: u64,
-    /// When true, use plain HTTP instead of TLS. Only for loopback testing against
-    /// the in-repo fake; never set in a real config file (no `tiers.toml` field).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// When true, use plain HTTP instead of TLS. Set in tiers.toml for loopback testing
+    /// against the in-repo fake; a real production config must never set this.
     pub insecure: bool,
+    /// Where the envelope encryption key lives: a file path or an environment
+    /// variable name. The key is 64 hex characters (32 bytes). Never on argv,
+    /// never in a log line, never in the catalog. Required because bytes on this
+    /// tier cross the machine boundary (docs/design.md §2 rule 2).
+    pub encryption_key: CredentialSource,
 }
 
-/// Where S3 credentials come from. Never plaintext on argv.
+impl ObjectTierConfig {
+    /// Load the envelope encryption key as a hex string (64 hex chars) and convert to
+    /// a 32-byte key. Errors name the source, never the key value.
+    pub fn load_encryption_key(&self) -> Result<envelope::Key, ObjectStoreError> {
+        let hex_str = self.encryption_key.load_single()?;
+        envelope::Key::from_hex(&hex_str).map_err(|source| ObjectStoreError::Envelope {
+            tier: self.name.clone(),
+            source,
+        })
+    }
+}
+
+/// Where S3 credentials (or the envelope key) come from. Never plaintext on argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     /// A file whose first line is `ACCESS_KEY_ID` and second line is `SECRET_ACCESS_KEY`.
@@ -89,6 +105,38 @@ pub enum CredentialSource {
 }
 
 impl CredentialSource {
+    /// Read the credential as a single value — used for encryption keys and other
+    /// single-value secrets that are not in `KEY:VALUE` format.
+    pub fn load_single(&self) -> Result<String, ObjectStoreError> {
+        match self {
+            CredentialSource::File(path) => {
+                let text = fs::read_to_string(path).map_err(|source| {
+                    ObjectStoreError::CredentialRead {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                let val = text
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .ok_or_else(|| ObjectStoreError::CredentialMissing {
+                        path: path.clone(),
+                        detail: "the credential file is empty or its first line is blank"
+                            .to_string(),
+                    })?;
+                Ok(val)
+            }
+            CredentialSource::Env(var) => {
+                std::env::var(var).map_err(|_| ObjectStoreError::CredentialMissing {
+                    path: PathBuf::from(var),
+                    detail: format!("environment variable `{var}` is not set"),
+                })
+            }
+        }
+    }
+
     /// Read the credentials, returning `(access_key_id, secret_access_key)`.
     pub fn load(&self) -> Result<(String, String), ObjectStoreError> {
         match self {
@@ -581,7 +629,12 @@ fn send_request_plain(
     _method: &str,
     _path: &str,
 ) -> Result<(u16, Vec<u8>), ObjectStoreError> {
-    let addr = format!("{host}:80");
+    // If the host contains a port, use it; otherwise default to 80.
+    let addr = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:80")
+    };
     let mut stream = TcpStream::connect_timeout(
         &addr.parse().map_err(|_| ObjectStoreError::Connect {
             host: host.to_string(),
@@ -1123,6 +1176,7 @@ mod tests {
             credentials: CredentialSource::Env("TEST_CREDS".to_string()),
             chunk_size: CHUNK_SIZE,
             insecure: false,
+            encryption_key: CredentialSource::Env("TEST_ENC_KEY".to_string()),
         };
 
         assert_eq!(object_key(&config_no_prefix, "abc123"), "abc123");

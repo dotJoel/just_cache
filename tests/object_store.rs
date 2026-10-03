@@ -208,6 +208,7 @@ fn config(host: &str) -> ObjectTierConfig {
         credentials: CredentialSource::Env("TEST_S3_CREDS".to_string()),
         chunk_size: 256, // Small chunks for testing
         insecure: true,  // Plain HTTP for loopback
+        encryption_key: CredentialSource::Env("TEST_ENC_KEY".to_string()),
     }
 }
 
@@ -275,6 +276,7 @@ fn missing_credential_is_named_refusal() {
         credentials: CredentialSource::Env("NONEXISTENT_ENV_VAR_FOR_TEST".to_string()),
         chunk_size: CHUNK_SIZE,
         insecure: true,
+        encryption_key: CredentialSource::Env("TEST_ENC_KEY".to_string()),
     };
 
     let err = cfg.credentials.load().unwrap_err();

@@ -1557,26 +1557,29 @@ scope); and the format has no streaming-encrypt-from-a-pipe form, which would ne
 trailer and a different header — a want, not a need, until a driver pipes instead of
 reading a file.
 
-**Closed by #141:** the object-store tier driver exists. An `object` tier in `tiers.toml`
-(endpoint, bucket, region, credential source, chunk size) is parsed and its bytes actually
-move to and from an S3-compatible object store, chunked and resumable, encrypted through
-the envelope, with recall verified against the catalog's plaintext digest — the same
-contract every tier edge follows. Resumable upload state lives in a catalog row
-(`resumable_upload` table). A `min`/`hours` object tier refuses inline recall with
-`EAGAIN` and names `just_cache restore <path>`. Credentials come from a file path or an
-environment variable, never argv, and never appear in logs, error messages, `--json` or
-catalog rows. The HTTP transport hand-rolls `std::net::TcpStream` with `rustls` for
-TLS — the gateway serves plain HTTP on loopback, but S3 requires HTTPS; `rustls` (pure
-Rust) is the minimal addition and stays inside `src/object_store.rs`. Tests run against
-an in-repo fake S3 endpoint over loopback that verifies the AWS SigV4 signature. The
-sweep does not yet dispatch to an object tier as a `--dest` (the CLI still requires a
-filesystem path); the driver is callable from integration tests and is ready for wiring.
-**Still open, and named**: inline recall for object tiers is not wired into the FUSE
-mount (the `recall` module dispatches but the mount does not yet call it for object
-tiers); the sweep's `--dest` dispatch for object tiers; an object tier's `path` field is
-still required by the parser and is not yet repurposed as the local scratch path; and a
-manual run against a real S3 bucket is documented below, since CI cannot cover a cloud
-endpoint deterministically.
+**Closed by #141:** the object-store tier driver exists and the sweep now dispatches to
+it end-to-end. An `object` tier in `tiers.toml` (endpoint, bucket, region, credential
+source, encryption key, chunk size) is parsed, and when `just_cache sweep` resolves a
+`--dest` to a tier whose `kind` is `object`, the move goes through the driver: chunked
+upload encrypted through the envelope, read-back verification against the file's BLAKE3
+digest, and the source retired only after that verification succeeds (invariant 2).
+Resumable upload state lives in a catalog row (`resumable_upload` table). A `min`/`hours`
+object tier refuses inline recall with `EAGAIN` and names `just_cache restore <path>`.
+Credentials come from a file path or an environment variable, never argv; the envelope
+encryption key follows the same discipline (64 hex characters, from a file or env var,
+never logged). The HTTP transport hand-rolls `std::net::TcpStream` with `rustls` for
+TLS — `insecure = true` in the tiers.toml enables plain HTTP for loopback testing against
+the in-repo fake S3. Integration tests drive the real binary against a fake S3 endpoint
+over loopback, proving the sweep→upload→verify→retire flow and an interrupted upload
+keeps the source untouched. The `path` field on an object tier remains required and is the
+local scratch directory for downloads and partial upload buffers — an object tier needs a
+staging area with guaranteed free space, and the catalog/watch directory may be on a
+smaller disk.
+**Still open, and named**: restore and recall from object tiers are not yet wired — the
+`restore` and `recall` modules resolve catalog locations to local filesystem paths and
+do not yet download from S3; inline recall for object tiers is not wired into the FUSE
+mount; and a manual run against a real S3 bucket is documented below, since CI cannot
+cover a cloud endpoint deterministically.
 
 ## 10. Non-goals
 
