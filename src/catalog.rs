@@ -639,6 +639,102 @@ impl SyncReport {
     }
 }
 
+/// One difference a resolution pass concluded about, and — unless the pass was report-only —
+/// applied. The `detail` names the evidence that supported the conclusion, because the whole
+/// point of the command is that the conclusion is *earned*: a rename is only a rename when
+/// the object it names still exists somewhere the tree vouches for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// What kind of difference the row was.
+    pub kind: DifferenceKind,
+    /// The namespace path (or, for a location, its storage key) the difference was about.
+    pub path: PathBuf,
+    /// The evidence and the conclusion, in one line.
+    pub detail: String,
+    /// False when the pass was report-only (`--apply` absent) and nothing was written.
+    pub applied: bool,
+}
+
+impl Resolution {
+    pub fn describe(&self) -> String {
+        let verb = if self.applied {
+            "resolved"
+        } else {
+            "would resolve"
+        };
+        if self.detail.is_empty() {
+            format!("  {verb} {}: {}", self.kind.as_str(), self.path.display())
+        } else {
+            format!(
+                "  {verb} {}: {} ({})",
+                self.kind.as_str(),
+                self.path.display(),
+                self.detail
+            )
+        }
+    }
+}
+
+/// The result of one `catalog resolve`.
+///
+/// Two lists, and the split is the contract: `resolutions` are differences the evidence
+/// supported a conclusion for; `irreconcilable` are differences left exactly as they were,
+/// with the reason. Nothing is ever deleted from the filesystem, and no row is dropped if
+/// that would leave an object without its last record.
+#[derive(Debug)]
+pub struct ResolveReport {
+    pub catalog: PathBuf,
+    pub watch: PathBuf,
+    pub dests: Vec<PathBuf>,
+    /// True when `--apply` was given and the catalog was written.
+    pub apply: bool,
+    /// Differences a conclusion was drawn about, in path order.
+    pub resolutions: Vec<Resolution>,
+    /// Differences left alone because the evidence did not support a conclusion.
+    pub irreconcilable: Vec<Difference>,
+}
+
+impl ResolveReport {
+    /// True when the catalog and the tree still disagree: an irreconcilable difference is
+    /// still there, or a report-only pass found something it could resolve but did not.
+    /// An `--apply` run that resolved everything writes and exits clean.
+    pub fn has_findings(&self) -> bool {
+        !self.irreconcilable.is_empty() || (!self.apply && !self.resolutions.is_empty())
+    }
+
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mode = if self.apply {
+            "applied; the catalog was rewritten only where the evidence supported it"
+        } else {
+            "report only; nothing was written (pass --apply to resolve)"
+        };
+        let mut lines = vec![format!(
+            "catalog resolve: {} -> {}",
+            self.watch.display(),
+            self.catalog.display()
+        )];
+        lines.push(format!("  {mode}"));
+        lines.push(format!(
+            "  resolved: {}, irreconcilable: {}",
+            self.resolutions.len(),
+            self.irreconcilable.len()
+        ));
+        for resolution in &self.resolutions {
+            lines.push(resolution.describe());
+        }
+        for difference in &self.irreconcilable {
+            lines.push(format!(
+                "  not resolved {}",
+                difference.describe().trim_start()
+            ));
+        }
+        if self.resolutions.is_empty() && self.irreconcilable.is_empty() {
+            lines.push("nothing to resolve: the catalog agrees with the tree".to_string());
+        }
+        lines
+    }
+}
+
 /// What one pass over the tree and its tiers saw. Built before anything is written, so a
 /// filesystem error cannot leave a half-applied catalog.
 #[derive(Debug, Default)]
@@ -809,6 +905,265 @@ impl Catalog {
             names_ingested: applied.names_new,
             locations_ingested: applied.locations_new,
             differences,
+        })
+    }
+
+    /// Resolve the differences a `sync` reported, where the tree's own evidence supports a
+    /// conclusion — and only there.
+    ///
+    /// `sync` is report-not-heal on purpose: a name the catalog recorded that is gone, and a
+    /// location whose file vanished or was replaced, are reported and their rows left alone,
+    /// so the difference repeats on every pass until a human decides. This is that human
+    /// command. It re-observes the tree and the tiers exactly as `sync` does, then concludes
+    /// only where the evidence is a *surviving reference the catalog already records*:
+    ///
+    /// * a vanished name is dropped when the object it pointed at is still named elsewhere
+    ///   in the tree (the rename/duplicate case) — the recorded digest of the file now at the
+    ///   new name is what the observation hashed to the same object id;
+    /// * a vanished location is dropped when the object survives as another name or another
+    ///   copy — the deleted replica, with a sibling left;
+    /// * a name whose path now holds different bytes is repointed only when the object it
+    ///   used to name still survives named elsewhere, so the old object keeps its record.
+    ///
+    /// Everything else is *irreconcilable* and is reported, not guessed at: an object with no
+    /// surviving copy keeps its rows (invariant 6 — recovery never discards the only record
+    /// of a thing), and a replacement whose old object survives nowhere is refused because
+    /// repointing would drop the last record of it. No file is ever deleted; the only
+    /// mutations are to catalog rows, and only for differences the evidence settled.
+    ///
+    /// `apply` is the whole safety switch. Without it the pass writes nothing at all — the
+    /// default stays report-only, so a cron job can run `resolve` to *see* what it would do.
+    ///
+    /// # Why it does not ingest
+    ///
+    /// The command consumes the differences a `sync` already reported: the new name a rename
+    /// created, and the surviving sibling a delete left, are already catalog rows by the time
+    /// this runs. Requiring the surviving reference to be a recorded row is exactly what
+    /// keeps this from having to write on the way to deciding — and from silently ingesting a
+    /// tree it was not asked to ingest. Run `catalog sync` first; its non-zero exit is the
+    /// report this command resolves.
+    pub fn resolve(
+        &mut self,
+        watch: &Path,
+        dests: &[PathBuf],
+        apply: bool,
+    ) -> Result<ResolveReport, CatalogError> {
+        let observation = observe(watch, dests)?;
+        let existing = self.load_state()?;
+        let watch_tier = observation.watch_tier.clone();
+
+        let mut resolutions: Vec<Resolution> = Vec::new();
+        // The walk's own structural findings (a dangling symlink, a link outside every
+        // --dest) are differences no catalog edit can settle, so they are carried through as
+        // irreconcilable rather than silently dropped from the report.
+        let mut irreconcilable: Vec<Difference> = observation.differences.clone();
+        let mut drop_names: Vec<String> = Vec::new();
+        let mut repoint_names: Vec<(String, ObjectId)> = Vec::new();
+        let mut drop_locations: BTreeSet<LocationKey> = BTreeSet::new();
+        let mut repoint_locations: Vec<(LocationKey, ObjectId)> = Vec::new();
+        // A name and the hot location that carried it are one difference. The name pass owns
+        // both so the two can never be concluded apart: dropping a name but leaving its hot
+        // location row (or the reverse) would just hand `sync` a fresh difference next run.
+        let mut handled: BTreeSet<LocationKey> = BTreeSet::new();
+
+        for (path, id) in &existing.names {
+            let hot = (watch_tier.clone(), path.clone());
+            match observation.names.get(path) {
+                // The name is gone from the tree.
+                None => {
+                    handled.insert(hot.clone());
+                    match surviving_name(&observation, &existing, id, path) {
+                        Some(survivor) => {
+                            drop_names.push(path.clone());
+                            if existing.locations.get(&hot) == Some(id)
+                                && !observation.locations.contains_key(&hot)
+                            {
+                                drop_locations.insert(hot);
+                            }
+                            resolutions.push(Resolution {
+                                kind: DifferenceKind::NameVanished,
+                                path: PathBuf::from(path),
+                                detail: format!(
+                                    "object {} still named at {survivor}; stale name dropped",
+                                    hex(id)
+                                ),
+                                applied: apply,
+                            });
+                        }
+                        None => irreconcilable.push(Difference {
+                            kind: DifferenceKind::NameVanished,
+                            path: PathBuf::from(path),
+                            detail: format!(
+                                "object {} has no surviving name in the tree; left alone, nothing deleted",
+                                hex(id)
+                            ),
+                        }),
+                    }
+                }
+                Some(new_id) if new_id == id => {}
+                // The name still exists but now hashes to different bytes.
+                Some(new_id) => {
+                    handled.insert(hot.clone());
+                    match surviving_name(&observation, &existing, id, path) {
+                        Some(survivor) => {
+                            repoint_names.push((path.clone(), new_id.clone()));
+                            if existing.locations.get(&hot) == Some(id)
+                                && observation.locations.get(&hot) == Some(new_id)
+                            {
+                                repoint_locations.push((hot, new_id.clone()));
+                            }
+                            resolutions.push(Resolution {
+                                kind: DifferenceKind::NameReplaced,
+                                path: PathBuf::from(path),
+                                detail: format!(
+                                    "now {}; name repointed (object {} still named at {survivor})",
+                                    hex(new_id),
+                                    hex(id)
+                                ),
+                                applied: apply,
+                            });
+                        }
+                        None => irreconcilable.push(Difference {
+                            kind: DifferenceKind::NameReplaced,
+                            path: PathBuf::from(path),
+                            detail: format!(
+                                "was {}, now {}; object {} survives nowhere, so repointing would drop its only record; left alone",
+                                hex(id),
+                                hex(new_id),
+                                hex(id)
+                            ),
+                        }),
+                    }
+                }
+            }
+        }
+
+        for (key, id) in &existing.locations {
+            if handled.contains(key) {
+                continue;
+            }
+            match observation.locations.get(key) {
+                Some(new_id) if new_id == id => {}
+                // A replacement at a location is never concluded here: the bytes the row
+                // describes changed in place, and only a human can say whether that is the
+                // object rewritten or a different file that took its place. A watch-tier
+                // replacement is owned by the name pass above and never reaches this arm.
+                Some(new_id) => irreconcilable.push(Difference {
+                    kind: DifferenceKind::LocationChanged,
+                    path: PathBuf::from(&key.1),
+                    detail: format!(
+                        "on {} was {}, now {}; a replacement is left for a human",
+                        key.0,
+                        hex(id),
+                        hex(new_id)
+                    ),
+                }),
+                None => {
+                    // A mover offload leaves the namespace path a symlink into the cold
+                    // tier, and `sync` drops the stale hot row itself. That is not a
+                    // difference to resolve, so it is left for the next sync rather than
+                    // reported as a resolution here.
+                    let relocated = key.0 == watch_tier
+                        && observation.names.get(&key.1) == Some(id)
+                        && observation
+                            .locations
+                            .iter()
+                            .any(|((tier, _), object)| object == id && *tier != watch_tier);
+                    if relocated {
+                        continue;
+                    }
+                    match (
+                        surviving_name(&observation, &existing, id, ""),
+                        surviving_location(&observation, &existing, id, key),
+                    ) {
+                        (Some(name), _) => {
+                            drop_locations.insert(key.clone());
+                            resolutions.push(Resolution {
+                                kind: DifferenceKind::LocationMissing,
+                                path: PathBuf::from(&key.1),
+                                detail: format!(
+                                    "on {}; object {} still named at {name}; stale row dropped",
+                                    key.0,
+                                    hex(id)
+                                ),
+                                applied: apply,
+                            });
+                        }
+                        (None, Some((tier, storage_key))) => {
+                            drop_locations.insert(key.clone());
+                            resolutions.push(Resolution {
+                                kind: DifferenceKind::LocationMissing,
+                                path: PathBuf::from(&key.1),
+                                detail: format!(
+                                    "on {}; object {} still copied to {tier}/{storage_key}; stale row dropped",
+                                    key.0,
+                                    hex(id)
+                                ),
+                                applied: apply,
+                            });
+                        }
+                        (None, None) => irreconcilable.push(Difference {
+                            kind: DifferenceKind::LocationMissing,
+                            path: PathBuf::from(&key.1),
+                            detail: format!(
+                                "on {}; object {} has no surviving copy; left alone, nothing deleted",
+                                key.0,
+                                hex(id)
+                            ),
+                        }),
+                    }
+                }
+            }
+        }
+
+        // Every write is one transaction, for the same reason `sync` is: a half-applied
+        // resolution would leave a catalog that is wrong in a new way rather than the old
+        // one. An `Err` here leaves the file byte-for-byte as it was.
+        if apply
+            && !(drop_names.is_empty()
+                && repoint_names.is_empty()
+                && drop_locations.is_empty()
+                && repoint_locations.is_empty())
+        {
+            let tx = self.conn.transaction()?;
+            for path in &drop_names {
+                tx.execute("DELETE FROM name WHERE path = ?1", params![path])?;
+            }
+            for (path, new_id) in &repoint_names {
+                tx.execute(
+                    "UPDATE name SET object_id = ?1 WHERE path = ?2",
+                    params![new_id, path],
+                )?;
+            }
+            for key in &drop_locations {
+                tx.execute(
+                    "DELETE FROM location WHERE tier = ?1 AND storage_key = ?2",
+                    params![key.0, key.1],
+                )?;
+            }
+            // A repointed location now holds the object the observation hashed there, so its
+            // checksum and verified flag follow the row rather than describing bytes it no
+            // longer contains.
+            for (key, new_id) in &repoint_locations {
+                tx.execute(
+                    "UPDATE location SET object_id = ?1, verified = 1, checksum = ?1, updated_at = ?2
+                      WHERE tier = ?3 AND storage_key = ?4",
+                    params![new_id, now_seconds(), key.0, key.1],
+                )?;
+            }
+            tx.commit()?;
+        }
+
+        resolutions.sort_by(|a, b| a.path.cmp(&b.path));
+        irreconcilable.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(ResolveReport {
+            catalog: self.path.clone(),
+            watch: watch.to_path_buf(),
+            dests: dests.to_vec(),
+            apply,
+            resolutions,
+            irreconcilable,
         })
     }
 
@@ -1830,6 +2185,46 @@ fn refuse_foreign_owner(path: &Path, metadata: &fs::Metadata) -> Result<(), Cata
 #[cfg(not(unix))]
 fn refuse_foreign_owner(_path: &Path, _metadata: &fs::Metadata) -> Result<(), CatalogError> {
     Ok(())
+}
+
+/// A name the tree still holds *and* the catalog already records as holding `id`, other than
+/// `exclude`: the evidence a resolution pass requires before it drops or repoints a name.
+///
+/// Both halves matter. The observation half says the object still exists with the recorded
+/// digest (the walk hashed it); the catalog half says the surviving spelling is already
+/// ingested, so dropping the stale one cannot lose the object — `resolve` is not allowed to
+/// write a name into being on the way to concluding a rename (that is `sync`'s job).
+fn surviving_name(
+    observation: &Observation,
+    existing: &Existing,
+    id: &ObjectId,
+    exclude: &str,
+) -> Option<String> {
+    observation
+        .names
+        .iter()
+        .find(|(path, object)| {
+            *object == id && path.as_str() != exclude && existing.names.get(*path) == Some(*object)
+        })
+        .map(|(path, _)| path.clone())
+}
+
+/// A location the tree still holds and the catalog already records as holding `id`, other
+/// than `exclude`: evidence that a vanished location's object survives as another copy, so
+/// its row can be dropped without losing the object's last record.
+fn surviving_location(
+    observation: &Observation,
+    existing: &Existing,
+    id: &ObjectId,
+    exclude: &LocationKey,
+) -> Option<LocationKey> {
+    observation
+        .locations
+        .iter()
+        .find(|(key, object)| {
+            *object == id && *key != exclude && existing.locations.get(*key) == Some(*object)
+        })
+        .map(|(key, _)| key.clone())
 }
 
 /// Walk the watched tree and the cold tiers and put down every fact they show.
