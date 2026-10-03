@@ -609,3 +609,71 @@ fn a_destination_replaced_after_verification_keeps_the_source() {
     assert_eq!(fs::read(&source).unwrap(), bytes);
     assert!(support::partial_files(&dest).is_empty());
 }
+
+/// The in-flight partial is private, not the process umask's guess. A `0600` source must
+/// never be briefly a world-readable sibling in the destination directory during the copy:
+/// the partial is created `0600` and only given the source's mode once every byte is in.
+///
+/// The window only exists *while* the copy runs, and the file is renamed into place at the
+/// end, so no external test process can catch it — the witness has to be the process doing
+/// the copy. The `partial-mode-mid-copy` fault hook reads the partial's mode back mid-stream
+/// and reports it here; a regression to the umask (say `0644`) shows up as group/other bits.
+/// Like the unlink seam this needs a genuinely different mount: a same-filesystem copy is a
+/// reflink and never enters the chunked reader the hook reports through.
+#[cfg(unix)]
+#[test]
+fn the_in_flight_partial_is_never_readable_by_group_or_other() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(second) = support::second_fs() else {
+        return;
+    };
+    let work = support::work_dir(&second, "fi-partial-mode");
+    let dest = work.path().join("cold");
+    fs::create_dir_all(&dest).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    fs::create_dir_all(&watch).unwrap();
+    let bytes = payload(256 * 1024);
+    let source = watch.join("private.bin");
+    fs::write(&source, &bytes).unwrap();
+    // The source kept to itself: the destination must not widen it, even for an instant.
+    let mut perms = fs::metadata(&source).unwrap().permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&source, perms).unwrap();
+
+    support::assert_cross_device(&watch, &dest);
+
+    let output = fault_mover_sweep(&watch, &dest, "partial-mode-mid-copy=1");
+    assert_exit(&output, 0);
+    let text = text_of(&output);
+
+    // The hook must have fired: a test that never observed the partial would pass green
+    // while proving nothing.
+    let marker = "JUST_CACHE_FAULT=partial-mode-mid-copy saw ";
+    let found = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("the mid-copy mode fault must have fired:\n{text}"));
+    let mode = text[found + marker.len()..]
+        .split(" at mode ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| u32::from_str_radix(value, 8).ok())
+        .unwrap_or_else(|| panic!("the fault marker must carry an octal mode:\n{text}"));
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the in-flight partial must not be readable by group or other: mode {mode:o}\n{text}"
+    );
+
+    // And the finished copy carries the source's mode, not the partial's default.
+    let landed = dest.join("private.bin");
+    let landed_mode = fs::metadata(&landed).unwrap().permissions().mode();
+    assert_eq!(
+        landed_mode & 0o7777,
+        0o600,
+        "the published copy must inherit the source's 0600 mode"
+    );
+    assert!(support::partial_files(&dest).is_empty());
+}

@@ -32,6 +32,13 @@
 //!   destination vanished, so exactly one copy is torn out and every later destination is
 //!   an ordinary one. `N` is a byte count here, not a copy ordinal, which is why it cannot
 //!   also name the copy — the first is the only one it can touch.
+//! * `partial-mode-mid-copy=N` — during the **first** copy, once at least `N` bytes have
+//!   been written into the private `.just_cache-partial-*` file, its mode is read back and
+//!   reported. The file is only briefly in this state — it is renamed into place at the end
+//!   of the copy — and the process doing the copy is the only one that can observe it while
+//!   the bytes are still moving, so the seam exists for a test to prove the in-flight
+//!   partial is `0600` rather than the process umask's guess. Like `unlink-mid-copy`, `N` is
+//!   a byte count and the seam fires at most once per process.
 //! * `replace-verified-dest=N` — on the **first** destination whose existing bytes verify
 //!   as an identical copy of the source, and *after* that verification but *before* the
 //!   source is removed, the destination is unlinked and replaced by a different file.
@@ -54,6 +61,7 @@ pub(crate) enum FaultMode {
     VanishReadback,
     CorruptReadback,
     UnlinkMidCopy,
+    PartialModeMidCopy,
     ReplaceVerifiedDest,
 }
 
@@ -77,6 +85,7 @@ impl Fault {
             "vanish-readback" => FaultMode::VanishReadback,
             "corrupt-readback" => FaultMode::CorruptReadback,
             "unlink-mid-copy" => FaultMode::UnlinkMidCopy,
+            "partial-mode-mid-copy" => FaultMode::PartialModeMidCopy,
             "replace-verified-dest" => FaultMode::ReplaceVerifiedDest,
             other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
         };
@@ -100,6 +109,16 @@ static MID_COPY_DISARMED: AtomicBool = AtomicBool::new(false);
 /// The first caller wins the single `unlink-mid-copy` fault; every later copy is spared.
 pub(crate) fn claim_unlink_mid_copy() -> bool {
     !MID_COPY_DISARMED.swap(true, Ordering::SeqCst)
+}
+
+/// Disarms after the one `partial-mode-mid-copy` observation. Per process for the same
+/// reason as `unlink-mid-copy`: it witnesses *a* copy, and the sweep must still be able to
+/// process every later file normally.
+static PARTIAL_MODE_DISARMED: AtomicBool = AtomicBool::new(false);
+
+/// The first caller wins the single `partial-mode-mid-copy` observation.
+pub(crate) fn claim_partial_mode_mid_copy() -> bool {
+    !PARTIAL_MODE_DISARMED.swap(true, Ordering::SeqCst)
 }
 
 /// Disarms after the one `replace-verified-dest` seam has fired. Like `unlink-mid-copy`,

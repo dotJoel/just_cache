@@ -12,8 +12,12 @@
 //! [`copy_then_remove`] does the work. A plain `io::copy` there would silently drop
 //! everything that is not file content, so the copy is deliberate about metadata:
 //!
-//! * **mode, ownership and timestamps** are copied onto the destination before it is
-//!   put in place, so no reader ever sees the process umask's guess at a mode;
+//! * **mode, ownership and timestamps** are copied onto the destination before it is put
+//!   in place, and the in-flight partial is created `0600` rather than with the process
+//!   umask's guess, so no reader ever sees the moved bytes at a mode the source did not
+//!   grant. The source's own mode is applied only once every byte is in — the file bears a
+//!   private partial name until the copy completes — and ownership/timestamps land with it
+//!   just before the rename publishes the name;
 //! * **extended attributes are copied best-effort, and this is the documented
 //!   default**: an attribute that cannot be set — because the destination filesystem
 //!   has no xattr support (`ENOTSUP`), or because setting a `security.*`/`trusted.*`
@@ -1029,11 +1033,54 @@ fn copy_into_place_at(
         );
     };
     // `None` in production, so the copy below is byte-for-byte the code it always was.
+    let mode_at = match fault {
+        Some(crate::faults::Fault {
+            mode: crate::faults::FaultMode::PartialModeMidCopy,
+            at,
+        }) => at as u64,
+        _ => u64::MAX,
+    };
+    let mut mode_seen = false;
+    // The mode seam, armed only when `partial-mode-mid-copy` is set: it reads the mode of
+    // the private partial *while the bytes are still moving* and reports it. This process
+    // is the only vantage point that can see the file before the rename publishes it under
+    // the source's name, so a test cannot witness the window from outside. It reports rather
+    // than asserts so the test owns the expectation; a regression to the process umask shows
+    // up as group/other bits on the partial.
+    let mut mode_seam = |written: u64| {
+        if mode_seen || written < mode_at {
+            return;
+        }
+        mode_seen = true;
+        // One copy only, exactly like the unlink seam: it witnesses *a* copy and the sweep
+        // must still be able to process every later destination normally.
+        if !crate::faults::claim_partial_mode_mid_copy() {
+            return;
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(&partial)
+                .map(|meta| meta.mode())
+                .unwrap_or(0)
+        };
+        #[cfg(not(unix))]
+        let mode = 0u32;
+        eprintln!(
+            "just_cache: JUST_CACHE_FAULT=partial-mode-mid-copy saw {} at mode {mode:o} after \
+             {written} bytes of {expected}",
+            partial.display()
+        );
+    };
     let observer: Option<&mut dyn FnMut(u64)> = match fault {
         Some(crate::faults::Fault {
             mode: crate::faults::FaultMode::UnlinkMidCopy,
             ..
         }) => Some(&mut seam),
+        Some(crate::faults::Fault {
+            mode: crate::faults::FaultMode::PartialModeMidCopy,
+            ..
+        }) => Some(&mut mode_seam),
         _ => None,
     };
 
