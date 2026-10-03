@@ -32,7 +32,12 @@ jobs:
     - name: Set the initial branch name
       run: git config --global init.defaultBranch main
 
+    # Full history, not the default depth-1: the code-change detector below diffs against
+    # the base SHA, which is not otherwise present on the runner. The repo is small; the
+    # depth penalty is negligible next to the correctness of "did this PR touch code?".
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        fetch-depth: 0
 
     - name: Cache cargo registry and build
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -50,7 +55,8 @@ jobs:
     # A half-resolved merge carries its marker lines as ordinary content, so the file
     # rebases and merges cleanly forever after, and a markdown doc is neither compiled nor
     # tested — nothing else fails on it. A marker that reaches a commit renders in the
-    # shipped documentation, so fail here instead.
+    # shipped documentation, so fail here instead. This runs even on docs-only changes:
+    # it is cheap and docs are exactly where a marker can hide.
     - name: Reject committed conflict markers
       run: |
         if git grep -nE '^(<{7}|={7}$|>{7})' -- .; then
@@ -58,13 +64,45 @@ jobs:
           exit 1
         fi
 
+    # Docs-only changes skip the compiler. The branch ruleset requires the `build` check,
+    # so this cannot be a trigger-level `paths-ignore` (GitHub leaves a required check
+    # "Pending" when the whole workflow is skipped, and the PR cannot merge). Instead the
+    # workflow always runs and reports green, and the cargo steps below are gated on
+    # whether any changed file lives outside docs/. The skip fires only when we can
+    # positively see docs-only changes; anything unknown keeps the full build.
+    - name: Detect whether any code changed
+      id: code-change
+      run: |
+        files=""
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags origin "$base" >/dev/null 2>&1 || true
+        else
+          base="${{ github.event.before }}"
+        fi
+        if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
+          files="$(git diff --name-only "$base"...HEAD 2>/dev/null || true)"
+        fi
+        skip=true
+        if [ -z "$files" ] || printf '%s\n' "$files" | grep -vq '^docs/'; then
+          skip=false
+        fi
+        if [ "$skip" = "true" ]; then
+          echo "code_changed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "code_changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Format
+      if: steps.code-change.outputs.code_changed == 'true'
       run: cargo fmt --all -- --check
 
     - name: Lint
+      if: steps.code-change.outputs.code_changed == 'true'
       run: cargo clippy --all-targets -- -D warnings
 
     - name: Build
+      if: steps.code-change.outputs.code_changed == 'true'
       run: cargo build --verbose
     # A cold tier is a different mount, so production always moves files onto it with a
     # copy — `rename` cannot cross a filesystem boundary. The ordinary tests keep source
@@ -72,7 +110,9 @@ jobs:
     # path that can leave a partial file behind. Mount a second filesystem here and the
     # cross_device tests exercise it for real; JUST_CACHE_REQUIRE_SECOND_FS makes them
     # fail loudly if this mount ever stops working, instead of skipping silently.
+    # Docs-only changes skip this whole block (see the Detect step above).
     - name: Mount a second filesystem for cross-device tests
+      if: steps.code-change.outputs.code_changed == 'true'
       run: |
         second_fs="$(mktemp -d)"
         sudo mount -t tmpfs -o size=256m tmpfs "$second_fs"
@@ -80,6 +120,7 @@ jobs:
         echo "JUST_CACHE_REQUIRE_SECOND_FS=1" >> "$GITHUB_ENV"
 
     - name: Run tests
+      if: steps.code-change.outputs.code_changed == 'true'
       run: cargo test --verbose
 
     - name: Unmount the second filesystem
