@@ -563,6 +563,20 @@ on a second filesystem (`tests/cross_device.rs`), and, through a new
 the verification-to-removal window (`tests/fault_injection.rs`). Both fail if the guard is
 reverted.
 
+Closed by #80: a `--dest` root nested inside the watched tree — or a `--watch` nested inside
+a `--dest` root — is now refused up front, in both directions. The shared `validate_paths`
+check used to reject only `dest == watch` (canonical equality), so `--watch /data --dest
+/data/cold` passed: the sweep wrote its copy into a directory it also scans, discovered that
+copy on the next pass, and tiered it deeper, moving its own output once per pass. The check
+now compares the canonical roots component-wise (`Path::starts_with`), which is what makes
+`/data` a prefix of `/data/cold` but not of a sibling named `/database`, and it names the
+direction in the refusal ("inside the watched tree" / "inside the `--dest` root"). Because
+`validate_paths` is shared, every subcommand that takes a `--watch`/`--dest` pair inherits
+it; the acceptance criteria cover the sweep and `catalog sync`, and `tests/nested_dest.rs`
+drives the real binary for both, both directions, plus a symlinked `--dest` that resolves
+inside the watch (the check is on the canonical path, not the spelling) and a name-prefix
+sibling that must still be accepted.
+
 Still open, and honestly so:
 
 - **The open-descriptor re-check is a fresh scan, not a lock (#77).** The sweep's
