@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Read-only token: this workflow only builds, lints and tests a checkout, so it
+# needs nothing from the API beyond reading the repository. Declaring the floor
+# explicitly also caps what a compromised action or dependency could reach.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -26,17 +32,20 @@ jobs:
     - name: Set the initial branch name
       run: git config --global init.defaultBranch main
 
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     - name: Cache cargo registry and build
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        # Scope the cache to this ref. A shared `restore-keys` prefix let a run
+        # restore a sibling/foreign ref's cache, which is both a correctness
+        # hazard (stale artefacts from another ref) and a cache-poisoning
+        # surface. An exact key per ref keeps hits within the ref that wrote it.
+        key: ${{ runner.os }}-cargo-${{ github.ref }}-${{ hashFiles('**/Cargo.lock') }}
 
     # A half-resolved merge carries its marker lines as ordinary content, so the file
     # rebases and merges cleanly forever after, and a markdown doc is neither compiled nor

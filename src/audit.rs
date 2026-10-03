@@ -38,7 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::catalog::{Catalog, CatalogError};
+use crate::catalog::{resolve_location_path, Catalog, CatalogError};
 use crate::digest;
 use crate::disk_management::{self, DiskError};
 
@@ -145,6 +145,10 @@ pub enum VerdictKind {
     /// Catalog mode: a path exists in the tree that the catalog does not know about. It is
     /// reported and never adopted; ingesting it is `catalog sync`'s job, not an audit's.
     UnknownPath,
+    /// Catalog mode: a recorded location was refused before it became a path — its tier is
+    /// not one of the current roots, or its key would escape one. Reported, not touched
+    /// (issue #72).
+    MalformedCatalog,
 }
 
 impl VerdictKind {
@@ -162,6 +166,7 @@ impl VerdictKind {
             VerdictKind::CopyFloor => "copy-floor",
             VerdictKind::UnknownVersion => "unknown-version",
             VerdictKind::UnknownPath => "unknown-path",
+            VerdictKind::MalformedCatalog => "malformed-catalog",
         }
     }
 
@@ -169,7 +174,7 @@ impl VerdictKind {
     ///
     /// Every problem kind is listed, in both modes, so a cron job's counts do not change
     /// shape when the catalog appears — the catalog-only kinds simply read `0` in walk mode.
-    pub fn problems() -> [VerdictKind; 11] {
+    pub fn problems() -> [VerdictKind; 12] {
         [
             VerdictKind::MissingCopy,
             VerdictKind::ChecksumMismatch,
@@ -177,6 +182,7 @@ impl VerdictKind {
             VerdictKind::NameVanished,
             VerdictKind::UnknownVersion,
             VerdictKind::UnknownPath,
+            VerdictKind::MalformedCatalog,
             VerdictKind::OrphanedCopy,
             VerdictKind::DanglingSymlink,
             VerdictKind::UnexpectedTarget,
@@ -241,6 +247,14 @@ pub enum Verdict {
     },
     /// Catalog mode: the catalog has no row for this path at all.
     UnknownPath,
+    /// Catalog mode: a recorded location is refused as a path — its tier is not one of the
+    /// current roots, or its key is absolute or walks out with `..`. Reported, and no stat
+    /// or hash ran on it (issue #72).
+    MalformedCatalog {
+        tier: String,
+        key: String,
+        detail: String,
+    },
 }
 
 impl Verdict {
@@ -262,6 +276,7 @@ impl Verdict {
             Verdict::CopyFloor { .. } => VerdictKind::CopyFloor,
             Verdict::UnknownVersion { .. } => VerdictKind::UnknownVersion,
             Verdict::UnknownPath => VerdictKind::UnknownPath,
+            Verdict::MalformedCatalog { .. } => VerdictKind::MalformedCatalog,
         }
     }
 }
@@ -329,6 +344,11 @@ impl Finding {
             }
             Verdict::UnknownPath => {
                 line.push_str(" (the catalog does not know this path)");
+            }
+            Verdict::MalformedCatalog { tier, key, detail } => {
+                line.push_str(&format!(
+                    " (catalog row {tier}/{key}: {detail}; no filesystem operation)"
+                ));
             }
             Verdict::Healthy => {}
             // The walk-mode verdicts that carry a cold copy: keep the hint.
@@ -768,6 +788,12 @@ pub fn catalog_audit(
         })
         .collect();
 
+    // The roots a recorded tier must be one of before its key becomes a path. A row that
+    // names any other tier is reported, never stat'ed or hashed (issue #72).
+    let roots: Vec<PathBuf> = std::iter::once(watch_root.clone())
+        .chain(dest_tiers.iter().map(|(root, _)| root.clone()))
+        .collect();
+
     let objects = catalog.all_objects()?;
     let object_index: BTreeMap<String, crate::catalog::ObjectRecord> = objects
         .iter()
@@ -862,7 +888,25 @@ pub fn catalog_audit(
         let mut surviving = 0usize;
 
         for copy in copies {
-            let file = PathBuf::from(&copy.tier).join(&copy.storage_key);
+            // The row is joined only after it proves to stay under a current root; a
+            // refused row is reported and no stat or hash runs on it (issue #72).
+            let file = match resolve_location_path(&copy.tier, &copy.storage_key, &roots) {
+                Ok(file) => file,
+                Err(error) => {
+                    suspect_objects.insert(object.clone());
+                    findings.push(Finding {
+                        path: PathBuf::from(format!("{}/{}", copy.tier, copy.storage_key)),
+                        relative: PathBuf::from(&copy.storage_key),
+                        cold_copy: None,
+                        verdict: Verdict::MalformedCatalog {
+                            tier: copy.tier.clone(),
+                            key: copy.storage_key.clone(),
+                            detail: error.detail().to_string(),
+                        },
+                    });
+                    continue;
+                }
+            };
             if !fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
                 suspect_objects.insert(object.clone());
                 findings.push(Finding {
@@ -940,10 +984,15 @@ pub fn catalog_audit(
                 if copy.tier == watch_tier {
                     continue;
                 }
+                // A refused row was already reported in the location loop above; it never
+                // becomes a path here either (issue #72).
+                let Ok(cold) = resolve_location_path(&copy.tier, &copy.storage_key, &roots) else {
+                    continue;
+                };
                 findings.push(Finding {
-                    path: PathBuf::from(&copy.tier).join(&copy.storage_key),
+                    path: cold.clone(),
                     relative: PathBuf::from(&copy.storage_key),
-                    cold_copy: Some(PathBuf::from(&copy.tier).join(&copy.storage_key)),
+                    cold_copy: Some(cold),
                     verdict: Verdict::OrphanedCopy,
                 });
             }
@@ -1204,6 +1253,7 @@ pub fn repair(report: &AuditReport) -> Result<Vec<RepairOutcome>, AuditError> {
             | Verdict::ChecksumMismatch { .. }
             | Verdict::CopyFloor { .. }
             | Verdict::UnknownVersion { .. }
+            | Verdict::MalformedCatalog { .. }
             | Verdict::UnknownPath => RepairAction::NotAttempted {
                 reason: "catalog-mode finding: use catalog repair, which marks it for resync"
                     .to_string(),
