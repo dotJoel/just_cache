@@ -484,6 +484,57 @@ fn a_copy_on_a_second_filesystem_is_repaired_across_the_mount() {
     );
 }
 
+/// A symlink at a recorded location is *not* a copy, even when it resolves to
+/// byte-identical bytes: scrub reports it unreadable and does not record it verified.
+///
+/// The link's target hashes exactly to the object, so a stat that follows the final
+/// component (`fs::metadata`) would call this location clean and write a `scrub_state`
+/// row vouching for a name whose target can be removed without the catalog noticing.
+#[test]
+fn a_symlink_at_a_recorded_location_is_unreadable_not_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    let catalog = tmp.path().join("catalog.sqlite");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    let bytes = payload(16 * 1024);
+    fs::write(hot.join("a.bin"), &bytes).unwrap();
+    fs::write(cold.join("a.bin"), &bytes).unwrap();
+    assert_exit(&sync(&hot, &cold, &catalog), 0);
+    assert_eq!(summary(&catalog).locations, 2);
+
+    // Replace the cold copy with a relative symlink to the byte-identical hot file.
+    let cold_copy = cold.join("a.bin");
+    fs::remove_file(&cold_copy).unwrap();
+    std::os::unix::fs::symlink(Path::new("../hot/a.bin"), &cold_copy).unwrap();
+    assert_eq!(
+        fs::metadata(&cold_copy).unwrap().len(),
+        bytes.len() as u64,
+        "the link must resolve to byte-identical content for this test to mean anything"
+    );
+
+    let output = scrub(&catalog, &[]);
+    // A location that is not a copy is a finding, not a pass.
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("unreadable"),
+        "the symlink must be reported unreadable:\n{text}"
+    );
+    assert!(
+        text.contains(&cold_copy.display().to_string()),
+        "the report must name the symlink location:\n{text}"
+    );
+
+    let after = summary(&catalog);
+    assert_eq!(after.verified, 1, "only the real hot copy is verified");
+    assert_eq!(
+        after.never_scrubbed, 1,
+        "the symlink location must not be recorded as verified"
+    );
+}
+
 /// Sanity: the default catalog path really is beside the watch root, so a `--catalog`-less
 /// scrub of the default file works. (The command requires `--catalog` today; this pins the
 /// name the default path uses.)
