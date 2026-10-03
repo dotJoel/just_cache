@@ -7,6 +7,12 @@ pub mod digest;
 
 pub mod disk_management;
 pub mod explain;
+// The FUSE namespace provider (issue #42). Unix-only: it is the only module that
+// links `fuser`, and the only path into it is the `mount` subcommand, so a build on a
+// host with no FUSE kernel module still compiles every other subcommand.
+#[cfg(unix)]
+pub mod fuse;
+pub mod namespace;
 // Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
 // built without test cfg, so the fault seam has to be compiled into production and stay
 // inert there. It is private because nothing outside the crate may set a fault.
@@ -47,7 +53,10 @@ pub use file_movement::{
     log_file_movement, migrate_least_used, migrate_replicated, select_candidates, FileOutcome,
     MigrationRecord, MigrationReport, Policy, ReplicationDetail, SkipReason, UsageTracker,
 };
+#[cfg(unix)]
+pub use fuse::{serve as mount_serve, MountError, MountRequest};
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
+pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
 pub use policy::{
     DownDecision, DownRule, Lifecycle, PolicyError, Rule, RuleSet, UpRule, POLICY_FILE_NAME,

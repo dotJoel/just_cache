@@ -1189,6 +1189,44 @@ the catalog or the tree, and `--repair` marks for resync exactly as catalog mode
 and asserts the answer still comes back — which is what proves the abstention, since a
 command that validated or walked those paths would exit 2. The mode deliberately does not
 verify whether recorded copies still exist; that is the whole limit it names.
+Closed by #42: `just_cache mount <MOUNTPOINT>` mounts the catalog's namespace as a FUSE
+filesystem, so a consumer that does not follow symlinks (rsync/backup defaults, some SMB
+clients, qBittorrent verify) sees real bytes for an offloaded file instead of a link — the
+§4 provider that the symlink mover is the fallback for. The provider is split in two so the
+part CI can check is testable at all. `src/namespace.rs` is provider-agnostic: it indexes the
+catalog's `name` rows into a prefix tree (directories are implied prefixes; only files are
+named), resolves a path to its **tier of record** — the object's primary `location` — and
+turns that row into a filesystem path through `resolve_location_path` against the roots
+`catalog sync` recorded, so a hand-edited catalog can never point the mount outside a trusted
+root (#72). A named path whose row is missing or malformed is `NamespaceError::Unresolvable`,
+never `NotFound` and never a zero-length file: a directory the catalog says holds files cannot
+read as empty just because a row could not be joined into a path. `src/fuse.rs` is the thin
+adapter: it maps inodes to namespace paths (`&self` methods behind mutexes, as fuser 0.18
+requires), serves a directory as the catalog's children merged with the real entries under the
+watch root so `mkdir`/`create` behave normally, and answers a file from the bytes at its tier
+of record. A **read** is a pure read of those bytes and can never touch a row. A **write**
+goes through to the tier of record's file in place, and a **create** lands under the watch root
+(the hot tier); the mount invents no second placement mechanism — no partial, no journal, no
+tier choice — and it does not rewrite the catalog, so a rewrite leaves the recorded checksum
+stale until the next `catalog sync` observes it exactly as it would any other rewrite. Fail
+closed is enforced before and during serving: `mount` requires an existing catalog (a mount
+over none would present an empty namespace), refuses a catalog with no recorded roots, refuses
+a mountpoint that is missing or non-empty, answers `EIO` for a name whose bytes are gone (an
+unmounted tier) rather than reporting an empty file, and answers `EIO` if `create` would shadow
+a catalogued name. A dead daemon is the kernel's own `ENOTCONN` — the mountpoint cannot read as
+an empty tree — and `Ctrl-C`/`SIGTERM` unmount through fuser's `SessionUnmounter` before the
+process exits, so no live mount is left behind. `fuser` is built with `default-features = false`
+(the pure-Rust `/dev/fuse` path), so a build host needs no libfuse headers — CI's image has
+none — and no other subcommand links FUSE, so a sweep/audit on a host without the kernel module
+still builds and runs. Tests: `tests/fuse_mount.rs` exercises the namespace layer against a
+real catalog with **no mount** (name→tier-of-record resolution for a present and an offloaded
+file, an unknown path as `NotFound`, an absolute key and a deleted location row as
+`Unresolvable`, and that resolving names rewrites neither the catalog nor the tiers), and the
+`serve` refusals that happen before any kernel call (no roots, non-empty mountpoint, a missing
+catalog as a usage error). The real mount — bytes served through the handler, a write through
+to a tier file, a rename, a clean unmount — is gated behind `JUST_CACHE_TEST_FUSE=1` and is
+**not run by CI**, which has no usable `/dev/fuse`; everything only a real mount proves is
+therefore verified by a human running it with the gate set, and is named rather than implied.
 
 ## 10. Non-goals
 
@@ -1286,3 +1324,17 @@ verify whether recorded copies still exist; that is the whole limit it names.
   mode exists to avoid. It reports the recorded floor and damage state instead, marks the
   rest `unchecked`, and leaves the filesystem answer to a catalog-mode run once a tier is
   mounted. Making the mode reconstruct paths to probe them would defeat its purpose.
+- **The mount does not rewrite the catalog, and that bounds what it can do.** `just_cache
+  mount` (#42) serves reads from the tier of record and writes through to those bytes in
+  place, but it never writes a `name`/`location` row: a rewrite leaves the object's recorded
+  checksum stale until the next `catalog sync` observes it, exactly as any other rewrite is
+  observed. Three consequences are deliberate and named rather than hidden. **Rename is
+  confined to the watch root**: the mount can move a hot name (the disk overlay shows it
+  afterwards) but a name whose bytes are on a cold tier answers `EROFS`, because renaming the
+  cold copy would leave a name the mount cannot serve and no catalog row to update. **Deletion
+  is not implemented**: `unlink`/`rmdir` answer `EROFS` — deletion is a catalog transition with
+  reference counting across names and copies (§3), and is a separate issue. And **access
+  observation and recall are not here**: every open/read/close does not update `lifecycle`,
+  and a read of an offloaded object does not pull it one tier up — those are the two issues
+  after this one (§4, the issue's out-of-scope), and the mount is only the lookup/list/stat/
+  read/write/rename over copies that are present.

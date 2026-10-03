@@ -96,6 +96,9 @@ enum Command {
     /// Run the maintenance passes (`scrub`, `reconcile`) that `schedule.toml` says are due,
     /// and report the next planned run when asked.
     Schedule(ScheduleArgs),
+    /// Mount the catalog's namespace as a FUSE filesystem, so a consumer that does not
+    /// follow symlinks sees real bytes for an offloaded file (issue #42).
+    Mount(MountArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -634,6 +637,39 @@ struct ScheduleArgs {
     now: Option<u64>,
 }
 
+/// Everything `mount` needs: the catalog to serve, the tiers its rows are proven
+/// against, the watch root new names are created under, and where to mount.
+#[derive(Debug, Args)]
+struct MountArgs {
+    /// Directory to mount on. It must already exist and be empty: the mount refuses to
+    /// create it (invariant 1) and refuses to hide files already there.
+    #[arg(value_name = "MOUNTPOINT")]
+    mountpoint: PathBuf,
+
+    /// Directory to watch: the namespace the mount presents. A file present in it is
+    /// served from the tree; an offloaded one is served from its tier of record. New
+    /// files are created here (the hot tier).
+    #[arg(long, value_name = "DIR")]
+    watch: PathBuf,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk. Every
+    /// destination must already exist; a volatile tier is refused as a `--dest`.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the watch
+    /// root, consulted only when it is already there — never created. A volatile tier
+    /// is refused as a `--dest` (a destination is a home; a volatile tier is a mirror).
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// The catalog to serve. Defaults to `.just_cache-catalog.sqlite` beside the watch
+    /// root. It must already exist: a mount never creates a catalog (`catalog sync`
+    /// does), and one conjured empty would serve an empty namespace.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -647,6 +683,7 @@ fn main() -> ExitCode {
         Some(Command::Scrub(args)) => run_scrub(args),
         Some(Command::Reconcile(args)) => run_reconcile(args),
         Some(Command::Schedule(args)) => run_schedule(args),
+        Some(Command::Mount(args)) => run_mount(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -2368,4 +2405,74 @@ fn record_replicas(catalog: &catalog::Catalog, details: &[file_movement::Replica
             );
         }
     }
+}
+
+/// Mount the catalog namespace and serve it until unmounted.
+///
+/// The mount is not a source of truth: it serves the names the catalog records, reads
+/// their bytes from the tier of record, and writes through to those bytes in place. It
+/// never creates a catalog (invariant 9) and never touches a row: a rewrite is picked
+/// up by the next `catalog sync`, exactly as a rewrite made by any other process is.
+/// Exit `2` when the invocation or the catalog is unusable (a mount with no catalog to
+/// serve would present an empty namespace, which is the failure the issue names); `1`
+/// when the FUSE session itself could not be established or run.
+#[cfg(unix)]
+fn run_mount(args: MountArgs) -> ExitCode {
+    if let Err(message) = validate_paths(&args.watch, &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    // The catalog must exist: a mount over no catalog would serve an empty namespace,
+    // which is precisely the "reads as an empty tree" failure the mount must not have.
+    let catalog_path = args
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
+    if !catalog_path.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`, \
+             then mount it)",
+            catalog_path.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let request = just_cache::MountRequest {
+        catalog_path,
+        watch: args.watch.clone(),
+        dests: args.dest.clone(),
+        mountpoint: args.mountpoint.clone(),
+    };
+    eprintln!(
+        "just_cache: mounting {} at {} (Ctrl-C to unmount)",
+        request.catalog_path.display(),
+        request.mountpoint.display()
+    );
+    match just_cache::mount_serve(&request) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `mount` is a Unix/FUSE feature. On a platform without it the subcommand still parses
+/// (so the CLI is the same everywhere) and explains itself rather than disappearing.
+#[cfg(not(unix))]
+fn run_mount(_args: MountArgs) -> ExitCode {
+    eprintln!("just_cache: mount needs FUSE, which this build does not have (it is Unix-only)");
+    ExitCode::from(EXIT_USAGE)
 }
