@@ -418,3 +418,142 @@ fn the_cli_restores_a_lost_name_on_its_next_run() {
     assert!(report.contains("healthy: 1"), "{report}");
     let _ = tmp;
 }
+
+/// A symlink planted at the journal name must be refused, not followed: following it would
+/// append every intent record into — or, on the append open, redirect writes into — a file
+/// the planter chose. The symlink target keeps its contents and the run says why.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_journal_name_is_refused_and_the_target_survives() {
+    let (tmp, watch, cold) = scenario();
+    let victim = tmp.path().join("victim.txt");
+    fs::write(&victim, b"SECRET-DATA-THAT-MUST-SURVIVE\n").unwrap();
+    fs::write(watch.join("shows/episode.mkv"), b"payload").unwrap();
+    std::os::unix::fs::symlink(&victim, watch.join(JOURNAL_NAME)).unwrap();
+
+    let output = bin()
+        .args([
+            "--watch",
+            watch.to_str().unwrap(),
+            "--dest",
+            cold.to_str().unwrap(),
+            "--min-idle-days",
+            "30",
+            "--min-free-gb",
+            "0",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a symlinked journal must stop the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say what it refused: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"SECRET-DATA-THAT-MUST-SURVIVE\n",
+        "the link target must be untouched"
+    );
+    assert!(
+        fs::symlink_metadata(watch.join(JOURNAL_NAME))
+            .unwrap()
+            .is_symlink(),
+        "the link itself must be left as it was"
+    );
+    assert!(
+        !fs::symlink_metadata(watch.join("shows/episode.mkv"))
+            .unwrap()
+            .is_symlink(),
+        "and nothing may have moved"
+    );
+    let _ = tmp;
+}
+
+/// The compaction temp is the other fixed name. `create_new` refuses the planted link rather
+/// than truncating through it, so the file it points at keeps its bytes, and the end-of-sweep
+/// compaction that hits it is reported rather than swallowed.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_compaction_temp_is_refused_and_the_target_survives() {
+    let (tmp, watch, cold) = scenario();
+    let victim = tmp.path().join("victim.txt");
+    fs::write(&victim, b"SECRET-DATA-THAT-MUST-SURVIVE\n").unwrap();
+    // A warm file so the sweep itself has nothing to do; the only write is the compaction.
+    fs::write(watch.join("shows/episode.mkv"), b"payload").unwrap();
+    let temporary = watch.join(JOURNAL_NAME).with_extension("compacting");
+    std::os::unix::fs::symlink(&victim, &temporary).unwrap();
+
+    let output = bin()
+        .args([
+            "--watch",
+            watch.to_str().unwrap(),
+            "--dest",
+            cold.to_str().unwrap(),
+            "--min-idle-days",
+            "30",
+            "--min-free-gb",
+            "0",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the refused compaction must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "the refusal must say what it refused: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"SECRET-DATA-THAT-MUST-SURVIVE\n",
+        "the link target must never be truncated into"
+    );
+    assert!(
+        fs::symlink_metadata(&temporary).unwrap().is_symlink(),
+        "the planted link is left for a human, not deleted"
+    );
+    let _ = tmp;
+}
+
+/// The journal records every in-flight move, destination included, so it must not be
+/// world-readable. Created under `umask 0` — where an un-hinted create would be 0666 — it
+/// still comes out 0600.
+#[cfg(unix)]
+#[test]
+fn a_newly_created_journal_is_mode_0600_even_under_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, watch, cold) = scenario();
+    fs::write(watch.join("shows/episode.mkv"), b"still warm").unwrap();
+
+    // The umask is per-process, so it is set in a child: `sh -c 'umask 0; exec …'`.
+    let script = format!(
+        "umask 0; exec '{}' --watch '{}' --dest '{}' --min-idle-days 30 --min-free-gb 0 --once",
+        env!("CARGO_BIN_EXE_just_cache"),
+        watch.display(),
+        cold.display()
+    );
+    let status = Command::new("sh").args(["-c", &script]).status().unwrap();
+    assert!(status.success());
+
+    let mode = fs::metadata(watch.join(JOURNAL_NAME))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the journal must be created with an explicit mode, not the umask"
+    );
+    let _ = tmp;
+}

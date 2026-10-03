@@ -583,8 +583,16 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         let report = sweep(&mut state, pass);
         // Compaction is what keeps the journal describing only what is still in flight:
         // finished moves are dropped, and any incomplete record is written back so the
-        // next start reads a file the size of the work actually outstanding.
-        let _ = journal.compact();
+        // next start reads a file the size of the work actually outstanding. A compaction
+        // that fails — a symlink planted at the temp name, say — must be seen, not
+        // swallowed: silently continuing would leave the journal describing the whole run
+        // and never report the refusal.
+        if let Err(err) = journal.compact() {
+            eprintln!("just_cache: {err}");
+            if args.once {
+                return ExitCode::FAILURE;
+            }
+        }
         if args.once {
             return if report.failed() > 0 || report.under_replicated() > 0 {
                 ExitCode::FAILURE

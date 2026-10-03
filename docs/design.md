@@ -466,8 +466,31 @@ from it. What is deliberately out of scope is deciding *when* to reconcile (§10
 scrub scheduling) and verifying copies that are present — a stat per location answers
 "is this copy absent", and anything more is the scrubber's job.
 
+Closed by the journal hardening (#69): the journal and its compaction temp no longer follow
+a symlink at their fixed names. `Journal` opens the journal `O_NOFOLLOW` and creates the
+compaction temp with `create_new(true)` — the same refusal the copy path already made — so a
+link planted at `.just_cache-journal` or `.just_cache-journal.compacting` is reported and
+refused rather than redirecting every appended intent record into, or truncating, the file it
+points at. The end-of-sweep compaction now reports a failure instead of discarding it (the
+old `let _ = journal.compact()`), so a refused temp is visible even when the sweep itself had
+nothing to do. Both the journal and the temp are created 0600 *explicitly* rather than under
+the caller's umask, and an existing journal is brought down to 0600 the moment it is opened:
+the journal names every in-flight move, destination included, so 0644 on a shared tree is a
+disclosure and a permissive umask makes it the primitive that lets another writer forge a
+record. Proven by `tests/journal.rs` — both links planted with the target asserted intact and
+the refusal named on stderr, and the created file's mode asserted under `umask 0` — and by
+unit tests in `src/journal.rs` that fail when either guard is reverted.
+
 Still open, and honestly so:
 
+- **A hard link at the journal name is not distinguishable from the real journal.** The
+  `O_NOFOLLOW` guard closes the symlink redirect, but a file carrying the journal's name that
+  is a hard link to another file passes the regular-file check, and an append lands in the
+  shared inode just as a following open would have. Nothing can tell the two apart without
+  ownership metadata, and the journal lives inside the watched tree where any writer can plant
+  one; a `nlink > 1` refusal (the rule the mover already applies to move candidates) would
+  cover the planted case but not a backup tool that legitimately shares the inode. Left
+  unpatched deliberately and recorded here rather than in a commit message.
 - **Closed by the `JUST_CACHE_FAULT` hook (#25): a destination that disappears
   mid-sweep is now deterministically testable.** A destination that becomes unavailable
   *between* two copies of one sweep, or while a freshly written copy is being read back,

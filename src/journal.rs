@@ -30,7 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,17 @@ pub const JOURNAL_NAME: &str = ".just_cache-journal";
 
 /// Prefix shared by the journal and by in-flight copies, for the walk to ignore.
 pub const INTERNAL_PREFIX: &str = ".just_cache";
+
+/// Permissions a new journal — and the compaction temp that becomes one — is created with,
+/// independent of the process umask.
+///
+/// The journal names every in-flight move, destination included, so on a shared tree the
+/// umask's usual 0644 makes it world-readable and a permissive umask makes it world-writable,
+/// which is the very primitive that would let another writer forge a record. 0600 closes
+/// both, and the tool applies it explicitly rather than leaving it to whatever the caller's
+/// umask happens to be.
+#[cfg(unix)]
+const JOURNAL_MODE: u32 = 0o600;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -55,6 +66,64 @@ pub enum JournalError {
     },
     #[error("cannot write the journal at {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
+    #[error(
+        "refusing the journal at {path}: the name is a symlink, and a journal must be a \
+         regular file"
+    )]
+    Symlink { path: PathBuf },
+}
+
+/// Apply the journal's open flags: an explicit private mode, and no following a symlink.
+///
+/// Both the journal and its compaction temp live at fixed names inside the watched tree, so
+/// anyone who can write the tree can plant a link at either one. A following open would
+/// append records into — or truncate — a file of their choosing, the same redirect the copy
+/// path already refuses with `create_new`; the journal needs the same guard. `mode` bites
+/// only at creation, so an existing journal is brought private by `tighten` instead.
+#[cfg(unix)]
+fn harden(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(JOURNAL_MODE);
+    options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+}
+
+#[cfg(not(unix))]
+fn harden(_options: &mut OpenOptions) {}
+
+/// Refuse a symlink standing at a name the journal owns.
+///
+/// `O_NOFOLLOW` (and, for the temp, `O_EXCL`'s own refusal of a symlink) is what actually
+/// closes the race; this check exists so the refusal names the file and the reason instead
+/// of surfacing a bare `ELOOP`, and so a link that is there when we look is reported before
+/// any bytes are written through the fixed name.
+fn refuse_symlink(path: &Path) -> Result<(), JournalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JournalError::Symlink {
+            path: path.to_path_buf(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Bring a journal that already exists down to the private mode.
+///
+/// The create-time `mode` never touches a file that is already there, so a journal written
+/// by an older version — or by the first run under a permissive umask — would otherwise stay
+/// world-readable. Applied to the open descriptor, so it cannot be redirected to a symlink
+/// target by a race on the path.
+#[cfg(unix)]
+fn tighten(file: &File, path: &Path) -> Result<(), JournalError> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(JOURNAL_MODE))
+        .map_err(|source| JournalError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn tighten(_file: &File, _path: &Path) -> Result<(), JournalError> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,8 +175,12 @@ impl Journal {
     }
 
     fn load(&mut self) -> Result<(), JournalError> {
-        let contents = match fs::read_to_string(&self.path) {
-            Ok(contents) => contents,
+        refuse_symlink(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        harden(&mut options);
+        let mut file = match options.open(&self.path) {
+            Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(JournalError::Read {
@@ -116,6 +189,17 @@ impl Journal {
                 })
             }
         };
+        // A journal written by an older version, or by the first run under a permissive
+        // umask, may already be world-readable: bring it private as soon as we open it,
+        // before a single record is appended through this handle.
+        tighten(&file, &self.path)?;
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|source| JournalError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
 
         for (index, line) in contents.lines().enumerate() {
             let line = line.trim();
@@ -195,9 +279,11 @@ impl Journal {
     /// machine dies is a record that was never written, and the window it was meant to
     /// cover is exactly the one where the power goes out mid-move.
     fn append(&self, record: &Record) -> Result<(), JournalError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        refuse_symlink(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        harden(&mut options);
+        let mut file = options
             .open(&self.path)
             .map_err(|source| JournalError::Write {
                 path: self.path.clone(),
@@ -219,6 +305,12 @@ impl Journal {
     /// "nothing was in flight".
     pub fn compact(&self) -> Result<(), JournalError> {
         let temporary = self.path.with_extension("compacting");
+        // A symlink at either name is refused by name: `create_new` would already refuse the
+        // temp (O_EXCL rejects a symlink), but a clear message beats a bare `EEXIST`, and
+        // `refuse_symlink` on the journal itself stops the rename from replacing a link with
+        // our file and hiding whatever it pointed at.
+        refuse_symlink(&temporary)?;
+        refuse_symlink(&self.path)?;
         let mut body = String::new();
         for record in self.records.values() {
             body.push_str(&encode_record(record));
@@ -226,7 +318,10 @@ impl Journal {
         }
 
         let write = || -> io::Result<()> {
-            let mut file = File::create(&temporary)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            harden(&mut options);
+            let mut file = options.open(&temporary)?;
             file.write_all(body.as_bytes())?;
             file.sync_all()?;
             fs::rename(&temporary, &self.path)
@@ -857,6 +952,71 @@ mod tests {
         assert!(
             JOURNAL_NAME.starts_with(INTERNAL_PREFIX),
             "the walk skips this prefix, so the journal can never be moved onto a cold tier"
+        );
+    }
+
+    /// A symlink at the journal name must be refused, never followed: an append through it
+    /// would write every intent record into a file the planter chose.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_journal_name_is_refused_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&victim, tmp.path().join(JOURNAL_NAME)).unwrap();
+
+        match Journal::in_tree(tmp.path()) {
+            Err(JournalError::Symlink { .. }) => {}
+            other => panic!("expected a symlink refusal, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"must survive",
+            "the link target must be untouched"
+        );
+    }
+
+    /// The compaction temp is the other fixed name: `create_new` refuses a symlink there, so
+    /// a planted link cannot be truncated into the file it points at.
+    #[cfg(unix)]
+    #[test]
+    fn compaction_refuses_a_symlink_at_the_temp_name() {
+        let (tmp, journal) = temp_journal();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, b"must survive").unwrap();
+        let temporary = tmp.path().join(JOURNAL_NAME).with_extension("compacting");
+        std::os::unix::fs::symlink(&victim, &temporary).unwrap();
+
+        match journal.compact() {
+            Err(JournalError::Symlink { .. }) => {}
+            other => panic!("expected a symlink refusal, got {other:?}"),
+        }
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert!(
+            fs::symlink_metadata(&temporary).unwrap().is_symlink(),
+            "the link may not be unlinked either"
+        );
+    }
+
+    /// Created with an explicit 0600, not whatever the umask leaves behind. Under the usual
+    /// 022 umask an un-hinted create would be 0644 — world-readable — and this asserts it is
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_journal_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, mut journal) = temp_journal();
+        journal
+            .intent(Path::new("a.bin"), &tmp.path().join("cold/a.bin"), 1)
+            .unwrap();
+        let mode = fs::metadata(tmp.path().join(JOURNAL_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the journal must not inherit the process umask"
         );
     }
 }
