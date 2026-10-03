@@ -80,6 +80,14 @@ worth reading before editing the code around them.
   than writing something that only looks like coverage.
 - **Name gaps instead of hiding them.** Anything not done — untested paths, unverified
   assumptions, a hard stop that needs a human — is recorded where the next reader will find it.
+- **Append §9 entries at the end of the list.** A new "Closed by #NN" paragraph in
+  `docs/design.md` §9 goes after the last existing entry, not before a
+  `Still open, and honestly so:` heading — the headings are fixed anchors, never an
+  insert point. With the heading as anchor, every branch in a parallel wave inserted at
+  the same line and the second to land always conflicted; the moving tail of the list
+  keeps entries in merge order, and a rebase re-appends after the entries that landed.
+  Two branches off the same base still meet at the tail; resolve by keeping both
+  entries, in the order they merge.
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `ci:`, `test:`, `chore:`) with a body that
   explains the change and its verification.
 - **Branch, then PR — never commit on `main`.** Even in a repo where you own every commit:
