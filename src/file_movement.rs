@@ -581,7 +581,11 @@ where
 /// * the source is removed **only** when the floor is met
 ///   ([`crate::replication::ReplicationOutcome::meets_floor`]). Below the floor the file
 ///   is left exactly where it was and reported as [`FileOutcome::UnderReplicated`] — the
-///   mover never trades the last copy away to satisfy a number.
+///   mover never trades the last copy away to satisfy a number;
+/// * the journal record names the copy the move actually retires to — the first that
+///   verified — rather than the destination tried first, so a crash in the retire window
+///   sends recovery to a copy that exists instead of reporting data loss over a path that
+///   never held one.
 ///
 /// With `floor == 1` this collapses to the old behaviour, which is why the default sweep
 /// still calls `migrate_least_used` and only an explicit `--copies N` reaches here.
@@ -630,49 +634,70 @@ pub fn migrate_replicated(
             continue;
         }
 
-        let primary = dests.first().map(|dest| dest.join(&entry.relative));
+        // The intent names the first destination before anything moves (invariant 5). On
+        // this path the copy step never touches the source, so the record only has to be
+        // right for the window *after* the copies exist — where the destination the move
+        // actually retires to is whichever copy verified, which need not be the first one
+        // tried. It is corrected to that copy below, before the source is removed.
+        let intent_destination = dests.first().map(|dest| dest.join(&entry.relative));
 
         if policy.dry_run {
             report.records.push(MigrationRecord {
                 path: entry.path.clone(),
-                destination: primary,
+                destination: intent_destination,
                 outcome: FileOutcome::Planned,
                 size: entry.size,
             });
             continue;
         }
 
-        // The intent names the primary destination, which is the copy recovery would
-        // link to if the machine dies between here and the symlink. The size in the
-        // record is what recovery checks the cold copy against.
-        let journalled = match &primary {
+        let mut journalled = match &intent_destination {
             Some(target) => journal.intent(&entry.relative, target, entry.size).is_ok(),
             None => false,
         };
-        if !journalled {
-            eprintln!(
-                "just_cache: cannot record the replicated move of {} in the journal; a \
-                 crash during this move would not be recoverable",
-                entry.path.display()
-            );
-        }
 
         let outcome = crate::replication::replicate(entry, dests, floor, min_free);
+
+        // The copy recovery would link to is the one that verified, not necessarily the
+        // destination the intent guessed at. Record it now, *before* the source is
+        // removed: a record left naming a destination that never held a copy sends
+        // recovery to an empty path, so a crash in this window is reported as DATA LOST
+        // while verified copies exist (#78).
+        let retire_to = outcome.primary().map(Path::to_path_buf);
+        if let Some(target) = &retire_to {
+            if intent_destination.as_deref() != Some(target.as_path()) {
+                journalled = journal.intent(&entry.relative, target, entry.size).is_ok();
+            }
+        }
 
         let result = if outcome.meets_floor() {
             // The floor is met, so the source may now be retired. Removing it first and
             // linking second follows the single-copy mover's order: if the link step
             // fails, the bytes are safe on every verified replica and the journal record
             // still describes the move, so the next run's recovery creates the link.
-            let primary_path = outcome
-                .primary()
+            let primary_path = retire_to
+                .as_deref()
                 .expect("a met floor always has at least one verified replica");
-            match retire_source(&entry.path, primary_path) {
-                Ok(()) => {
-                    journal.forget(&entry.relative);
-                    FileOutcome::Moved
+            if !journalled {
+                // Retiring over a record that does not name the destination being relied
+                // on is exactly the unrecoverable window this fix closes, so keep the
+                // source instead: the journal could not name the copy a crash would need.
+                eprintln!(
+                    "just_cache: cannot record the replicated move of {} in the journal; a \
+                     crash during this move would not be recoverable, so the source is kept",
+                    entry.path.display()
+                );
+                FileOutcome::Failed(
+                    "the journal could not record the destination the move retires to".to_string(),
+                )
+            } else {
+                match retire_source(&entry.path, primary_path) {
+                    Ok(()) => {
+                        journal.forget(&entry.relative);
+                        FileOutcome::Moved
+                    }
+                    Err(err) => FileOutcome::Failed(err.to_string()),
                 }
-                Err(err) => FileOutcome::Failed(err.to_string()),
             }
         } else {
             // Belt and braces in the other direction: the source is not touched. This is
@@ -700,7 +725,9 @@ pub fn migrate_replicated(
 
         report.records.push(MigrationRecord {
             path: entry.path.clone(),
-            destination: primary,
+            // The copy the move relies on — the one it retired to, or the first that
+            // verified — never the destination that was merely tried first (#78).
+            destination: retire_to.or(intent_destination),
             outcome: result,
             size: entry.size,
         });
