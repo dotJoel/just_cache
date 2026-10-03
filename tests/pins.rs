@@ -99,6 +99,20 @@ impl Fixture {
         path
     }
 
+    /// Re-establish a placed file's idle stamp.
+    ///
+    /// The tests stamp a file "idle past the threshold" with `set_times`, but the mover's
+    /// idle signal *is* atime, and any read of the file refreshes atime on a mount that
+    /// maintains it under the `relatime` rule — which is every normal Linux mount, and is
+    /// why `catalog sync` (which hashes the file) undoes the stamp, while a `noatime` mount
+    /// (the box these tests were written on) hides it. A test that asserts "this moved
+    /// because it was idle" therefore has to re-stamp after the last read of the file and
+    /// before the sweep whose decision it asserts. This is that call, named for the trap
+    /// rather than repeated inline at every site.
+    fn restamp(&self, path: &Path, days: u64) {
+        set_times(path, days_ago(days));
+    }
+
     fn sync(&self) {
         let output = bin()
             .args(["catalog", "sync", "--watch"])
@@ -244,7 +258,9 @@ fn an_expired_pin_blocks_nothing_and_its_expiry_is_visible() {
         "an expired pin must not be the verdict: {explained_out}"
     );
 
-    // And the sweep is free to move it.
+    // And the sweep is free to move it. Re-stamp first: `sync` and `explain` have read the
+    // file, and on a `relatime` mount that refreshed the atime the mover reads as idleness.
+    fixture.restamp(&hot, 90);
     let sweep = fixture.sweep();
     let out = stdout(&sweep);
     assert!(
@@ -336,6 +352,9 @@ fn unpin_is_idempotent_and_releases_the_pin() {
     let second = fixture.unpin("shows/release.bin");
     assert_eq!(second.status.code(), Some(0), "stderr: {}", stderr(&second));
 
+    // With the pin cleared the file must move. Re-stamp first: `sync` read the file, and on
+    // a `relatime` mount that read refreshed the atime the mover reads as idleness.
+    fixture.restamp(&hot, 90);
     let sweep = fixture.sweep();
     assert!(
         fs::symlink_metadata(&hot).unwrap().file_type().is_symlink(),
