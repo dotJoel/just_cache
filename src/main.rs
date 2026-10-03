@@ -1698,12 +1698,31 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         None => None,
     };
 
+    // Gather object-tier configs and keys so a file offloaded to S3 can be
+    // brought back by downloading through the object-store driver. A tier without
+    // an object config is skipped (it is an FS tier).
+    let object_configs: Vec<just_cache::object_store::ObjectTierConfig> = tiers
+        .as_ref()
+        .map(|set| {
+            set.tiers()
+                .iter()
+                .filter_map(|tier| tier.object_config.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let encryption_keys: Vec<just_cache::envelope::Key> = object_configs
+        .iter()
+        .filter_map(|cfg| cfg.load_encryption_key().ok())
+        .collect();
+
     let request = RestoreRequest {
         path: &args.path,
         watch: &args.watch,
         dests: &args.dest,
         remove_copy: args.remove_copy,
         catalog: catalog.as_ref(),
+        object_tier_configs: &object_configs,
+        encryption_keys: &encryption_keys,
     };
     match restore::restore(&request) {
         Ok(outcome) => {

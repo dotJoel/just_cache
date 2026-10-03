@@ -7,8 +7,8 @@
 //! runs `just_cache sweep`, and verifies the outcome on disk and in the catalog.
 //!
 //! What these tests prove:
-//!   (a) A sweep moves a file to an object tier and retires the source only after
-//!       verification (the source becomes a symlink).
+//!   (a) A sweep moves a file to an object tier, records the catalog location,
+//!       and removes the source (no symlink — the catalog is the source of truth).
 //!   (b) An upload that never completes adopts nothing and the sweep keeps the source.
 //!   (c) A checksum mismatch on download adopts nothing and names the tier.
 //!   (d) A successful recall/restore brings the file back.
@@ -236,16 +236,16 @@ fn setup_e2e(fake_host: &str, _enc_key: &str) -> (PathBuf, PathBuf, PathBuf, tem
 
 // ---------- tests ---------------------------------------------------------------
 
-/// (a) A sweep moves a file to an object tier and leaves the source retired only
-/// after verification. The source at the watched path becomes a symlink pointing
-/// into the object tier's scratch directory.
+/// (a) A sweep moves a file to an object tier, records the catalog location, and
+/// removes the source. The source file is gone (no symlink — the catalog is the
+/// source of truth; docs/design.md §4 no-local-representation decision).
 #[test]
 fn sweep_moves_file_to_object_tier_and_retires_source_after_verification() {
     let (port, store) = start_fake_s3();
     let host = format!("127.0.0.1:{port}");
 
     set_creds("test-access-key", "test-secret-key", TEST_ENC_KEY);
-    let (watch, tiers_path, _catalog_path, _tmp) = setup_e2e(&host, TEST_ENC_KEY);
+    let (watch, tiers_path, catalog_path, _tmp) = setup_e2e(&host, TEST_ENC_KEY);
     let scratch = _tmp.path().join("scratch");
 
     // Run the sweep: move the file to the object tier
@@ -273,12 +273,37 @@ fn sweep_moves_file_to_object_tier_and_retires_source_after_verification() {
         "sweep should succeed\nstdout: {stdout}\nstderr: {stderr}"
     );
 
-    // The source should be a symlink now (retired)
+    // The source should not exist — removed after catalog recording.
     let source = watch.join("data.bin");
     assert!(
-        source.is_symlink(),
-        "source should be a symlink after sweep: {}",
+        !source.exists(),
+        "source should be removed after object-tier sweep: {} still exists",
         source.display()
+    );
+
+    // The catalog should have the location recorded — verify via `locate`.
+    let locate_out = binary()
+        .arg("locate")
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .arg("--tiers")
+        .arg(&tiers_path)
+        .arg("data.bin")
+        .output()
+        .expect("locate failed");
+    let locate_stdout = String::from_utf8_lossy(&locate_out.stdout);
+    assert!(
+        locate_out.status.success(),
+        "locate should succeed after object-tier sweep: {}",
+        locate_stdout
+    );
+    assert!(
+        locate_stdout.contains("obj"),
+        "locate should report the object tier `obj`: got: {locate_stdout}"
+    );
+    assert!(
+        locate_stdout.contains("offloaded"),
+        "locate should report state offloaded: {locate_stdout}"
     );
 
     // The fake S3 should have the object
@@ -428,9 +453,9 @@ fn checksum_mismatch_names_tier_and_adopts_nothing() {
         "sweep should succeed\nstdout: {stdout}\nstderr: {stderr}"
     );
 
-    // The source should be a symlink after a successful sweep
+    // The source should not exist after a successful sweep (removed, no symlink).
     let source = watch.join("test.bin");
-    assert!(source.is_symlink() || !source.is_file());
+    assert!(!source.exists());
 
     // The store should contain the uploaded object
     let store = store.lock().unwrap();
@@ -439,23 +464,98 @@ fn checksum_mismatch_names_tier_and_adopts_nothing() {
     drop(store);
 }
 
-/// (d) A restored file from an object tier is brought back to the watch tree,
-/// verified against the catalog checksum. The file at the hot path is a regular
-/// file whose bytes match the original.
-///
-/// **Still open, and named:** restore from an object tier requires the binary to
-/// detect that a tier's `kind` is `object` and route the download through the
-/// object-store driver rather than the local filesystem. The current `restore.rs`
-/// `locate()` function resolves catalog locations to local filesystem paths via
-/// `resolve_location_path`, which cannot produce a path for an object-tier copy.
-///
-/// This test is marked `#[ignore]` pending the restore-path integration.
-/// When restored, it covers criterion (d) from #141's acceptance criteria.
-/// See docs/design.md §9.
+/// (d) A successful restore brings the file back from an object tier:
+/// download, decrypt, verify against the recorded digest, and place on disk.
 #[test]
-#[ignore = "restore-from-object-tier not yet wired (docs/design.md §9)"]
 fn restore_brings_file_back_from_object_tier() {
-    // placeholder — will be implemented when restore supports object tiers
+    let (port, _store) = start_fake_s3();
+    let host = format!("127.0.0.1:{port}");
+    set_creds("test-access-key", "test-secret-key", TEST_ENC_KEY);
+
+    let (watch, tiers_path, catalog_path, _tmp) = setup_e2e(&host, TEST_ENC_KEY);
+
+    // Run catalog sync to ingest the tree
+    let sync = binary()
+        .arg("catalog")
+        .arg("sync")
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .arg("--tiers")
+        .arg(&tiers_path)
+        .arg("--watch")
+        .arg(&watch)
+        .arg("--dest")
+        .arg(_tmp.path().join("scratch"))
+        .output()
+        .expect("sync failed");
+    assert!(
+        sync.status.success(),
+        "catalog sync should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&sync.stdout),
+        String::from_utf8_lossy(&sync.stderr)
+    );
+
+    // Run the sweep to move the file to the object tier
+    let sweep = binary()
+        .arg("sweep")
+        .arg("--once")
+        .arg("--watch")
+        .arg(&watch)
+        .arg("--dest")
+        .arg(_tmp.path().join("scratch"))
+        .arg("--min-idle-days")
+        .arg("0")
+        .arg("--tiers")
+        .arg(&tiers_path)
+        .output()
+        .expect("sweep failed");
+    let stdout = String::from_utf8_lossy(&sweep.stdout);
+    let stderr = String::from_utf8_lossy(&sweep.stderr);
+    assert!(
+        sweep.status.success(),
+        "sweep should succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // The source file should be gone after the sweep
+    let source = watch.join("data.bin");
+    assert!(
+        !source.exists(),
+        "source should be removed after object-tier sweep: {} still exists",
+        source.display()
+    );
+
+    // Restore the file from the object tier
+    let restore = binary()
+        .arg("restore")
+        .arg("--catalog")
+        .arg(&catalog_path)
+        .arg("--tiers")
+        .arg(&tiers_path)
+        .arg("--dest")
+        .arg(_tmp.path().join("scratch"))
+        .arg("--watch")
+        .arg(&watch)
+        .arg(&source)
+        .output()
+        .expect("restore failed");
+    let restore_stdout = String::from_utf8_lossy(&restore.stdout);
+    let restore_stderr = String::from_utf8_lossy(&restore.stderr);
+    assert!(
+        restore.status.success(),
+        "restore should succeed\nstdout: {restore_stdout}\nstderr: {restore_stderr}"
+    );
+
+    // The file should be back with the correct content
+    assert!(
+        source.is_file(),
+        "restored file should exist at {}",
+        source.display()
+    );
+    let content = std::fs::read_to_string(&source).unwrap();
+    assert_eq!(
+        content, "this is cold storage data for object tier test\n",
+        "restored file should have the original content"
+    );
 }
 
 /// (e) A tier whose recall class is `min` or `hours` refuses inline recall with

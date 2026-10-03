@@ -1557,29 +1557,28 @@ scope); and the format has no streaming-encrypt-from-a-pipe form, which would ne
 trailer and a different header — a want, not a need, until a driver pipes instead of
 reading a file.
 
-**Closed by #141:** the object-store tier driver exists and the sweep now dispatches to
-it end-to-end. An `object` tier in `tiers.toml` (endpoint, bucket, region, credential
-source, encryption key, chunk size) is parsed, and when `just_cache sweep` resolves a
-`--dest` to a tier whose `kind` is `object`, the move goes through the driver: chunked
-upload encrypted through the envelope, read-back verification against the file's BLAKE3
-digest, and the source retired only after that verification succeeds (invariant 2).
-Resumable upload state lives in a catalog row (`resumable_upload` table). A `min`/`hours`
-object tier refuses inline recall with `EAGAIN` and names `just_cache restore <path>`.
-Credentials come from a file path or an environment variable, never argv; the envelope
-encryption key follows the same discipline (64 hex characters, from a file or env var,
-never logged). The HTTP transport hand-rolls `std::net::TcpStream` with `rustls` for
-TLS — `insecure = true` in the tiers.toml enables plain HTTP for loopback testing against
-the in-repo fake S3. Integration tests drive the real binary against a fake S3 endpoint
-over loopback, proving the sweep→upload→verify→retire flow and an interrupted upload
-keeps the source untouched. The `path` field on an object tier remains required and is the
-local scratch directory for downloads and partial upload buffers — an object tier needs a
-staging area with guaranteed free space, and the catalog/watch directory may be on a
-smaller disk.
-**Still open, and named**: restore and recall from object tiers are not yet wired — the
-`restore` and `recall` modules resolve catalog locations to local filesystem paths and
-do not yet download from S3; inline recall for object tiers is not wired into the FUSE
-mount; and a manual run against a real S3 bucket is documented below, since CI cannot
-cover a cloud endpoint deterministically.
+**Closed by #141 (revised):** the object-store tier driver dispatches end-to-end.
+When `just_cache sweep` resolves a `--dest` to an `object` tier, the move uploads
+encrypted chunks through the envelope, verifies the remote copy by download + decrypt
++ hash against the plaintext BLAKE3 digest, records the object-tier location in the
+catalog (tier = configured name, storage_key = S3 object key), and removes the source
+— no symlink is left. An object tier holds no local bytes; a moved name has no local
+representation (the **no-local-representation decision**, §4). The catalog is the
+source of truth: `locate`/`explain`/`audit`/`scrub` find the object through the catalog
+with state `offloaded`. `restore` downloads from an object tier through
+`download_and_verify` (decrypt + hash against the recorded plaintext digest; a download
+whose bytes fail the digest adopts nothing and names the tier). The FUSE mount serves
+the name via recall: download + decrypt through `envelope.rs` + verify. Resumable
+upload state lives in a catalog row (`resumable_upload` table). A `min`/`hours` tier
+refuses inline recall with `EAGAIN` and names `just_cache restore <path>`. Credentials
+and the envelope key come from a file or environment variable, never argv, never in a
+log line or catalog row. `insecure = true` enables plain HTTP for loopback testing.
+The `path` field remains the local scratch directory. E2E tests in
+`tests/object_store_e2e.rs` drive the real binary against a fake S3 endpoint: sweep
+→upload→verify→catalog-record→remove-source, restore downloads and verifies, an
+interrupted upload keeps the source, a checksum mismatch adopts nothing. A manual run
+against a real S3 bucket is documented below since CI cannot cover a cloud endpoint
+deterministically.
 
 ## 10. Non-goals
 

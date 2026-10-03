@@ -2220,6 +2220,46 @@ impl Catalog {
         Ok(true)
     }
 
+    /// Ensure an object row exists, inserting it if it does not.
+    ///
+    /// For the object-store path: a sweep may encounter an object that has not yet been
+    /// ingested by a `catalog sync`. The mover still needs to record the location of the
+    /// copy it just verified — that is the whole point of the catalog — so this inserts
+    /// the object row when it is absent, and is a no-op when it is already there.
+    /// An existing row keeps its state; a new one is written with the given state.
+    pub fn ensure_object(
+        &self,
+        id: &[u8],
+        size: i64,
+        checksum: &[u8],
+        state: &str,
+        created_at: i64,
+    ) -> Result<(), CatalogError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO object (id, size, checksum, created_at, state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, size, checksum, created_at, state],
+        )?;
+        // Also seed the lifecycle row so pin and access queries don't trip over a missing row.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO lifecycle
+                 (object_id, last_access, accesses, pinned_until, rule)
+             VALUES (?1, ?4, 0, NULL, NULL)",
+            params![id, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Update the lifecycle state of an object. Returns false if the object is not in
+    /// the catalog, true if the state was changed (or was already the given value).
+    pub fn set_object_state(&self, id: &[u8], state: &str) -> Result<bool, CatalogError> {
+        let changed = self.conn.execute(
+            "UPDATE object SET state = ?1 WHERE id = ?2",
+            params![state, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Record a copy that an inline recall (issue #44) placed on the hot tier.
     ///
     /// `checksum` is the digest the placed bytes were *read back* to, not the one the
