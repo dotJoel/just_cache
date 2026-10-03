@@ -155,7 +155,7 @@ fn a_rule_moves_on_its_idle_gate_and_explain_records_which_rule_fired() {
     let fx = Fixture::new("moves");
     fx.write_default_tiers();
     fx.write_default_policy(CATCH_ALL);
-    fx.place("shows/old.mkv", b"movie bytes", 90);
+    let old = fx.place("shows/old.mkv", b"movie bytes", 90);
     fx.place("shows/warm.mkv", b"still hot", 5);
 
     // A catalog first, so the sweep has a name to attach the rule to and `explain` can read
@@ -168,6 +168,9 @@ fn a_rule_moves_on_its_idle_gate_and_explain_records_which_rule_fired() {
         .output()
         .expect("catalog sync runs");
     assert_eq!(sync.status.code(), Some(0), "sync: {}", stderr(&sync));
+    // Sync hashes file contents and can update atime on relatime mounts; restore the
+    // test stamp afterwards so the rule's 30-day gate is the variable under test.
+    set_times(&old, days_ago(90));
 
     let output = fx.sweep(&[]);
     assert_eq!(output.status.code(), Some(0), "sweep: {}", stderr(&output));
