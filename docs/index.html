@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>just_cache — local cold storage you can inspect and verify</title>
-<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Cloud and offline tiers are planned, not yet supported.">
+<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Cloud/object tiers are now supported; LAN and offline tiers are next.">
 <style>
   :root {
     --bg: #0b0f14;
@@ -198,7 +198,7 @@
   </p>
   <p>
     The longer-term design extends this catalog and namespace to LAN, cloud-object and offline
-    volume tiers, with recall latency and cost declared per tier. Those providers are not implemented
+    volume tiers, with recall latency and cost declared per tier. The object-store provider (#141) is implemented; LAN and offline are not yet.
     yet — they are the phase in progress (P3). The namespace today is served locally by the symlink tree,
     a FUSE mount and a WebDAV gateway. <a href="design.md">See the design and roadmap.</a>
   </p>
@@ -308,7 +308,7 @@
     use, in the spirit of S3 storage classes. Local tiers are what this repo does today: the mover
     is the hot→cold driver and the symlink namespace provider, and the catalog's namespace is also
     served by a FUSE mount and a WebDAV gateway. The cache overlay and mount-observed use are
-    implemented; LAN, cloud-object and offline tiers are not.
+    implemented; LAN, cloud-object and offline tiers are planned.
     <a href="design.md">The full design sketch is in design.md.</a>
   </p>
 </section>

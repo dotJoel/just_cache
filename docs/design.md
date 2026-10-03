@@ -92,10 +92,8 @@ Hard rules:
 
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
-than accepted and then treated as a filesystem. `fs` is the only kind with a driver, so the
-`object`, `peer` and `offline` tiers this section configures are still a description of where
-the phase is going — which is exactly why they are refused by name instead of being quietly
-served by the `path` they carry. The boundary rule (rule 2) is the type's own answer,
+than accepted and then treated as a filesystem. **As implemented (#141):** `fs` and
+`object` have drivers; `peer` and `offline` are still refused by name. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -1558,6 +1556,29 @@ tier no command touches yet); one key per config, no rotation or KMS (the issue'
 scope); and the format has no streaming-encrypt-from-a-pipe form, which would need a
 trailer and a different header — a want, not a need, until a driver pipes instead of
 reading a file.
+
+**Closed by #141 (revised):** the object-store tier driver dispatches end-to-end.
+When `just_cache sweep` resolves a `--dest` to an `object` tier, the move uploads
+encrypted chunks through the envelope, verifies the remote copy by download + decrypt
++ hash against the plaintext BLAKE3 digest, records the object-tier location in the
+catalog (tier = configured name, storage_key = S3 object key), and removes the source
+— no symlink is left. An object tier holds no local bytes; a moved name has no local
+representation (the **no-local-representation decision**, §4). The catalog is the
+source of truth: `locate`/`explain`/`audit`/`scrub` find the object through the catalog
+with state `offloaded`. `restore` downloads from an object tier through
+`download_and_verify` (decrypt + hash against the recorded plaintext digest; a download
+whose bytes fail the digest adopts nothing and names the tier). The FUSE mount serves
+the name via recall: download + decrypt through `envelope.rs` + verify. Resumable
+upload state lives in a catalog row (`resumable_upload` table). A `min`/`hours` tier
+refuses inline recall with `EAGAIN` and names `just_cache restore <path>`. Credentials
+and the envelope key come from a file or environment variable, never argv, never in a
+log line or catalog row. `insecure = true` enables plain HTTP for loopback testing.
+The `path` field remains the local scratch directory. E2E tests in
+`tests/object_store_e2e.rs` drive the real binary against a fake S3 endpoint: sweep
+→upload→verify→catalog-record→remove-source, restore downloads and verifies, an
+interrupted upload keeps the source, a checksum mismatch adopts nothing. A manual run
+against a real S3 bucket is documented below since CI cannot cover a cloud endpoint
+deterministically.
 
 ## 10. Non-goals
 

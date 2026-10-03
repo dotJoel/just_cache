@@ -251,6 +251,14 @@ pub struct RestoreRequest<'a> {
     /// open-if-present rule (`--catalog` must exist; the default beside the watch root is
     /// used only when it is already there) and never creates one for a restore.
     pub catalog: Option<&'a Catalog>,
+    /// Object-tier configurations, so a file whose only copy is in an object store can
+    /// be downloaded rather than skipped. Empty or absent means the restore falls back to
+    /// filesystem-only behaviour (the no-catalog path).
+    pub object_tier_configs: &'a [crate::object_store::ObjectTierConfig],
+    /// The envelope encryption key for the configured object tier(s). All object tiers
+    /// with this driver share one key per invocation; the key-value never appears in an
+    /// error or a log line.
+    pub encryption_keys: &'a [crate::envelope::Key],
 }
 
 /// Bring the object at `request.path` back from a cold tier.
@@ -382,7 +390,27 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
             .ok_or_else(|| RestoreError::NoColdCopy {
                 path: path.clone(),
                 dests: request.dests.to_vec(),
-            })?;
+            });
+
+            // When locate() returns None but the catalog records an object-tier
+            // location, download the object from the object store instead.
+            let cold = match cold {
+                Ok(cold) => cold,
+                Err(err) => {
+                    // Try object-tier download as a fallback
+                    if let Some(obj_cold) = restore_from_object_tier(
+                        request,
+                        &path,
+                        recorded_locations,
+                        recorded.as_ref(),
+                    )? {
+                        obj_cold
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+
             if request.remove_copy {
                 ensure_removable(&cold, &roots, &path)?;
             }
@@ -549,6 +577,76 @@ fn locate(
     Ok(Some(
         fs::canonicalize(&unique[0]).unwrap_or_else(|_| unique[0].clone()),
     ))
+}
+
+/// Try to restore a file whose only copy is on an object tier: download from the
+/// matching object store, decrypt, verify the plaintext against the recorded digest,
+/// and return the path to the downloaded temporary file.
+///
+/// Returns `Ok(None)` when no object-tier location is found, or when the object-tier
+/// config is not provided.
+fn restore_from_object_tier(
+    request: &RestoreRequest<'_>,
+    hot: &Path,
+    recorded_locations: &[LocationRecord],
+    recorded: Option<&blake3::Hash>,
+) -> Result<Option<PathBuf>, RestoreError> {
+    if request.object_tier_configs.is_empty() || request.encryption_keys.is_empty() {
+        return Ok(None);
+    }
+
+    // Find a catalog-recorded location on an object tier (tier name matches a config).
+    for location in recorded_locations {
+        let config = request
+            .object_tier_configs
+            .iter()
+            .find(|c| c.name == location.tier);
+        let Some(config) = config else {
+            continue;
+        };
+        let key = request.encryption_keys.first();
+        let Some(key) = key else {
+            continue;
+        };
+
+        // Download to the hot file's parent directory as a partial sibling.
+        let parent = hot.parent().unwrap_or_else(|| Path::new("."));
+        let partial = disk_management::partial_sibling(parent);
+
+        // Decode the recorded checksum into a blake3::Hash for verification.
+        let expected = match recorded {
+            Some(hash) => *hash,
+            None => {
+                // Without a recorded digest we cannot verify the download; skip.
+                continue;
+            }
+        };
+
+        crate::object_store::download_and_verify(
+            config,
+            key,
+            &location.storage_key,
+            &expected,
+            &partial,
+        )
+        .map_err(|err| RestoreError::Copy {
+            path: hot.to_path_buf(),
+            from: PathBuf::from(format!("s3://{}/{}", config.bucket, location.storage_key)),
+            error: std::io::Error::other(err.to_string()),
+        })?;
+
+        let _downloaded_meta = std::fs::metadata(&partial).map_err(|error| RestoreError::Stat {
+            path: partial.clone(),
+            error,
+        })?;
+
+        // The downloaded file is already verified (download_and_verify checks the
+        // digest). We return it as the cold copy; the caller will use restore_from()
+        // to move it into place with its own verification step.
+        return Ok(Some(partial));
+    }
+
+    Ok(None)
 }
 
 /// Copy `cold` onto `hot`, verifying before the swap, optionally dropping the cold copy.
@@ -944,6 +1042,8 @@ mod tests {
             dests,
             remove_copy: false,
             catalog: None,
+            object_tier_configs: &[],
+            encryption_keys: &[],
         }
     }
 

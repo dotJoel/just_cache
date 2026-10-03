@@ -996,6 +996,7 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             journal: &mut journal,
             lifecycle: lifecycle.as_ref(),
             dest_tiers: &dest_tiers,
+            tiers: tiers.as_ref(),
         };
         let report = sweep(&mut state, pass);
         // Compaction is what keeps the journal describing only what is still in flight:
@@ -1697,12 +1698,31 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         None => None,
     };
 
+    // Gather object-tier configs and keys so a file offloaded to S3 can be
+    // brought back by downloading through the object-store driver. A tier without
+    // an object config is skipped (it is an FS tier).
+    let object_configs: Vec<just_cache::object_store::ObjectTierConfig> = tiers
+        .as_ref()
+        .map(|set| {
+            set.tiers()
+                .iter()
+                .filter_map(|tier| tier.object_config.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let encryption_keys: Vec<just_cache::envelope::Key> = object_configs
+        .iter()
+        .filter_map(|cfg| cfg.load_encryption_key().ok())
+        .collect();
+
     let request = RestoreRequest {
         path: &args.path,
         watch: &args.watch,
         dests: &args.dest,
         remove_copy: args.remove_copy,
         catalog: catalog.as_ref(),
+        object_tier_configs: &object_configs,
+        encryption_keys: &encryption_keys,
     };
     match restore::restore(&request) {
         Ok(outcome) => {
@@ -2479,6 +2499,8 @@ struct Sweep<'a> {
     lifecycle: Option<&'a Lifecycle<'a>>,
     /// `(tier name, destination root)` pairs, so a rule's `to` tier can be routed to.
     dest_tiers: &'a [(String, PathBuf)],
+    /// The tier configuration, needed to detect when a destination is an object tier.
+    tiers: Option<&'a TierSet>,
 }
 
 fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
@@ -2612,10 +2634,17 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
         report.replication.extend(by_rules.replication);
         pending.clear();
     } else {
-        for dest in dests {
-            // Both sides matter: the guards are live state (a descriptor can open at any
-            // moment), and the room check measures allocated bytes, since the copy
-            // preserves holes and `size` would refuse moves the tier can afford.
+        // Split destinations into FS tiers and object tiers. FS tiers go through the
+        // existing local-copy path; object tiers go through the object-store driver.
+        let (object_dests, fs_dests): (Vec<_>, Vec<_>) = dests.iter().partition(|dest| {
+            state
+                .tiers
+                .and_then(|t| t.tier_for_root(dest))
+                .is_some_and(|t| matches!(t.kind, just_cache::tiers::TierKind::Object))
+        });
+
+        // --- FS destinations: the existing local-disk path ---------------------------
+        for dest in &fs_dests {
             let mut context = file_movement::MoveContext {
                 policy,
                 scope,
@@ -2639,7 +2668,6 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
                 },
             );
 
-            // Whatever this tier took (or would take) is off the table for slower disks.
             let handled: HashSet<PathBuf> = tier.migrated_paths().into_iter().collect();
             let waiting = tier.waiting_for_room();
             pending.retain(|entry| !handled.contains(&entry.path));
@@ -2659,7 +2687,77 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
             }
 
             if policy.dry_run {
-                // Nothing on disk changed, so a second tier would just re-report the plan.
+                break;
+            }
+        }
+
+        // --- Object-tier destinations: upload + verify + retire ----------------------
+        for dest in &object_dests {
+            let Some(full_tier) = state.tiers.and_then(|t| t.tier_for_root(dest)) else {
+                continue;
+            };
+            let Some(tier) = full_tier.object_config.as_ref() else {
+                continue;
+            };
+
+            // Load the envelope encryption key. Errors name the tier and source, never
+            // the key value.
+            let key = match tier.load_encryption_key() {
+                Ok(k) => k,
+                Err(err) => {
+                    eprintln!("just_cache: cannot load encryption key for tier `{}` (object store): {err}", tier.name);
+                    // The sweep can't move to this tier without a key, so drop it but
+                    // keep going — the FS tiers already processed their files.
+                    continue;
+                }
+            };
+
+            // A catalog is required for object-tier movement: the resumable-upload
+            // table lives there, and object ids need a catalog source of truth (§3).
+            let catalog_path = catalog::Catalog::default_path(state.watch);
+            let catalog_opt = if catalog_path.is_file() {
+                Some(catalog_path.as_path())
+            } else {
+                eprintln!(
+                    "just_cache: object-tier sweep for `{}` needs a catalog (the \
+                     resumable-upload table lives there); skipping object-tier destination {} \
+                     — run `catalog sync` first",
+                    tier.name,
+                    dest.display()
+                );
+                continue;
+            };
+
+            // The scratch root for this tier: the `path` is a local staging directory,
+            // stored on the Tier struct (not on ObjectTierConfig).
+            let scratch_root = &full_tier.path;
+
+            let mut context = file_movement::MoveContext {
+                policy,
+                scope,
+                guards: &guards,
+                journal,
+                lifecycle: None,
+                dest_tiers,
+                pins: pins.as_ref(),
+            };
+            let tier_report = file_movement::migrate_to_object(
+                &pending,
+                tracker,
+                &mut context,
+                now,
+                tier,
+                &key,
+                catalog_opt,
+                scratch_root,
+            );
+
+            let handled: HashSet<PathBuf> = tier_report.migrated_paths().into_iter().collect();
+            pending.retain(|entry| !handled.contains(&entry.path));
+            report.records.extend(tier_report.records);
+            report.replication.extend(tier_report.replication);
+
+            if policy.dry_run {
                 break;
             }
         }
