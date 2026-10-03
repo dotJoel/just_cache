@@ -289,6 +289,10 @@ pub enum AccessSource {
     Atime,
     /// No access time was available, so the last-modification time stands in for it.
     MtimeFallback,
+    /// The namespace provider (the FUSE mount) observed the access and wrote it to
+    /// `lifecycle.last_access` (issue #43). For such an object no timestamp on disk is
+    /// consulted at all — atime and its mtime fallback belong to the symlink provider.
+    Provider,
 }
 
 impl AccessSource {
@@ -296,6 +300,7 @@ impl AccessSource {
         match self {
             AccessSource::Atime => "atime",
             AccessSource::MtimeFallback => "mtime-fallback",
+            AccessSource::Provider => "provider",
         }
     }
 }

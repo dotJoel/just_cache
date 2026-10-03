@@ -863,9 +863,10 @@ Still open, and honestly so:
 - **`lifecycle` keeps the rule, but its usage columns are ingest-only.** A sweep that moves a
   path the catalog already names writes the deciding rule to `lifecycle.rule`
   (`Catalog::record_lifecycle_rule`, #41), so the "which rule fired" half is maintained.
-  `last_access` is still filled only at first ingest from atime and `accesses` stays 0;
-  nothing updates them because proper access observation is the namespace provider's job
-  (§4, P2). (`pinned_until` is the exception since #45: `pin`/`unpin` write it, so it is a
+  For an object accessed through the mount, `last_access` and `accesses` are maintained
+  by the provider since #43 (see the `Closed by #43` entry below); for one only ever reached
+  through the symlink provider, `last_access` is still the atime ingested at first sync and
+  `accesses` stays 0, because that provider sees no opens to count. (`pinned_until` is the exception since #45: `pin`/`unpin` write it, so it is a
   maintained column rather than an ingest-only one — see the `Closed by #45` entry below.)
   The `state` column is likewise derived at sync from whether a hot and a cold copy
   both exist, not written by `restore`: a completed restore only becomes `present` after the
@@ -1342,6 +1343,38 @@ loopback or behind a TLS terminator; there is no S3 API, only WebDAV; and `O_NOA
 best-effort — a file the gateway user does not own is read with a plain open, which can
 update atime and so the mover's usage signal.
 
+Closed by #43: the FUSE provider observes access and maintains `lifecycle`. Every open
+through the mount adds one to `lifecycle.accesses` and stamps `lifecycle.last_access`; a read
+or a close refreshes the stamp without counting (`read` calls track a consumer's buffer size,
+not its use, so an access is an open). The bookkeeping lives in `src/observe.rs`
+(`AccessLog`), buffered in memory and written in one transaction per flush by
+`Catalog::record_observed_accesses`, which moves `last_access` only forward (`MAX`) and writes
+nothing but `last_access`, `accesses` and a new `lifecycle.observed` flag — an access is an
+observation, never a transition, so `rule` and `pinned_until` are untouched. The flag
+(`ALTER TABLE` on open for an older catalog, default 0) is what lets every reader tell a
+provider-observed stamp from an ingested atime. **No path consults atime for an observed
+object**: a sweep judges it by `lifecycle.last_access` (read once per sweep beside the pins),
+and the atime→mtime fallback survives only for objects never accessed through the mount —
+the symlink provider's view. `explain` shows the source as `via provider` and the catalog
+note says the count was observed by the mount provider (counted opens, not a timestamp);
+the noatime caveat is not printed for such a stamp. **The loss bound, named**: a flush
+happens on every close, on any open or read at least `FLUSH_INTERVAL` (5 s) after the last
+flush, and at unmount, so a `SIGKILL`ed daemon loses at most the observations since the last
+flush — opens and reads of files still open at the kill, plus at most 5 s of activity on
+files never closed; a completed access (its close reached the daemon) is never lost, and a
+failed flush keeps its batch for the next one. **Write-invalidate**: a write or rename
+through the mount writes no `lifecycle` column and is not a transition; the overlay copy is
+dropped at the `open`-for-write/`setattr`/`rename` call sites #46 added (§2.1), and a read
+served from an overlay copy is observed exactly like one served from home. Tests: `tests/access_observation.rs`
+drives `AccessLog` against a real catalog with no mount — an access updates the row, a second
+increments it, a late flush never makes an object colder, an unflushed observation is not in
+the catalog (the bound), an unsynced name writes nothing — and proves atime is not read by
+contradiction: a file stamped 400 days idle stays put after one observed access while a
+control with the same atime moves, and `explain` names `provider`; the test was shown to fail
+with the sweep's provider-stamp lookup removed. That the FUSE handlers call the log is
+asserted only in the `JUST_CACHE_TEST_FUSE=1` mount test, which CI does not run. What to *do*
+with an observed access is the policy engine's (§5), not this change's.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
@@ -1453,11 +1486,11 @@ update atime and so the mover's usage signal.
   afterwards) but a name whose bytes are on a cold tier answers `EROFS`, because renaming the
   cold copy would leave a name the mount cannot serve and no catalog row to update. **Deletion
   is not implemented**: `unlink`/`rmdir` answer `EROFS` — deletion is a catalog transition with
-  reference counting across names and copies (§3), and is a separate issue. And **access
-  observation and recall are not here**: every open/read/close does not update `lifecycle`,
-  and a read of an offloaded object does not pull it one tier up — those are the two issues
-  after this one (§4, the issue's out-of-scope), and the mount is only the lookup/list/stat/
-  read/write/rename over copies that are present.
+  reference counting across names and copies (§3), and is a separate issue. And **recall is
+  not here**: a read of an offloaded object does not pull it one tier up (§4), so the mount is
+  the lookup/list/stat/read/write/rename over copies that are present. (Access observation,
+  once listed here, landed with #43: the mount writes `lifecycle.last_access`/`accesses`,
+  and nothing else.)
 - **The mount's FUSE surface is deliberately incomplete, and the catalog is indexed once.**
   `just_cache mount` (#42) implements the operations a read/write workload needs and refuses
   the rest rather than answering them wrongly: `statfs` is the FUSE default, so `df`/`statvfs`

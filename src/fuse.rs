@@ -56,7 +56,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
@@ -68,6 +68,7 @@ use rustix::fs::OFlags;
 use crate::cache::Overlay;
 use crate::catalog::{Catalog, CatalogError};
 use crate::namespace::{Entry, Namespace, NamespaceError};
+use crate::observe::AccessLog;
 
 /// One second: names come from a catalog the mount does not watch, so a fresh lookup
 /// is cheap and a cached one must not outlive a `catalog sync` by long.
@@ -264,8 +265,12 @@ struct MountFs {
     hot_owner: (u32, u32),
     /// Inode <-> path, allocated on demand.
     inodes: Mutex<Inodes>,
-    /// Open file handles, keyed by the handle returned from `open`/`create`.
-    handles: Mutex<HashMap<u64, File>>,
+    /// Open file handles, keyed by the handle returned from `open`/`create`, with the
+    /// namespace path each was opened as so a read or close can be attributed to it.
+    handles: Mutex<HashMap<u64, (File, String)>>,
+    /// Accesses observed but not yet written to `lifecycle` (issue #43). Lock order is
+    /// `access_log` then `catalog`, never the reverse.
+    access_log: Mutex<AccessLog>,
     next_handle: AtomicU64,
     /// Cache overlays (§2.1). Reads may be served from a copy here; writes always land on
     /// the home and drop the copy first (write-invalidate).
@@ -284,6 +289,7 @@ impl MountFs {
             hot_owner,
             inodes: Mutex::new(Inodes::new()),
             handles: Mutex::new(HashMap::new()),
+            access_log: Mutex::new(AccessLog::new()),
             next_handle: AtomicU64::new(1),
             overlays: Mutex::new(Vec::new()),
         }
@@ -297,10 +303,41 @@ impl MountFs {
         self.inodes.lock().unwrap().inode(path)
     }
 
-    fn add_handle(&self, file: File) -> u64 {
+    fn add_handle(&self, file: File, path: &str) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.handles.lock().unwrap().insert(handle, file);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(handle, (file, path.to_string()));
         handle
+    }
+
+    /// Record one provider-observed event and flush when the bound says to (see
+    /// [`crate::observe`]). `opened` adds an access; a read or close only refreshes the
+    /// stamp. A failed flush is reported and the batch kept: observation must never turn
+    /// into a failed read for the consumer.
+    fn observe(&self, path: &str, opened: bool, force_flush: bool) {
+        let mut log = self.access_log.lock().unwrap();
+        let now = SystemTime::now();
+        if opened {
+            log.opened(path, now);
+        } else {
+            log.touched(path, now);
+        }
+        if force_flush || log.due(Instant::now()) {
+            self.flush_observations(&mut log);
+        }
+    }
+
+    fn flush_observations(&self, log: &mut AccessLog) {
+        let mut catalog = self.catalog.lock().unwrap();
+        if let Err(err) = log.flush(&mut catalog) {
+            eprintln!(
+                "just_cache: could not record {} observed access(es) in the catalog: {err}; \
+                 kept for the next flush",
+                log.pending()
+            );
+        }
     }
 
     /// Join a parent namespace path and a child name.
@@ -702,7 +739,8 @@ impl Filesystem for MountFs {
         };
         match options.open(&bytes) {
             Ok(file) => {
-                let handle = self.add_handle(file);
+                let handle = self.add_handle(file, &path);
+                self.observe(&path, true, false);
                 reply.opened(FileHandle(handle), FopenFlags::empty());
             }
             Err(_) => reply.error(Errno::EIO),
@@ -720,15 +758,22 @@ impl Filesystem for MountFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let handles = self.handles.lock().unwrap();
-        let Some(file) = handles.get(&u64::from(fh)) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        let mut buffer = vec![0u8; size as usize];
-        match file.read_at(&mut buffer, offset) {
-            Ok(read) => {
+        let (result, path) = {
+            let handles = self.handles.lock().unwrap();
+            let Some((file, path)) = handles.get(&u64::from(fh)) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let mut buffer = vec![0u8; size as usize];
+            let result = file.read_at(&mut buffer, offset).map(|read| {
                 buffer.truncate(read);
+                buffer
+            });
+            (result, path.clone())
+        };
+        match result {
+            Ok(buffer) => {
+                self.observe(&path, false, false);
                 reply.data(&buffer);
             }
             Err(_) => reply.error(Errno::EIO),
@@ -748,10 +793,14 @@ impl Filesystem for MountFs {
         reply: ReplyWrite,
     ) {
         let handles = self.handles.lock().unwrap();
-        let Some(file) = handles.get(&u64::from(fh)) else {
+        let Some((file, _)) = handles.get(&u64::from(fh)) else {
             reply.error(Errno::EBADF);
             return;
         };
+        // The write itself adds nothing to `lifecycle` (its open was already counted as a
+        // use) and is never a transition. Any cache copy was already dropped when the
+        // handle was opened for writing (write-invalidate, §2.1), so this call has nothing
+        // further to invalidate.
         match file.write_at(data, offset) {
             Ok(written) => reply.written(written as u32),
             Err(_) => reply.error(Errno::EIO),
@@ -781,7 +830,7 @@ impl Filesystem for MountFs {
         reply: ReplyEmpty,
     ) {
         let handles = self.handles.lock().unwrap();
-        let Some(file) = handles.get(&u64::from(fh)) else {
+        let Some((file, _)) = handles.get(&u64::from(fh)) else {
             reply.error(Errno::EBADF);
             return;
         };
@@ -801,8 +850,22 @@ impl Filesystem for MountFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.lock().unwrap().remove(&u64::from(fh));
+        let released = self.handles.lock().unwrap().remove(&u64::from(fh));
+        // A close completes the access, so it is flushed now: a daemon killed after this
+        // point loses nothing about this open (the bound in `crate::observe`).
+        if let Some((_, path)) = released {
+            self.observe(&path, false, true);
+        }
         reply.ok();
+    }
+
+    fn destroy(&mut self) {
+        // Unmount: whatever is still buffered (files open at unmount) is written now.
+        let log = self.access_log.get_mut().unwrap();
+        let mut catalog = self.catalog.lock().unwrap();
+        if let Err(err) = log.flush(&mut catalog) {
+            eprintln!("just_cache: observed accesses lost at unmount: {err}");
+        }
     }
 
     fn create(
@@ -852,7 +915,7 @@ impl Filesystem for MountFs {
                         return;
                     }
                 };
-                let handle = self.add_handle(file);
+                let handle = self.add_handle(file, &path);
                 reply.created(
                     &TTL,
                     &attr,

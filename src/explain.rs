@@ -977,6 +977,9 @@ pub struct CatalogAnswer {
     pub rule: Option<String>,
     /// `lifecycle.accesses`: the observed counter since ingest.
     pub accesses: u64,
+    /// True when the namespace provider wrote `last_access`/`accesses` (`lifecycle.observed`,
+    /// issue #43): the numbers are counted opens, not a timestamp read off the file.
+    pub access_observed: bool,
     /// `lifecycle.pinned_until` (unix seconds): a pin wins over the idle rule.
     pub pinned_until: Option<u64>,
 }
@@ -1023,6 +1026,7 @@ fn catalog_answer(context: &ExplainContext<'_>) -> Option<CatalogAnswer> {
         storage_key: primary.map(|location| PathBuf::from(&location.storage_key)),
         rule: record.rule.clone(),
         accesses: record.accesses.unwrap_or(0),
+        access_observed: record.access_observed,
         pinned_until: record.pinned_until.map(|until| until.max(0) as u64),
     })
 }
@@ -1178,15 +1182,30 @@ pub fn explain_with(context: &ExplainContext<'_>, catalog: Option<&CatalogAnswer
 
     // ---- 3. policy ---------------------------------------------------------------
     let now = SystemTime::now();
-    let last_access = context.tracker.last_access(path, entry.last_access);
+    // An object the mount observed is judged by the provider's stamp, exactly as the
+    // sweep judges it (`file_movement::last_use`): atime is not consulted for it, and the
+    // report says so by naming `provider` as the source (issue #43).
+    let observed = catalog.filter(|answer| answer.access_observed);
+    let (last_access, access_source) = match observed {
+        Some(answer) => (
+            std::time::UNIX_EPOCH + Duration::from_secs(answer.last_access),
+            AccessSource::Provider,
+        ),
+        None => (
+            context.tracker.last_access(path, entry.last_access),
+            access_source,
+        ),
+    };
     let idle = now.duration_since(last_access).unwrap_or(Duration::ZERO);
     let observed_accesses = context.tracker.observed_accesses(path);
     let pinned = context.policy.observed_access_pin > 0
         && observed_accesses >= context.policy.observed_access_pin;
-    let atime_matches_mtime = matches!(
-        (metadata.accessed(), metadata.modified()),
-        (Ok(accessed), Ok(modified)) if accessed == modified
-    );
+    // The noatime caveat is about a timestamp; a provider-observed stamp is not one.
+    let atime_matches_mtime = observed.is_none()
+        && matches!(
+            (metadata.accessed(), metadata.modified()),
+            (Ok(accessed), Ok(modified)) if accessed == modified
+        );
     let policy = PolicyReport {
         evaluated: true,
         skipped_reason: None,
@@ -1496,9 +1515,14 @@ fn catalog_report(
         consulted: true,
         source: "catalog",
         note: format!(
-            "catalog state {:?}, {} observed access(es){}; {}",
+            "catalog state {:?}, {} access(es) {}{}; {}",
             answer.state,
             answer.accesses,
+            if answer.access_observed {
+                "observed by the mount provider (counted opens, not a timestamp)"
+            } else {
+                "observed (none through the mount; last use is the ingested atime)"
+            },
             pin_note,
             answer
                 .rule
@@ -2085,6 +2109,7 @@ mod tests {
             storage_key: None,
             rule: Some("intelligent-tiering".to_string()),
             accesses: 3,
+            access_observed: false,
             pinned_until: None,
         };
         let explanation = explain_with(

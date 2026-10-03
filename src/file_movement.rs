@@ -293,6 +293,23 @@ fn live_pin(pins: Option<&Pins>, relative: &Path, now: SystemTime) -> Option<i64
     (until > unix_seconds(now)).then_some(until)
 }
 
+/// The last-use stamp a sweep judges `entry` by.
+///
+/// An object the namespace provider observed (issue #43) is judged by
+/// `lifecycle.last_access` alone: the mount saw every open, read and close, so its stamp
+/// is the truth and the file's atime — which a `noatime` mount never advances, and which
+/// the mount's own reads of the backing file would disturb — is not consulted. Only an
+/// object never accessed through the provider falls back to the walk's atime→mtime stamp,
+/// which is the symlink provider's view of usage.
+fn last_use(entry: &FileEntry, tracker: &UsageTracker, pins: Option<&Pins>) -> SystemTime {
+    if let Some(seconds) =
+        pins.and_then(|pins| pins.observed_access(&entry.relative.to_string_lossy()))
+    {
+        return std::time::UNIX_EPOCH + Duration::from_secs(seconds.max(0) as u64);
+    }
+    tracker.last_access(&entry.path, entry.last_access)
+}
+
 /// One file a sweep chose, with the lifecycle rule that chose it when one did.
 ///
 /// A candidate carries its target tier name because a rule decides *which* disk a file
@@ -367,7 +384,7 @@ pub fn select_candidates<'a>(
             continue;
         }
 
-        let last_access = tracker.last_access(&entry.path, entry.last_access);
+        let last_access = last_use(entry, tracker, context.pins);
         let idle = now.duration_since(last_access).unwrap_or(Duration::ZERO);
 
         // The pin is checked first: a file that was read while we were watching is
@@ -453,7 +470,7 @@ fn select_by_rules<'a>(
             continue;
         }
 
-        let last_access = tracker.last_access(&entry.path, entry.last_access);
+        let last_access = last_use(entry, tracker, context.pins);
         let idle = now.duration_since(last_access).unwrap_or(Duration::ZERO);
         let current_tier = lifecycle.current_tier(&entry.path);
         match lifecycle.evaluate_down(&entry.relative, current_tier, idle) {
