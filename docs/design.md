@@ -85,6 +85,15 @@ Hard rules:
 3. **Recall latency is honest.** A parked pool is not "fast when idle"; it is `recall =
    s`, and recall-aware consumers get that answer before the read is attempted.
 
+**As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
+above are recognised, and a kind no transport driver serves is refused with its line rather
+than accepted and then treated as a filesystem. `fs` is the only kind with a driver, so the
+`object`, `peer` and `offline` tiers this section configures are still a description of where
+the phase is going — which is exactly why they are refused by name instead of being quietly
+served by the `path` they carry. The boundary rule (rule 2) is the type's own answer,
+`TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
+host, `offline` because the volume does.
+
 ### 2.1 Cache overlays: RAM is a promotion target, not a tier
 
 Decided in review: **RAM acts as a fast read cache in front of a durable tier, never as
@@ -1489,7 +1498,28 @@ not run; and the "read back again disagrees" branch of `Recaller` has no determi
 (`restore` already refused a mismatch), so `record_recall` is tested directly with a wrong
 and a missing digest (row unverified, not primary, object `offloaded`) rather than through
 the recaller. Writes to an offloaded
-name still go through to the cold copy in place; recall is read-only opens.
+name still goes through to the cold copy in place; recall is read-only opens.
+
+Closed by #146: a tier's `kind` is no longer free text that nothing reads. It is a
+`TierKind` — the four kinds §2 names — and the parse refuses a kind no transport driver
+serves, naming the tier, the kind and the line, instead of accepting it and then serving the
+tier as an ordinary local directory. That was the real gap: `kind = "object"` with a `path`
+parsed, and every path that read it treated the tier as `fs`, so a mover pointed at such a
+root would have written a file to a destination it had not understood (invariant 3 — refuse
+what you do not fully understand). The type also answers, once, the two questions the P3
+drivers need answered in the same place: `is_served()` (only `Fs` today, and the single line
+a driver flips) and `crosses_machine_boundary()` (§2 rule 2 — `object` and `peer` because the
+bytes leave the host, `offline` because the volume itself does, so the envelope is the
+export path's requirement too). No trait, no new flag, no new dependency, and no behaviour
+change for `fs`: the existing suite plus the binary against two real filesystems is the
+evidence. The transport trait itself is deliberately absent — it arrives with the first
+driver that needs it (the object store), where there are two implementations to reconcile
+rather than one abstraction and no second caller. **Still open, and named**: the kind check
+now runs before the volatility check, so a tier that is both `volatile` and of a kind nothing
+serves is refused for the kind (`fs` is the only kind a volatile tier can be written with),
+and a `[[cache]]` overlay's own `kind` is still validated by the cache parser with its own
+message (`only fs exists`) rather than through `TierKind` — the two paths to "a kind nothing
+serves" do not share one message yet.
 
 ## 10. Non-goals
 

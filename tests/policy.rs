@@ -343,7 +343,10 @@ fn a_volatile_tier_is_refused_as_a_rule_target() {
     fs::write(
         fx.watch.join("tiers.toml"),
         format!(
-            "{}[tiers.ram]\nkind = \"ram\"\npath = \"{}\"\nvolatility = \"volatile\"\nrecall = \"ms\"\ncopies = 1\n",
+            // `kind = "fs"` deliberately: the point of this fixture is the volatility, and
+            // since #146 a `kind` nothing serves is refused before anything reads the
+            // volatility — so a bogus kind here would test a different refusal.
+            "{}[tiers.ram]\nkind = \"fs\"\npath = \"{}\"\nvolatility = \"volatile\"\nrecall = \"ms\"\ncopies = 1\n",
             fx.tiers(),
             fx.cold.display()
         ),
