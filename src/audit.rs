@@ -1,7 +1,17 @@
 //! Audit: name every structural inconsistency in a tree, read-only unless `--repair`.
 //!
-//! Two modes, chosen by whether a catalog exists (`--catalog <FILE>`, or the default
-//! `.just_cache-catalog.sqlite` beside the watch root):
+//! Three modes. Two are chosen by whether a catalog exists (`--catalog <FILE>`, or the
+//! default `.just_cache-catalog.sqlite` beside the watch root); the third, catalog-only, is
+//! asked for outright (`--no-filesystem`):
+//!
+//! * **Catalog-only mode** (issue #51). The watched tree and every tier are not touched —
+//!   no walk, no stat, no hash — so the answer is whatever the recorded rows say and
+//!   nothing else. It reports the recorded state (object/name/location counts), a floor an
+//!   object's recorded locations fall below, damage marks a scrub left, malformed rows and
+//!   the scrub-state summary, and it says out loud which findings it cannot make without a
+//!   tree (`missing-copy`, `unknown-path`, a checksum of record, and the rest of
+//!   [`VerdictKind::filesystem_only`]). This is the mode for a catalog whose tier is not
+//!   mounted: it answers "what does the catalog say" without pretending to have looked.
 //!
 //! * **Catalog mode** (issue #19). The catalog is the arbiter, so the audit reads it and
 //!   makes a *single* filesystem pass over the primary copies instead of walking both
@@ -141,6 +151,14 @@ pub enum VerdictKind {
     ChecksumMismatch,
     /// Catalog mode: an object has fewer than [`COPY_FLOOR`] surviving copies.
     CopyFloor,
+    /// Catalog-only mode: an object's *recorded* locations number fewer than the floor
+    /// recorded for its tier. Nothing was stat'ed, so this is a claim about the rows, not
+    /// about bytes: a copy may have been deleted under the catalog and the row still
+    /// counts here — that is exactly what the mode cannot see.
+    UnderReplicated,
+    /// Catalog-only mode: a location a scrub marked damaged (no good copy existed to repair
+    /// from). The mark is recorded state; whether the bytes are still there is not checked.
+    DamagedCopy,
     /// Catalog mode: a symlink resolves to a file the catalog has no location for — a
     /// version the catalog does not have.
     UnknownVersion,
@@ -166,6 +184,8 @@ impl VerdictKind {
             VerdictKind::MissingCopy => "missing-copy",
             VerdictKind::ChecksumMismatch => "checksum-mismatch",
             VerdictKind::CopyFloor => "copy-floor",
+            VerdictKind::UnderReplicated => "under-replicated",
+            VerdictKind::DamagedCopy => "damaged-copy",
             VerdictKind::UnknownVersion => "unknown-version",
             VerdictKind::UnknownPath => "unknown-path",
             VerdictKind::MalformedCatalog => "malformed-catalog",
@@ -176,7 +196,54 @@ impl VerdictKind {
     ///
     /// Every problem kind is listed, in both modes, so a cron job's counts do not change
     /// shape when the catalog appears — the catalog-only kinds simply read `0` in walk mode.
-    pub fn problems() -> [VerdictKind; 12] {
+    pub fn problems() -> [VerdictKind; 14] {
+        [
+            VerdictKind::MissingCopy,
+            VerdictKind::ChecksumMismatch,
+            VerdictKind::CopyFloor,
+            VerdictKind::UnderReplicated,
+            VerdictKind::DamagedCopy,
+            VerdictKind::NameVanished,
+            VerdictKind::UnknownVersion,
+            VerdictKind::UnknownPath,
+            VerdictKind::MalformedCatalog,
+            VerdictKind::OrphanedCopy,
+            VerdictKind::DanglingSymlink,
+            VerdictKind::UnexpectedTarget,
+            VerdictKind::Duplicate,
+            VerdictKind::ReplicaLost,
+        ]
+    }
+
+    /// Every kind, so a test can prove the partition below is exhaustive rather than
+    /// trusting a hand-maintained list.
+    pub const ALL: [VerdictKind; 15] = [
+        VerdictKind::Healthy,
+        VerdictKind::OrphanedCopy,
+        VerdictKind::DanglingSymlink,
+        VerdictKind::UnexpectedTarget,
+        VerdictKind::Duplicate,
+        VerdictKind::ReplicaLost,
+        VerdictKind::NameVanished,
+        VerdictKind::MissingCopy,
+        VerdictKind::ChecksumMismatch,
+        VerdictKind::CopyFloor,
+        VerdictKind::UnderReplicated,
+        VerdictKind::DamagedCopy,
+        VerdictKind::UnknownVersion,
+        VerdictKind::UnknownPath,
+        VerdictKind::MalformedCatalog,
+    ];
+
+    /// The kinds a catalog-only audit (`--no-filesystem`) cannot make, because every one of
+    /// them needs the tree: a location row may lie about a file that was deleted, only a
+    /// `stat` sees that; a checksum needs the bytes read; a name/path disagreement needs
+    /// the namespace walked. The complement — [`Healthy`](VerdictKind::Healthy),
+    /// `under-replicated`, `damaged-copy` and `malformed-catalog` — is everything the mode
+    /// can honestly report. Kept as a function of the enum (with [`ALL`](VerdictKind::ALL)
+    /// to check the partition) so the "cannot see the filesystem" set is exactly this list,
+    /// not prose that can drift from the code.
+    pub fn filesystem_only() -> [VerdictKind; 11] {
         [
             VerdictKind::MissingCopy,
             VerdictKind::ChecksumMismatch,
@@ -184,7 +251,6 @@ impl VerdictKind {
             VerdictKind::NameVanished,
             VerdictKind::UnknownVersion,
             VerdictKind::UnknownPath,
-            VerdictKind::MalformedCatalog,
             VerdictKind::OrphanedCopy,
             VerdictKind::DanglingSymlink,
             VerdictKind::UnexpectedTarget,
@@ -242,6 +308,19 @@ pub enum Verdict {
         object: String,
         copies: usize,
     },
+    /// Catalog-only mode: an object's recorded locations number fewer than the floor
+    /// recorded for its primary tier. `copies` counts rows, not bytes.
+    UnderReplicated {
+        object: String,
+        copies: usize,
+        floor: usize,
+    },
+    /// Catalog-only mode: a location a scrub marked damaged.
+    DamagedCopy {
+        tier: String,
+        key: String,
+        object: String,
+    },
     /// Catalog mode: a symlink resolves to something the catalog does not hold as a
     /// location of the object the name points at.
     UnknownVersion {
@@ -276,6 +355,8 @@ impl Verdict {
             Verdict::MissingCopy { .. } => VerdictKind::MissingCopy,
             Verdict::ChecksumMismatch { .. } => VerdictKind::ChecksumMismatch,
             Verdict::CopyFloor { .. } => VerdictKind::CopyFloor,
+            Verdict::UnderReplicated { .. } => VerdictKind::UnderReplicated,
+            Verdict::DamagedCopy { .. } => VerdictKind::DamagedCopy,
             Verdict::UnknownVersion { .. } => VerdictKind::UnknownVersion,
             Verdict::UnknownPath => VerdictKind::UnknownPath,
             Verdict::MalformedCatalog { .. } => VerdictKind::MalformedCatalog,
@@ -347,6 +428,23 @@ impl Finding {
                     " (object {object} has {copies} surviving copy/copies, floor is {COPY_FLOOR})"
                 ));
             }
+            Verdict::UnderReplicated {
+                object,
+                copies,
+                floor,
+            } => {
+                line.push_str(&format!(
+                    " (object {object} records {copies} location(s), the recorded floor is \
+                     {floor}; no copy was checked, so only the rows are known)"
+                ));
+            }
+            Verdict::DamagedCopy { tier, key, object } => {
+                line.push_str(&format!(
+                    " (location {} on {tier} is marked damaged for object {object}; the mark is \
+                     recorded state, the bytes were not read)",
+                    key
+                ));
+            }
             Verdict::ReplicaLost { present, missing } => {
                 let list = |paths: &[PathBuf]| {
                     paths
@@ -391,6 +489,10 @@ pub enum AuditSource {
     Walk,
     /// Answered from the catalog at this path, plus one pass over the watched tree.
     Catalog { path: PathBuf },
+    /// Answered from the catalog rows alone (issue #51): the watched tree and every tier
+    /// were not walked, stat'ed, or hashed. The report names the findings it could not make
+    /// in [`CatalogOnlySection::unchecked`].
+    CatalogOnly { path: PathBuf },
 }
 
 impl AuditSource {
@@ -398,7 +500,67 @@ impl AuditSource {
         match self {
             AuditSource::Walk => "walk",
             AuditSource::Catalog { .. } => "catalog",
+            AuditSource::CatalogOnly { .. } => "catalog-only",
         }
+    }
+
+    /// The catalog file behind the answer, when a catalog answered.
+    pub fn catalog_path(&self) -> Option<&Path> {
+        match self {
+            AuditSource::Walk => None,
+            AuditSource::Catalog { path } | AuditSource::CatalogOnly { path } => Some(path),
+        }
+    }
+}
+
+/// What a catalog-only audit can report but cannot check: the recorded counts, the tier
+/// floors, the damage marks a scrub left, and the scrub-state summary — plus the explicit
+/// list of findings it could not make, so a reader never mistakes a `0` in the counts block
+/// for "checked and clean".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogOnlySection {
+    /// Objects the catalog records.
+    pub objects: usize,
+    /// Namespace paths the catalog records.
+    pub names: usize,
+    /// Location rows the catalog records.
+    pub locations: usize,
+    /// The recorded per-tier copy floor, `(tier, copies)`, in tier order.
+    pub floors: Vec<(String, usize)>,
+    /// Locations a scrub marked damaged.
+    pub damaged: usize,
+    /// The same scrub-state summary (`verified`/`never-scrubbed`/`damaged`) `audit` prints
+    /// for a catalog-mode run.
+    pub scrub: crate::catalog::ScrubSummary,
+    /// The finding kinds this audit could not make, because each needs the tree.
+    pub unchecked: Vec<VerdictKind>,
+}
+
+impl CatalogOnlySection {
+    /// The recorded state a catalog-only audit could report, one line per fact. The report
+    /// adds the findings it could not make after these; deliberately this says what was
+    /// *not* checked, because the whole point of this mode is that a reader must not read
+    /// its silence as health.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let floors = if self.floors.is_empty() {
+            "none recorded".to_string()
+        } else {
+            self.floors
+                .iter()
+                .map(|(tier, copies)| format!("{tier}={copies}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines = vec![
+            format!(
+                "  recorded state: {} object(s), {} name(s), {} location(s)",
+                self.objects, self.names, self.locations
+            ),
+            format!("  recorded floors: {floors}"),
+            format!("  damage marks: {}", self.damaged),
+        ];
+        lines.extend(self.scrub.summary_lines());
+        lines
     }
 }
 
@@ -464,6 +626,10 @@ pub struct AuditReport {
     /// Scrub-state counts from the catalog that answered, or `None` for a walk-based audit
     /// (and for a catalog-mode run whose summary could not be read). See [`ScrubSection`].
     pub scrub: Option<ScrubSection>,
+    /// Present only for a catalog-only audit (`--no-filesystem`): the recorded state it
+    /// could report and the findings it could not make. `None` for every filesystem-backed
+    /// mode, which checked the tree itself.
+    pub catalog_only: Option<CatalogOnlySection>,
 }
 
 impl AuditReport {
@@ -496,6 +662,10 @@ impl AuditReport {
     /// The readable summary: which source answered, counts for every class, then the first
     /// `examples` findings so a human gets the shape of the problem without the full dump
     /// (use `--json` for everything).
+    ///
+    /// A catalog-only audit prints only the classes it could actually check; the classes it
+    /// could not are listed as such rather than shown as `0`, because a `0` for
+    /// `missing-copy` would read as "checked and none missing" when nothing was stat'ed.
     pub fn summary_lines(&self, examples: usize) -> Vec<String> {
         let answered_from = match &self.source {
             AuditSource::Walk => format!(
@@ -511,8 +681,15 @@ impl AuditReport {
                 self.dests.len(),
                 path.display()
             ),
+            AuditSource::CatalogOnly { path } => format!(
+                "answered from catalog {} with no filesystem access (--no-filesystem)",
+                path.display()
+            ),
         };
         let mut lines = vec![format!("audit: {answered_from}")];
+        if let Some(section) = &self.catalog_only {
+            lines.extend(section.summary_lines());
+        }
         lines.push(format!("  healthy: {}", self.healthy));
         // Configured tiers are named once, up front, so a finding below can refer to a
         // tier by name and the reader has the key to what that name means.
@@ -521,8 +698,26 @@ impl AuditReport {
                 lines.extend(tiers.summary_lines());
             }
         }
-        for kind in VerdictKind::problems() {
+        // Only the kinds this source could check are counted. Walk and catalog modes check
+        // the tree, so they count every problem kind as before; a catalog-only audit counts
+        // the three it can derive from rows and names the rest as unchecked.
+        let counted: Vec<VerdictKind> = match &self.source {
+            AuditSource::CatalogOnly { .. } => vec![
+                VerdictKind::UnderReplicated,
+                VerdictKind::DamagedCopy,
+                VerdictKind::MalformedCatalog,
+            ],
+            _ => VerdictKind::problems().to_vec(),
+        };
+        for kind in counted {
             lines.push(format!("  {}: {}", kind.as_str(), self.count(kind)));
+        }
+        if let Some(section) = &self.catalog_only {
+            let names: Vec<&str> = section.unchecked.iter().map(|kind| kind.as_str()).collect();
+            lines.push(format!(
+                "  cannot be checked without the tree: {}",
+                names.join(", ")
+            ));
         }
         if self.findings.is_empty() {
             lines.push("no structural inconsistency found".to_string());
@@ -636,7 +831,9 @@ impl AuditReport {
         };
 
         let catalog_json = match &self.source {
-            AuditSource::Catalog { path } => json_string(&path.to_string_lossy()),
+            AuditSource::Catalog { path } | AuditSource::CatalogOnly { path } => {
+                json_string(&path.to_string_lossy())
+            }
             AuditSource::Walk => "null".to_string(),
         };
 
@@ -646,6 +843,43 @@ impl AuditReport {
         let scrub_json = match &self.scrub {
             None => "null".to_string(),
             Some(scrub) => scrub.json(),
+        };
+
+        // What a catalog-only audit could report and could not check. `null` for any audit
+        // that had filesystem access, so a consumer can tell "0 findings" from "0 checked":
+        // the `unchecked` list names the finding kinds this run never attempted. It carries
+        // its own recorded scrub summary, separate from the top-level `scrub` object that
+        // names the catalog's scrub state for every mode.
+        let no_filesystem_json = match &self.catalog_only {
+            None => "null".to_string(),
+            Some(section) => {
+                let floors: Vec<String> = section
+                    .floors
+                    .iter()
+                    .map(|(tier, copies)| {
+                        format!("{{\"tier\":{},\"copies\":{copies}}}", json_string(tier))
+                    })
+                    .collect();
+                let unchecked: Vec<String> = section
+                    .unchecked
+                    .iter()
+                    .map(|kind| json_string(kind.as_str()))
+                    .collect();
+                let scrub = section.scrub;
+                format!(
+                    "{{\"objects\":{},\"names\":{},\"locations\":{},\"damaged\":{},\"floors\":[{}],\"scrub\":{{\"locations\":{},\"verified\":{},\"never-scrubbed\":{},\"damaged\":{}}},\"unchecked\":[{}]}}",
+                    section.objects,
+                    section.names,
+                    section.locations,
+                    section.damaged,
+                    floors.join(","),
+                    scrub.locations,
+                    scrub.verified,
+                    scrub.never_scrubbed,
+                    scrub.damaged,
+                    unchecked.join(",")
+                )
+            }
         };
 
         // The configured tiers, as a machine-readable list. `null` when none was given,
@@ -678,7 +912,7 @@ impl AuditReport {
         };
 
         format!(
-            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"tiers\":{},\"scanned\":{},\"healthy\":{},\"scrub\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{}}}",
+            "{{\"watch\":{},\"dest\":[{}],\"source\":{},\"catalog\":{},\"tiers\":{},\"scanned\":{},\"healthy\":{},\"scrub\":{},\"findings\":[{}],\"counts\":{{{}}},\"repair\":{},\"no-filesystem\":{}}}",
             json_string(&self.watch.to_string_lossy()),
             dest_json.join(","),
             json_string(self.source.as_str()),
@@ -689,7 +923,8 @@ impl AuditReport {
             scrub_json,
             findings.join(","),
             counts.join(","),
-            repair_json
+            repair_json,
+            no_filesystem_json
         )
     }
 }
@@ -833,6 +1068,7 @@ pub fn audit_with_copies(
         findings,
         tiers: None,
         scrub: None,
+        catalog_only: None,
     })
 }
 
@@ -1173,7 +1409,182 @@ pub fn catalog_audit(
         findings,
         tiers: None,
         scrub: None,
+        catalog_only: None,
     })
+}
+
+/// Answer from the catalog rows alone (issue #51): no walk, no `stat`, no hash, no tier
+/// access at all.
+///
+/// Catalog mode above still makes one filesystem pass — it must, to tell a location row
+/// that is stale from one whose file is there. This mode does not, which is the whole
+/// point: it is for a tier that is not mounted (or a host where the tree is gone), and it
+/// answers only what the recorded rows say. Everything it reports is therefore a claim
+/// about the catalog, never about bytes, and it says which findings it could not make in
+/// [`CatalogOnlySection::unchecked`] so a reader is never left to infer health from
+/// silence:
+///
+/// * a **floor** an object's recorded locations fall below is `under-replicated` — rows
+///   counted, not bytes verified;
+/// * a **damage mark** a scrub left is `damaged-copy`;
+/// * a **malformed row** (a tier or key that could never be joined into a path) is
+///   `malformed-catalog` — the check is lexical, so it needs no filesystem;
+/// * the recorded object/name/location counts, the floors, and the scrub-state summary go
+///   in the report's [`CatalogOnlySection`].
+///
+/// `watch` and `dests` are carried only so the output can name the invocation; they are
+/// never touched. Read-only, and it writes nothing to the catalog.
+pub fn catalog_audit_no_filesystem(
+    catalog: &Catalog,
+    watch: &Path,
+    dests: &[PathBuf],
+) -> Result<AuditReport, AuditError> {
+    // The recorded roots decide whether a row could become a path — a purely lexical check,
+    // so it needs no filesystem. A catalog written before roots were recorded has none;
+    // fall back to the invocation's watch/dest (the same roots catalog mode resolves
+    // against) rather than declaring every row malformed.
+    let mut roots = catalog.roots()?;
+    if roots.is_empty() {
+        roots.push(watch.to_path_buf());
+        roots.extend(dests.iter().cloned());
+    }
+    let objects = catalog.reconcile_objects()?;
+    let names = catalog.all_names()?;
+    let floors = catalog.all_tier_floors()?;
+    let scrub = catalog.scrub_summary()?;
+
+    let floor_of: BTreeMap<&str, usize> = floors
+        .iter()
+        .map(|(tier, copies)| (tier.as_str(), *copies))
+        .collect();
+
+    let mut findings = Vec::new();
+    // Objects with at least one recorded finding, so a name is called healthy only when
+    // nothing about the object it points at is in question.
+    let mut suspect_objects: BTreeSet<String> = BTreeSet::new();
+
+    for object in &objects {
+        let object_hex = hex_bytes(&object.object);
+        for location in &object.locations {
+            // A row that could never be a path is reported, never joined; the check is the
+            // same lexical one catalog mode uses, minus any filesystem call after it.
+            if let Err(error) = resolve_location_path(&location.tier, &location.storage_key, &roots)
+            {
+                suspect_objects.insert(object_hex.clone());
+                findings.push(Finding {
+                    path: PathBuf::from(format!("{}/{}", location.tier, location.storage_key)),
+                    relative: PathBuf::from(&location.storage_key),
+                    cold_copy: None,
+                    verdict: Verdict::MalformedCatalog {
+                        tier: location.tier.clone(),
+                        key: location.storage_key.clone(),
+                        detail: error.detail().to_string(),
+                    },
+                });
+            }
+            // A damage mark is recorded state: a scrub found no good copy to repair this
+            // location from. Reported as such — the mark exists whether or not the bytes
+            // still do, and only the tree could tell the two apart.
+            if object
+                .damaged
+                .contains(&(location.tier.clone(), location.storage_key.clone()))
+            {
+                suspect_objects.insert(object_hex.clone());
+                findings.push(Finding {
+                    path: PathBuf::from(format!("{}/{}", location.tier, location.storage_key)),
+                    relative: PathBuf::from(&location.storage_key),
+                    cold_copy: None,
+                    verdict: Verdict::DamagedCopy {
+                        tier: location.tier.clone(),
+                        key: location.storage_key.clone(),
+                        object: object_hex.clone(),
+                    },
+                });
+            }
+        }
+
+        // The floor application: the recorded floor of the tier the object's copy of record
+        // sits on, defaulting to the schema-wide [`COPY_FLOOR`] when no tier floor was
+        // recorded. An object with no locations is below the floor of 1, which is right —
+        // its rows are gone — but whether its bytes are is unknowable here.
+        let primary = object
+            .locations
+            .iter()
+            .find(|location| location.is_primary)
+            .or_else(|| object.locations.first());
+        let floor = primary
+            .and_then(|location| floor_of.get(location.tier.as_str()).copied())
+            .unwrap_or(COPY_FLOOR);
+        let copies = object.locations.len();
+        if copies < floor {
+            suspect_objects.insert(object_hex.clone());
+            findings.push(Finding {
+                path: PathBuf::from(&object_hex),
+                relative: PathBuf::new(),
+                cold_copy: None,
+                verdict: Verdict::UnderReplicated {
+                    object: object_hex.clone(),
+                    copies,
+                    floor,
+                },
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.verdict.kind().as_str().cmp(b.verdict.kind().as_str()))
+    });
+
+    let locations = catalog.location_count()?;
+    let unchecked = VerdictKind::filesystem_only().to_vec();
+    let damaged = object_damage_count(&objects);
+    let section = CatalogOnlySection {
+        objects: objects.len(),
+        names: names.len(),
+        locations,
+        floors,
+        damaged,
+        scrub,
+        unchecked,
+    };
+
+    Ok(AuditReport {
+        watch: watch.to_path_buf(),
+        dests: dests.to_vec(),
+        source: AuditSource::CatalogOnly {
+            path: catalog.path().to_path_buf(),
+        },
+        // Nothing was walked, so `scanned` counts recorded rows (names and locations) and
+        // `healthy` counts recorded names whose object has no recorded finding. A named
+        // object whose every recorded location is gone still counts as it stands; the tree
+        // is what would say otherwise, and this mode cannot see it.
+        scanned: names.len() + locations,
+        healthy: names
+            .iter()
+            .filter(|(_, object)| !suspect_objects.contains(object))
+            .count(),
+        findings,
+        tiers: None,
+        scrub: None,
+        catalog_only: Some(section),
+    })
+}
+
+/// How many recorded locations carry a damage mark, across every object.
+fn object_damage_count(objects: &[crate::catalog::ReconcileObject]) -> usize {
+    objects.iter().map(|object| object.damaged.len()).sum()
+}
+
+/// Hex for an object id. The catalog's own encoder is private to it, and a report should not
+/// grow a public dependency for six lines.
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Canonical form of a root, so a tier string recorded by `catalog sync` (which uses the
@@ -1387,6 +1798,8 @@ pub fn repair(report: &AuditReport) -> Result<Vec<RepairOutcome>, AuditError> {
             | Verdict::MissingCopy { .. }
             | Verdict::ChecksumMismatch { .. }
             | Verdict::CopyFloor { .. }
+            | Verdict::UnderReplicated { .. }
+            | Verdict::DamagedCopy { .. }
             | Verdict::UnknownVersion { .. }
             | Verdict::MalformedCatalog { .. }
             | Verdict::UnknownPath => RepairAction::NotAttempted {
@@ -1610,6 +2023,7 @@ mod tests {
             healthy: 6,
             tiers: None,
             scrub: None,
+            catalog_only: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/watch/a.bin"),
@@ -1663,6 +2077,7 @@ mod tests {
             healthy: 0,
             tiers: None,
             scrub: None,
+            catalog_only: None,
             findings: vec![Finding {
                 path: PathBuf::from("/watch/a)weird\"name"),
                 relative: PathBuf::from("a)weird\"name"),
@@ -1711,6 +2126,7 @@ mod tests {
             healthy: 0,
             tiers: None,
             scrub: Some(scrub),
+            catalog_only: None,
             findings: Vec::new(),
         };
         let json = report.to_json(None);
@@ -1757,6 +2173,7 @@ mod tests {
             healthy: 0,
             tiers: None,
             scrub: None,
+            catalog_only: None,
             findings: vec![
                 Finding {
                     path: PathBuf::from("/cold/a.bin"),
@@ -1800,5 +2217,97 @@ mod tests {
         assert!(json.contains("\"source\":\"catalog\""), "{json}");
         assert!(json.contains("\"checksum-mismatch\":1"), "{json}");
         assert!(json.contains(".just_cache-catalog.sqlite"), "{json}");
+    }
+
+    #[test]
+    fn the_filesystem_only_set_is_exactly_every_kind_that_needs_a_tree() {
+        // The findings a catalog-only audit can make, from rows alone. Everything else must
+        // be in `filesystem_only`; anything missing from both would be a kind the mode
+        // silently never reports, and anything in both would be a contradiction.
+        let producible = [
+            VerdictKind::Healthy,
+            VerdictKind::MalformedCatalog,
+            VerdictKind::UnderReplicated,
+            VerdictKind::DamagedCopy,
+        ];
+        for kind in VerdictKind::ALL {
+            let needs_tree = !producible.contains(&kind);
+            assert_eq!(
+                VerdictKind::filesystem_only().contains(&kind),
+                needs_tree,
+                "{kind:?} is on the wrong side of the filesystem boundary"
+            );
+        }
+        // And the unchecked list is never empty: a catalog-only audit always has something
+        // it could not check, or it would not be a catalog-only audit.
+        assert_eq!(VerdictKind::filesystem_only().len(), 11);
+    }
+
+    #[test]
+    fn a_catalog_only_report_counts_only_what_it_checked_and_names_the_rest() {
+        let report = AuditReport {
+            watch: PathBuf::from("/gone"),
+            dests: vec![PathBuf::from("/gone-cold")],
+            source: AuditSource::CatalogOnly {
+                path: PathBuf::from("/catalog.sqlite"),
+            },
+            scanned: 4,
+            healthy: 3,
+            tiers: None,
+            scrub: None,
+            catalog_only: Some(CatalogOnlySection {
+                objects: 2,
+                names: 2,
+                locations: 4,
+                floors: vec![("/cold".to_string(), 2)],
+                damaged: 1,
+                scrub: crate::catalog::ScrubSummary {
+                    locations: 4,
+                    verified: 1,
+                    never_scrubbed: 3,
+                    damaged: 1,
+                },
+                unchecked: VerdictKind::filesystem_only().to_vec(),
+            }),
+            findings: vec![Finding {
+                path: PathBuf::from("aaaa"),
+                relative: PathBuf::new(),
+                cold_copy: None,
+                verdict: Verdict::UnderReplicated {
+                    object: "aaaa".to_string(),
+                    copies: 1,
+                    floor: 2,
+                },
+            }],
+        };
+
+        let summary = report.summary_lines(10).join("\n");
+        // The recorded state is reported...
+        assert!(
+            summary.contains("recorded state: 2 object(s), 2 name(s), 4 location(s)"),
+            "{summary}"
+        );
+        assert!(summary.contains("recorded floors: /cold=2"), "{summary}");
+        assert!(summary.contains("damage marks: 1"), "{summary}");
+        assert!(summary.contains("4 location(s): 1 verified"), "{summary}");
+        assert!(summary.contains("under-replicated: 1"), "{summary}");
+        // ...and the classes it could not check are named, not left as a misleading zero.
+        assert!(
+            summary.contains("cannot be checked without the tree: missing-copy, checksum-mismatch"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("missing-copy: 0"),
+            "an unchecked class must not read as an explicit zero: {summary}"
+        );
+
+        let json = report.to_json(None);
+        assert!(json.contains("\"source\":\"catalog-only\""), "{json}");
+        assert!(json.contains("\"unchecked\":[\"missing-copy\""), "{json}");
+        assert!(json.contains("\"no-filesystem\":{\"objects\":2"), "{json}");
+        assert!(
+            json.contains("\"floors\":[{\"tier\":\"/cold\",\"copies\":2}]"),
+            "{json}"
+        );
     }
 }

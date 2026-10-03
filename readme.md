@@ -563,6 +563,32 @@ resync and touches neither the tree nor the rows — the catalog may record a mo
 sees as unfinished, and guessing is how a repair deletes the wrong thing. Exit codes are
 unchanged (`0` clean, `1` findings, `2` bad invocation).
 
+### With no filesystem at all
+
+Add `--no-filesystem` and the audit answers from the catalog rows alone — no walk, no
+`stat`, no hash, no tier access — which is what makes it work when the tier it describes is
+not mounted:
+
+```sh
+# --watch / --dest are labels here: named for the report, never touched.
+just_cache audit --no-filesystem \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+```
+
+It reports what the rows can honestly say — the recorded object/name/location counts, the
+recorded tier floors, an object whose *recorded* locations fall below the floor
+(`under-replicated`), a location a scrub marked damaged (`damaged-copy`), a row that could
+never be joined into a path (`malformed-catalog`), and the scrub-state summary — and it
+**states which findings it cannot make**, because each needs the tree: `missing-copy`,
+`checksum-mismatch`, `name-vanished`, `unknown-path`, `unknown-version`, `dangling-symlink`,
+`unexpected-target`, `duplicate`, `orphaned-copy` and `replica-lost`. Those are named in the
+summary (`cannot be checked without the tree: …`) and listed in the JSON's
+`no-filesystem.unchecked`, so a `0` is never mistaken for "checked and clean". The source is
+named `catalog-only`; `--watch`/`--dest` are labels only and are never touched; exit codes
+are unchanged, and `--repair` still only marks for resync.
+
 ## Finding an object
 
 `locate` answers "where does this live" straight from the catalog, without walking the

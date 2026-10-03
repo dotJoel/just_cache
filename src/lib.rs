@@ -25,9 +25,9 @@ pub mod scrub;
 pub mod tiers;
 
 pub use audit::{
-    audit, audit_with_copies, catalog_audit, catalog_repair, classify, repair, AuditError,
-    AuditReport, AuditSource, Finding, RepairAction, RepairOutcome, SourceState, Verdict,
-    VerdictKind, COPY_FLOOR, DEFAULT_EXAMPLES,
+    audit, audit_with_copies, catalog_audit, catalog_audit_no_filesystem, catalog_repair, classify,
+    repair, AuditError, AuditReport, AuditSource, CatalogOnlySection, Finding, RepairAction,
+    RepairOutcome, SourceState, Verdict, VerdictKind, COPY_FLOOR, DEFAULT_EXAMPLES,
 };
 pub use catalog::{
     resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind, LocationRecord,
