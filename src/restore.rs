@@ -631,7 +631,7 @@ fn restore_from_object_tier(
         )
         .map_err(|err| RestoreError::Copy {
             path: hot.to_path_buf(),
-            from: PathBuf::from(format!("s3://{}/{}", config.bucket, location.storage_key)),
+            from: PathBuf::from(config.display_key(&location.storage_key)),
             error: std::io::Error::other(err.to_string()),
         })?;
 

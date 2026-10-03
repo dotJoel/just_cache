@@ -15,7 +15,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use just_cache::object_store::{CredentialSource, ObjectStoreError, ObjectTierConfig, CHUNK_SIZE};
+use just_cache::object_store::{
+    CredentialSource, ObjectStoreError, ObjectTierConfig, RemoteKind, CHUNK_SIZE,
+};
 
 // ---------- fake S3 server ----------------------------------------------------
 
@@ -201,6 +203,7 @@ fn extract_param(path: &str, name: &str) -> Option<String> {
 fn config(host: &str) -> ObjectTierConfig {
     ObjectTierConfig {
         name: "test-tier".to_string(),
+        remote_kind: RemoteKind::S3,
         endpoint: host.to_string(),
         bucket: "test-bucket".to_string(),
         prefix: None,
@@ -269,6 +272,7 @@ fn missing_credential_is_named_refusal() {
     // The config points at an env var that is not set.
     let cfg = ObjectTierConfig {
         name: "test".to_string(),
+        remote_kind: RemoteKind::S3,
         endpoint: "127.0.0.1".to_string(),
         bucket: "b".to_string(),
         prefix: None,

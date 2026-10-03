@@ -83,8 +83,10 @@ catalog and integrity commands.
 Today just_cache is a local mover with move recovery and explicit commands to record,
 locate, check, restore and delete copies, plus a FUSE mount and a WebDAV gateway over the
 same catalog. The larger plan — one namespace across local disks, LAN peers, cloud object
-storage and offline volumes — is in progress: the object-store driver landed (#141),
-and the LAN peer and offline volume drivers are next. See [Design](#design) for that
+storage and offline volumes — is in progress: the object-store driver landed (#141), and
+the LAN-peer tier followed (#142) — a peer runs `just_cache object-server`, and a `peer`
+tier moves bytes to it over the same S3-compatible wire. The offline-volume driver is
+next. See [Design](#design) for that
 roadmap and its current boundary.
 
 ## Configuration
@@ -1162,9 +1164,9 @@ must not break — the rules that make this tool safe to point at someone's data
 The providers that exist are local: the symlink mover over filesystem roots, a FUSE mount
 that serves the catalog's namespace as a real filesystem, and a WebDAV gateway for consumers
 that cannot mount. A `[[cache]]` overlay can sit in front of a durable tier, and a file read
-through the mount is judged by observed access rather than by atime. There is no LAN,
-cloud-object or offline-volume tier. The object-store driver (#141) exists and is ready for sweep
-dispatch; LAN and offline are next.
+through the mount is judged by observed access rather than by atime. Remote tiers exist for
+cloud object storage (#141) and a LAN peer (#142) — both over the same S3-compatible wire,
+sealed by the envelope — and there is no offline-volume tier yet.
 
 The design in [`docs/design.md`](docs/design.md) describes the intended extension: one
 catalog and namespace across local disks, LAN peers, cloud object storage and removable
