@@ -15,6 +15,20 @@ cargo test
 
 If `cargo` is not on `PATH`, this machine keeps the toolchain at `~/.cargo/bin`.
 
+Two local accelerators sit in front of those commands, both wired in so the plain
+commands still work but the fast ones are what the machine actually runs:
+
+- **`cargo nextest run` in place of `cargo test`.** nextest compiles and runs the test
+  binaries in parallel — measured at ~21s against `cargo test`'s ~49s on a cold cache for
+  the same tests. It does not run doctests, so `cargo test --doc` is a separate command;
+  CI runs both, and a doctest added later is covered without anyone remembering to look.
+- **sccache**, set as `RUSTC_WRAPPER` in `~/.cargo/config.toml`, caches compiled objects
+  across every worktree. A build into a fresh `target/` — which is what each new branch
+  pays — drops from ~15s to ~6s. sccache requires `CARGO_INCREMENTAL=0`, which that config
+  sets: an edit-build of this crate becomes ~3s instead of ~1s, the trade the config
+  explains. If sccache is not installed the wrapper fails loudly rather than building
+  uncached, so an unconfigured machine says so instead of quietly slowing down.
+
 CI (`.github/workflows/rust.yml`) runs all four, and mounts a tmpfs so the cross-device
 tests have a real second filesystem. Reproduce that locally when touching the mover:
 

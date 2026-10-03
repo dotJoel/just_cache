@@ -14,6 +14,21 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache wraps rustc and caches each compiled object under a hash of that
+  # compilation's inputs, so a build whose `target/` is empty still reuses
+  # objects another run already produced. That is exactly the case every new PR
+  # branch hits: the cargo cache below is scoped per ref for correctness, so a
+  # fresh branch starts cold and recompiles the whole dependency tree. sccache
+  # is the cross-branch layer that closes that gap, and it is safe to share —
+  # an object only matches when the inputs hash identically, which means it
+  # *is* the same compilation, so a hit can never be another ref's stale work.
+  RUSTC_WRAPPER: sccache
+  # sccache refuses to run alongside incremental compilation: its cache is keyed
+  # by a hash of the compile inputs, and an incremental artefact carries state
+  # that hash does not describe, so a hit could serve a wrong object. CI has no
+  # edit-build loop to accelerate, so turning incremental off costs nothing here.
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_DIR: /home/runner/.cache/sccache
 
 jobs:
   build:
@@ -38,6 +53,41 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         fetch-depth: 0
+
+    # sccache and nextest are fetched as single static binaries from their upstream
+    # release pages, pinned to an exact version, rather than through a third-party
+    # install action. Both are one file, and this keeps the workflow's dependency
+    # surface to the two actions already trusted above; the version is the pin.
+    # `--proto '=https' --tlsv1.2` refuses a redirect that would downgrade transport.
+    - name: Install sccache
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        curl -sSfL --proto '=https' --tlsv1.2 \
+          -o /tmp/sccache.tar.gz \
+          https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz
+        tar -xzf /tmp/sccache.tar.gz -C /tmp
+        install -m 0755 /tmp/sccache-v0.18.0-x86_64-unknown-linux-musl/sccache "$HOME/.local/bin/sccache"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Install cargo-nextest
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        curl -sSfL --proto '=https' --tlsv1.2 \
+          -o /tmp/nextest.tar.gz \
+          https://get.nexte.st/0.9.146/linux
+        tar -xzf /tmp/nextest.tar.gz -C "$HOME/.local/bin" cargo-nextest
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    # The sccache cache is keyed on the lockfile alone and carries a shared
+    # restore-key on purpose: its contents are content-addressed, so restoring a
+    # sibling ref's objects cannot poison this run the way restoring a `target`
+    # cache could. The per-ref cargo cache below still owns `target`.
+    - name: Cache sccache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: /home/runner/.cache/sccache
+        key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-sccache-
 
     - name: Cache cargo registry and build
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -119,9 +169,29 @@ jobs:
         echo "JUST_CACHE_TEST_SECOND_FS=$second_fs" >> "$GITHUB_ENV"
         echo "JUST_CACHE_REQUIRE_SECOND_FS=1" >> "$GITHUB_ENV"
 
+    # nextest compiles and runs the test binaries in parallel, which is most of
+    # this job's wall-clock: the same tests `cargo test` runs in ~49s cold finish
+    # in ~21s. It reads the same environment as libtest, so the second-filesystem
+    # variables set above reach the cross-device tests unchanged.
     - name: Run tests
       if: steps.code-change.outputs.code_changed == 'true'
-      run: cargo test --verbose
+      run: cargo nextest run
+
+    # nextest deliberately does not run doctests — a limitation, not a skip we
+    # chose. Leaving them out would let a doctest that stops compiling pass CI
+    # green, which is the "a skip looks exactly like a pass" trap AGENTS.md warns
+    # about, so they run in their own step. There are none today; the step keeps
+    # that honest by failing the day one is added and broken.
+    - name: Run doctests
+      if: steps.code-change.outputs.code_changed == 'true'
+      run: cargo test --doc
+
+    # The cache hit rate is the whole reason sccache is here; print it even when a
+    # step above failed, so a red run still says whether the cache was cold or the
+    # work was real.
+    - name: Report sccache statistics
+      if: always()
+      run: sccache --show-stats || true
 
     - name: Unmount the second filesystem
       if: always()
