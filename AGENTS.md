@@ -26,6 +26,15 @@ JUST_CACHE_TEST_SECOND_FS=/dev/shm JUST_CACHE_REQUIRE_SECOND_FS=1 cargo test
 is what CI sets. Without it, tests that need one skip — and a skip looks exactly like a pass
 in the summary line, so do not read a green run as coverage unless that variable was set.
 
+**A failure window inside the binary is opened with `JUST_CACHE_FAULT`.** A window a test
+process cannot time from outside — a destination vanishing between the copies of one sweep, a
+read-back failing on bytes that were just written, a partial file observed while bytes are
+still moving — is injected by setting `JUST_CACHE_FAULT` to a `mechanism=N` spec. The grammar
+and the one-shot claims are in `src/faults.rs`; the seams it arms fire in `src/replication.rs`
+and `src/disk_management.rs`. The variable is inert unless set, and a set-but-malformed spec
+panics deliberately: a fault switch that silently no-opped would let a mistyped test pass
+green with nothing injected. `tests/fault_injection.rs` is the worked example.
+
 **Unit tests are not evidence that a change works.** The mover deletes people's files, and
 several of the bugs found while building P0 were invisible to a passing suite: a regression
 in short-copy detection, a 57-byte-per-move journal leak, an unreadable-journal path. Run the

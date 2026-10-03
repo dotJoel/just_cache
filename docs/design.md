@@ -948,6 +948,15 @@ file, a per-path override beating a catch-all, a config file in the watched tree
 alone, an explicit `--policy` naming a file elsewhere, no policy meaning the flags still
 decide, and refusals (unconfigured tier, volatile target, bad duration) naming their rule.
 
+Closed by #39: the fault-injection seam is now discoverable from `AGENTS.md`. Its
+build/test/verify section already warned that a skipped test looks like a pass; beside that
+warning it now names the convention — the `JUST_CACHE_FAULT` env var, its `mechanism=N`
+grammar and the one-shot claims parsed in `src/faults.rs`, the seams it arms in
+`src/replication.rs` and `src/disk_management.rs`, the deliberate panic on a set-but-malformed
+spec (a no-op switch would let a mistyped test pass green with nothing injected), and
+`tests/fault_injection.rs` as the worked example. No command already documented in `AGENTS.md`
+is restated; the pointer works from the repo alone.
+
 ## 10. Non-goals
 
 - **Deciding *when* to reconcile is not this feature's job.** `just_cache reconcile` is an
