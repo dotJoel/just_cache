@@ -1,0 +1,103 @@
+name: Release
+
+# A release is cut by pushing a `v*` tag (the release SOP: a human decides when,
+# after the bug/security backlog is clear; this workflow only decides *how*).
+# Everything a release claims is proven here before the release object exists:
+# the same test suite CI runs — including the cross-device tests, because the
+# mover deletes people's files and a green suite without the second filesystem
+# is not coverage — gates the build that gets published.
+on:
+  push:
+    tags: [ "v*" ]
+
+# The release object and its asset are the whole point of this workflow, so
+# this is the one place the token writes. Kept at that floor: no packages,
+# no attestation actions, no third-party steps that would widen it.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    # Pinned like `rust.yml`: the runner image is part of what the tests mean,
+    # and a release artifact should be reproducible from a known image.
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Set the initial branch name
+      run: git config --global init.defaultBranch main
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        # The ref here is the tag, so the key never shares a cache entry with a
+        # branch run; release bytes are built from this tag's own objects.
+        key: ${{ runner.os }}-cargo-${{ github.ref }}-${{ hashFiles('**/Cargo.lock') }}
+
+    # The runner image ships a rustup-managed stable toolchain; pin the profile
+    # to what the crate needs rather than whatever the image happens to carry.
+    - name: Install the stable toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --component clippy
+        rustup default stable
+
+    - name: Reject committed conflict markers
+      run: |
+        if git grep -nE '^(<{7}|={7}$|>{7})' -- .; then
+          echo "::error::conflict markers committed as text; resolve the file properly, do not commit them"
+          exit 1
+        fi
+
+    - name: Format
+      run: cargo fmt --all -- --check
+
+    - name: Lint
+      run: cargo clippy --all-targets -- -D warnings
+
+    - name: Mount a second filesystem for cross-device tests
+      run: |
+        second_fs="$(mktemp -d)"
+        sudo mount -t tmpfs -o size=256m tmpfs "$second_fs"
+        echo "JUST_CACHE_TEST_SECOND_FS=$second_fs" >> "$GITHUB_ENV"
+        echo "JUST_CACHE_REQUIRE_SECOND_FS=1" >> "$GITHUB_ENV"
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Unmount the second filesystem
+      if: always()
+      run: sudo umount "${JUST_CACHE_TEST_SECOND_FS:-}" || true
+
+    - name: Build the release binary
+      run: cargo build --release --verbose
+
+    - name: Package the binary and its checksum
+      run: |
+        dir="$(mktemp -d)"
+        cp target/release/just_cache "$dir/"
+        cp readme.md "$dir/"
+        tar -czf "just_cache-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" -C "$dir" .
+        sha256sum "just_cache-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" > "just_cache-${GITHUB_REF_NAME}-x86_64-linux.tar.gz.sha256"
+        echo "ASSET_TAR=just_cache-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" >> "$GITHUB_ENV"
+        echo "ASSET_SHA=just_cache-${GITHUB_REF_NAME}-x86_64-linux.tar.gz.sha256" >> "$GITHUB_ENV"
+
+    # `--verify-tag` so a release can only be published for a tag that actually
+    # points at the commit that was just built and tested. Notes are generated
+    # from the squash-merged PR titles, which is the changelog convention the
+    # repo already keeps.
+    - name: Create the release
+      run: |
+        gh release create "$GITHUB_REF_NAME" \
+          --verify-tag \
+          --generate-notes \
+          "$ASSET_TAR" "$ASSET_SHA"
+      env:
+        GH_TOKEN: ${{ github.token }}
