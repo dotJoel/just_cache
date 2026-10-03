@@ -2,9 +2,13 @@
 
 ## Supported versions
 
-There are no published releases — `Cargo.toml` is at `0.3.0` and nothing is tagged. Only
-the current `main` is supported: a fix lands there, and there is no maintenance branch to
-patch.
+The current release is [`v0.3.0-rc.1`][rc1] — a preview of the standalone symlink mover,
+published as a prerelease. Only the current `main` is supported: a fix lands there, and
+the tag is superseded rather than patched in place — there is no maintenance branch. A
+fix on `main` is not in a published tag until the next one, so running the release means
+running fixed-on-main, tagged-sometimes.
+
+[rc1]: https://github.com/dotJoel/just_cache/releases/tag/v0.3.0-rc.1
 
 ## Reporting a vulnerability
 
