@@ -17,12 +17,15 @@ just_cache \
 ```
 
 That is the `sweep` subcommand with the subcommand omitted (existing scripts and cron
-entries keep working); `just_cache sweep ...` is the explicit form,
-[`just_cache audit ...`](#auditing-consistency) checks that the tree and the cold tiers
-still agree, [`just_cache explain ...`](#explaining-one-path) answers why one path is
-where it is, [`just_cache restore ...`](#restoring-a-file) brings an offloaded file back,
-and [`just_cache scrub ...`](#scrubbing-for-bitrot) reads every stored copy back and
-verifies it against the catalog.
+entries keep working); `just_cache sweep ...` is the explicit form. The other
+subcommands: [`audit ...`](#auditing-consistency) checks that the tree and the cold tiers
+still agree, [`explain ...`](#explaining-one-path) answers why one path is where it is,
+[`catalog sync ...`](#the-catalog) records the state of both sides in a SQLite catalog,
+[`locate ...`](#finding-an-object) says where an object lives,
+[`restore ...`](#restoring-a-file) brings an offloaded file back,
+[`scrub ...`](#scrubbing-for-bitrot) reads every stored copy back and verifies it against
+the catalog, and [`reconcile ...`](#reconciling-a-re-added-disk) rebuilds copies a
+re-added disk is missing.
 
 ## Why
 
@@ -112,38 +115,6 @@ The sweep summary counts these separately (`N in use`), so a busy box reads diff
 from a genuinely cold one — if every sweep reports files in use, the guard is working, not
 failing.
 
-### If the machine dies mid-move
-
-A move is three filesystem operations that cannot be one: the bytes land on the cold
-tier, the source is removed, the symlink appears. Crash between the last two and the
-file is still on disk but nothing points at it. So every move writes an **intent** to
-`<watch>/.just_cache-journal` — and fsyncs it — before anything moves, and clears the
-record once the symlink is in place.
-
-The next run reads that journal and asks the *filesystem* what happened, because the
-journal only knows what was attempted:
-
-- **bytes cold and complete, name gone** → the symlink is recreated, and the run says
-  so (`restored the name shows/ep2.mkv -> /dev/shm/cold/shows/ep2.mkv`). This is the
-  case the journal exists for.
-- **both copies present** → left alone; the next sweep's adoption path hashes the
-  destination and either adopts or refuses it. Recovery does not guess.
-- **nothing moved yet** → nothing to do.
-- **an interrupted copy, with the source intact** → removed (it is ours and worthless).
-- **an interrupted copy with nothing else left** → *kept*, deliberately: deleting it
-  could be deleting the only surviving bytes.
-- **no source and no complete copy** → reported as `DATA LOST` and kept in the journal,
-  because nothing on disk remains for `audit` to find later.
-
-Two rules hold throughout: recovery never deletes anything that might be the only copy,
-and it never creates a name pointing at a copy it cannot vouch for — a cold file whose
-size does not match what the move promised is refused, not linked.
-
-A journal that cannot be *read* stops the sweep, naming the damaged line: it may
-describe bytes already on a cold tier, and there is no safe way to guess. The journal
-itself is never a move candidate, and after a clean pass it is empty — a finished move
-is cleared rather than recorded, since the symlink is better evidence that it finished.
-
 ### Destinations
 
 **A destination is never created.** A missing `--dest` is a startup error, not a
@@ -181,46 +152,11 @@ destinations. With a floor of 2 and one other disk, the second copy lands on tha
 disk **on the same host** — this survives a disk failure, not the loss of the machine.
 Off-host copies are a later phase.
 
-## Reconciling a re-added disk
-
-A disk that is unmounted while a sweep runs misses its copies: the sweep places the file
-only on the disks that are present, and the object stays below its floor (`catalog sync`
-reports it as `under-replicated`, `audit --copies N` as `replica-lost`). When the disk
-comes back, `reconcile` is what fills it in:
-
-```sh
-# see what would be rebuilt before anything is written
-just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite --dry-run
-
-# rebuild every missing copy a surviving sibling can supply
-just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite
-```
-
-What it guarantees:
-
-- **The source is proved, not assumed.** A sibling is used only after its bytes are hashed
-  and compared to the object's recorded checksum — a copy that merely matches on size is
-  not a source, and one that hashes to something else is marked damaged and skipped.
-- **The rebuilt copy is verified before it is recorded.** The bytes go to a private
-  `.just_cache-partial-*` sibling, are read back and hashed there, and only a verified
-  copy is renamed into place; only then is the location recorded, with the real checksum.
-  A failed rebuild leaves the location absent, never holding unknown bytes.
-- **Nothing is deleted.** Not the source of a rebuild, not a copy restored by hand that
-  already sits where the copy belongs (that one is hashed and *adopted* instead), not a
-  file reconcile cannot vouch for.
-- **A destination root is never created.** A disk that is still unmounted is reported
-  (`tier not mounted`), not silently turned into a directory on the wrong filesystem.
-
-Exit codes: `0` every recorded floor already met, `1` something was rebuilt/adopted or
-could not be (a disk being out is evidence cron should see once), `2` bad invocation — a
-missing catalog file, since the recorded checksum a rebuild is proved against lives there.
-Like `scrub`, it runs on demand; deciding *when* to reconcile is P2.
-
 ## How a file is chosen
 
 A file is moved when **all** of these hold:
 
-0. it is in scope (§above): inside `--include`, not `--exclude`, within the size window;
+0. it is in scope (see Scope above): inside `--include`, not `--exclude`, within the size window;
 1. it is not already a symlink (already migrated);
 2. it is not empty;
 3. nothing has read it during this run (the `--min-observed-accesses` pin), and nothing is
@@ -266,6 +202,38 @@ Sweeps are safe to interrupt and safe to repeat:
 A destination below its free-space floor is not a failure: those files are reported as
 *waiting for room* and picked up when the slow disk has space again.
 
+## If the machine dies mid-move
+
+A move is three filesystem operations that cannot be one — the bytes land on the cold
+tier, the source is removed, the symlink appears — and the window this section is about
+is between the last two: the file is still on disk but nothing points at it. So every
+move writes an **intent** to `<watch>/.just_cache-journal` — and fsyncs it — before
+anything moves, and clears the record once the symlink is in place.
+
+The next run reads that journal and asks the *filesystem* what happened, because the
+journal only knows what was attempted:
+
+- **bytes cold and complete, name gone** → the symlink is recreated, and the run says
+  so (`restored the name shows/ep2.mkv -> /dev/shm/cold/shows/ep2.mkv`). This is the
+  case the journal exists for.
+- **both copies present** → left alone; the next sweep's adoption path hashes the
+  destination and either adopts or refuses it. Recovery does not guess.
+- **nothing moved yet** → nothing to do.
+- **an interrupted copy, with the source intact** → removed (it is ours and worthless).
+- **an interrupted copy with nothing else left** → *kept*, deliberately: deleting it
+  could be deleting the only surviving bytes.
+- **no source and no complete copy** → reported as `DATA LOST` and kept in the journal,
+  because nothing on disk remains for `audit` to find later.
+
+Two rules hold throughout: recovery never deletes anything that might be the only copy,
+and it never creates a name pointing at a copy it cannot vouch for — a cold file whose
+size does not match what the move promised is refused, not linked.
+
+A journal that cannot be *read* stops the sweep, naming the damaged line: it may
+describe bytes already on a cold tier, and there is no safe way to guess. The journal
+itself is never a move candidate, and after a clean pass it is empty — a finished move
+is cleared rather than recorded, since the symlink is better evidence that it finished.
+
 ## Example run
 
 ```
@@ -281,6 +249,15 @@ excludes.
 
 `/mnt/cache/media/shows/s1/ep1.mkv` is now a symlink; opening it still reads the
 episode.
+
+## Running it continuously
+
+```sh
+# one sweep per hour, forever
+just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --interval 3600
+```
+
+Or schedule single sweeps from cron/systemd and use `--once` instead.
 
 ## Explaining one path
 
@@ -330,6 +307,41 @@ exit `1` on purpose.
 # act only on files that are actually about to move
 just_cache explain "$path" --watch /mnt/cache/media --dest /mnt/disk-slow/media && reclaim "$path"
 ```
+
+## The catalog
+
+`audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
+tree and every cold tier and ingests their current state into a SQLite file whose id for
+each object is the BLAKE3 hash of its bytes — so identity survives a rename, dedup falls
+out, and "does this file exist?" is a question the catalog can answer even for a tier that
+is not mounted.
+
+```sh
+just_cache catalog sync \
+  --watch /mnt/cache/media \
+  --dest /mnt/disk-slow/media \
+  --dest /mnt/disk-archive/media
+```
+
+The catalog defaults to `.just_cache-catalog.sqlite` beside the watch root (the walk
+skips the `.just_cache` prefix, so it can never be moved onto a cold tier); `--catalog
+<FILE>` puts it anywhere else. A file the mover already offloaded is picked up by the
+first sync exactly like one offloaded afterwards — the migration story is ingest, not
+migrate.
+
+Each row records where the bytes are (a tier plus a storage key), their size, and the
+BLAKE3 checksum computed at ingest. An object moves through `present` -> `offloaded` ->
+`restoring`, and a location is only removed when another location still holds the object
+or when no name references it. Cache residency is never written to `location` (§2.1 of the
+design): a copy in a RAM or SSD promotion target is re-derivable, so a restart can never
+turn a volatile copy into data of record.
+
+`sync` **ingests new facts and reports contradictions; it never rewrites the catalog to
+match a hand-edited tree**. If a name the catalog recorded is gone or now hashes to
+different bytes, or a location's file vanished or changed, the difference is printed and
+the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
+bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
+the tree is worse than none.
 
 ## Auditing consistency
 
@@ -403,40 +415,6 @@ resync and touches neither the tree nor the rows — the catalog may record a mo
 sees as unfinished, and guessing is how a repair deletes the wrong thing. Exit codes are
 unchanged (`0` clean, `1` findings, `2` bad invocation).
 
-## The catalog
-
-`audit` inspects the tree; the catalog *records* it. `catalog sync` walks the watched
-tree and every cold tier and ingests their current state into a SQLite file whose id for
-each object is the BLAKE3 hash of its bytes — so identity survives a rename, dedup falls
-out, and "does this file exist?" is a question the catalog can answer even for a tier that
-is not mounted.
-
-```sh
-just_cache catalog sync \
-  --watch /mnt/cache/media \
-  --dest /mnt/disk-slow/media \
-  --dest /mnt/disk-archive/media
-```
-
-The catalog defaults to `.just_cache-catalog.sqlite` beside the watch root (the walk
-skips the `.just_cache` prefix, so it can never be moved onto a cold tier); `--catalog
-<FILE>` puts it anywhere else. A file the mover already offloaded is picked up by the
-first sync exactly like one offloaded afterwards — the migration story is ingest, not
-migrate.
-
-Each row records where the bytes are (a tier plus a storage key), their size, and the
-BLAKE3 checksum computed at ingest. An object moves through `present` -> `offloaded` ->
-`restoring`, and a location is only removed when another location still holds the object
-or when no name references it. Cache residency is never written to `location` (§2.1 of the
-design): a copy in a RAM or SSD promotion target is re-derivable, so a restart can never
-turn a volatile copy into data of record.
-
-`sync` **ingests new facts and reports contradictions; it never rewrites the catalog to
-match a hand-edited tree**. If a name the catalog recorded is gone or now hashes to
-different bytes, or a location's file vanished or changed, the difference is printed and
-the rows are left alone, and the command **exits `1`** so cron can alert (`0` clean, `2`
-bad invocation). An interrupted sync is rolled back whole — a catalog that disagrees with
-the tree is worse than none.
 ## Finding an object
 
 `locate` answers "where does this live" straight from the catalog, without walking the
@@ -569,14 +547,40 @@ A named limit: `scrub` is on demand; it does not schedule itself (that is P2), a
 location verified once is skipped until its content changes under the catalog. `--rate`
 is what makes a cron-driven scrub safe to run against a tier that is serving reads.
 
-## Running it continuously
+## Reconciling a re-added disk
+
+A disk that is unmounted while a sweep runs misses its copies: the sweep places the file
+only on the disks that are present, and the object stays below its floor (`catalog sync`
+reports it as `under-replicated`, `audit --copies N` as `replica-lost`). When the disk
+comes back, `reconcile` is what fills it in:
 
 ```sh
-# one sweep per hour, forever
-just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --interval 3600
+# see what would be rebuilt before anything is written
+just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite --dry-run
+
+# rebuild every missing copy a surviving sibling can supply
+just_cache reconcile --catalog /mnt/cache/media/.just_cache-catalog.sqlite
 ```
 
-Or schedule single sweeps from cron/systemd and use `--once` instead.
+What it guarantees:
+
+- **The source is proved, not assumed.** A sibling is used only after its bytes are hashed
+  and compared to the object's recorded checksum — a copy that merely matches on size is
+  not a source, and one that hashes to something else is marked damaged and skipped.
+- **The rebuilt copy is verified before it is recorded.** The bytes go to a private
+  `.just_cache-partial-*` sibling, are read back and hashed there, and only a verified
+  copy is renamed into place; only then is the location recorded, with the real checksum.
+  A failed rebuild leaves the location absent, never holding unknown bytes.
+- **Nothing is deleted.** Not the source of a rebuild, not a copy restored by hand that
+  already sits where the copy belongs (that one is hashed and *adopted* instead), not a
+  file reconcile cannot vouch for.
+- **A destination root is never created.** A disk that is still unmounted is reported
+  (`tier not mounted`), not silently turned into a directory on the wrong filesystem.
+
+Exit codes: `0` every recorded floor already met, `1` something was rebuilt/adopted or
+could not be (a disk being out is evidence cron should see once), `2` bad invocation — a
+missing catalog file, since the recorded checksum a rebuild is proved against lives there.
+Like `scrub`, it runs on demand; deciding *when* to reconcile is P2.
 
 ## Building and testing
 
