@@ -14,7 +14,7 @@ globset = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-toml = "0.8"
+toml = "1.1"
 
 # The envelope (#140): authenticated encryption for bytes crossing the machine boundary.
 # XChaCha20-Poly1305, pure Rust, no `unsafe`; `rand_core` supplies the OS entropy for the
