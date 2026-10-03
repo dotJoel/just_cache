@@ -28,6 +28,7 @@ pub mod locate;
 pub mod observe;
 pub mod opened;
 pub mod policy;
+pub mod recall;
 pub mod reconcile;
 pub mod replication;
 pub mod restore;

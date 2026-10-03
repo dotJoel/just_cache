@@ -1050,6 +1050,14 @@ impl Catalog {
             path: path.clone(),
             source,
         })?;
+        // The mount holds one connection for lookups and observation while an inline
+        // recall (#44) writes through its own; without a busy timeout the second writer
+        // gets SQLITE_BUSY at once and a recall that placed good bytes fails to record them.
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(|source| CatalogError::Open {
+                path: path.clone(),
+                source,
+            })?;
         conn.execute_batch(SCHEMA)
             .map_err(|source| CatalogError::Open {
                 path: path.clone(),
@@ -2196,6 +2204,78 @@ impl Catalog {
             ],
         )?;
         Ok(true)
+    }
+
+    /// Record a copy that an inline recall (issue #44) placed on the hot tier.
+    ///
+    /// `checksum` is the digest the placed bytes were *read back* to, not the one the
+    /// caller hoped for. When it equals the recorded checksum the copy is good: it
+    /// becomes the tier of record and the object is `present`, which is exactly what
+    /// `catalog sync` would conclude on its next pass. When it does not (or is `None`,
+    /// a read-back that could not finish) the row is written unverified, primary and
+    /// state untouched — the copy is *unknown*, never good, and the object stays
+    /// `offloaded` so nothing downstream counts the stray bytes as a home.
+    ///
+    /// Returns `Ok(false)` when the object is unknown; nothing is inserted (the mount is
+    /// not allowed to ingest).
+    pub fn record_recall(
+        &mut self,
+        object_hex: &str,
+        tier: &str,
+        storage_key: &str,
+        checksum: Option<&str>,
+    ) -> Result<bool, CatalogError> {
+        let Ok(object) = blake3::Hash::from_hex(object_hex) else {
+            return Ok(false);
+        };
+        let object = object.as_bytes().to_vec();
+        let tx = self.conn.transaction()?;
+        let recorded: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT checksum FROM object WHERE id = ?1",
+                params![object],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(recorded) = recorded else {
+            return Ok(false);
+        };
+        let found = checksum
+            .and_then(|hex| blake3::Hash::from_hex(hex).ok())
+            .map(|hash| hash.as_bytes().to_vec());
+        let good = found.as_deref() == Some(recorded.as_slice());
+        let now = now_seconds();
+        tx.execute(
+            "INSERT INTO location
+                 (object_id, tier, storage_key, is_primary, updated_at, verified, checksum)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+             ON CONFLICT(tier, storage_key) DO UPDATE SET
+                 object_id = excluded.object_id,
+                 updated_at = excluded.updated_at,
+                 verified = excluded.verified,
+                 checksum = excluded.checksum",
+            params![
+                object,
+                tier,
+                storage_key,
+                now,
+                i64::from(good),
+                if good { found.clone() } else { None }
+            ],
+        )?;
+        if good {
+            tx.execute(
+                "UPDATE location SET is_primary = (tier = ?2 AND storage_key = ?3)
+                  WHERE object_id = ?1",
+                params![object, tier, storage_key],
+            )?;
+            tx.execute(
+                "UPDATE object SET state = 'present' WHERE id = ?1",
+                params![object],
+            )?;
+        }
+        tx.commit()?;
+        Ok(good)
     }
 
     /// Record that a location was read back and matched the object it claims.

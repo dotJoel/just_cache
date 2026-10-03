@@ -77,6 +77,7 @@ use crate::cache::Overlay;
 use crate::catalog::{Catalog, CatalogError, DeleteError, DeleteRefusal};
 use crate::namespace::{Entry, Namespace, NamespaceError};
 use crate::observe::AccessLog;
+use crate::recall::{RecallError, RecallOutcome, RecallPolicy, Recaller};
 
 /// One second: names come from a catalog the mount does not watch, so a fresh lookup
 /// is cheap and a cached one must not outlive a `catalog sync` by long.
@@ -115,6 +116,11 @@ pub struct MountRequest {
     /// `[[cache]]` overlays to serve reads through, each with the root of the tier it
     /// sits in front of (§2.1, issue #46). Empty means no overlay.
     pub caches: Vec<(crate::tiers::CacheConfig, PathBuf)>,
+    /// The tier configuration, when there is one: it is what says a tier's recall class,
+    /// and so whether a read of an object offloaded there may recall inline (#44).
+    pub tiers: Option<crate::tiers::TierSet>,
+    /// What an inline recall does with the bytes it pulls up (`docs/design.md` §4).
+    pub recall: RecallPolicy,
 }
 
 /// Why a mount could not be served.
@@ -231,6 +237,12 @@ pub fn serve(request: &MountRequest) -> Result<(), MountError> {
 
     let mut filesystem = MountFs::new(catalog, namespace, request.watch.clone());
     filesystem.overlays = Mutex::new(overlays);
+    filesystem.recaller = Some(Recaller::new(
+        request.catalog_path.clone(),
+        request.watch.clone(),
+        request.tiers.clone(),
+        request.recall,
+    ));
     let mut config = Config::default();
     config.mount_options = mount_options();
 
@@ -283,6 +295,9 @@ struct MountFs {
     /// Cache overlays (§2.1). Reads may be served from a copy here; writes always land on
     /// the home and drop the copy first (write-invalidate).
     overlays: Mutex<Vec<Overlay>>,
+    /// Inline recall (#44): a read-only open of an offloaded name pulls it to the hot
+    /// tier first. `None` only in a filesystem built without a request.
+    recaller: Option<Recaller>,
 }
 
 impl MountFs {
@@ -300,6 +315,7 @@ impl MountFs {
             access_log: Mutex::new(AccessLog::new()),
             next_handle: AtomicU64::new(1),
             overlays: Mutex::new(Vec::new()),
+            recaller: None,
         }
     }
 
@@ -594,6 +610,37 @@ impl MountFs {
         }
     }
 
+    /// Recall an offloaded catalogued name before a read is served (#44), returning the
+    /// file the read should open. A name the catalog does not hold, or a mount with no
+    /// recaller, is served from `bytes` as before. A refusal (a `min`/`hours` tier) is
+    /// `EAGAIN` with the `restore` instruction on stderr — never ENOENT, since the
+    /// object exists; a failed recall is `EIO` naming the tier.
+    fn recall_for_read(&self, path: &str, bytes: PathBuf) -> Result<PathBuf, Errno> {
+        let Some(recaller) = &self.recaller else {
+            return Ok(bytes);
+        };
+        if !self.namespace.names_file(path) {
+            return Ok(bytes);
+        }
+        match recaller.recall(path) {
+            Ok(outcome) => {
+                if let RecallOutcome::Recalled { tier, .. } = &outcome {
+                    eprintln!("just_cache: recalled {path} from tier `{tier}` onto the hot tier");
+                }
+                Ok(outcome.bytes().to_path_buf())
+            }
+            Err(RecallError::NotCatalogued { .. }) => Ok(bytes),
+            Err(err @ RecallError::Refused { .. }) => {
+                eprintln!("just_cache: {err}");
+                Err(Errno::EAGAIN)
+            }
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                Err(Errno::EIO)
+            }
+        }
+    }
+
     /// `rmdir`: a directory still holding catalogued names is not empty, whatever the
     /// disk says — removing the directory would not delete those names.
     fn rmdir_path(&self, path: &str) -> Result<(), Errno> {
@@ -794,6 +841,15 @@ impl Filesystem for MountFs {
         let bytes = match flags.acc_mode() {
             OpenAccMode::O_RDONLY => {
                 options.read(true);
+                let bytes = match self.recall_for_read(&path, bytes) {
+                    Ok(bytes) => bytes,
+                    Err(errno) => {
+                        reply.error(errno);
+                        return;
+                    }
+                };
+                // The overlay sits in front of whatever the recall settled on, so a
+                // read-through recall can still be served from (and promote into) RAM.
                 self.read_source(&path, bytes)
             }
             OpenAccMode::O_WRONLY => {
