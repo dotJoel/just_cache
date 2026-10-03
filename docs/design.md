@@ -407,6 +407,19 @@ preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of 
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
 
+Closed in P1 by #75: the resume path no longer discards a repair candidate's verdict. When a
+group has rot but no sibling verified clean *this run*, `scrub` re-reads its already-verified
+locations as possible repair sources — and that re-read is now recorded as the location's real
+verdict rather than thrown away. A candidate that has rotted since it was last verified
+replaces its `AlreadyVerified` entry with `Corrupt`, so it joins the damage pass and
+`mark_damaged` drops its `scrub_state` row instead of leaving a row that keeps claiming the
+bytes were verified (which every later scrub would skip without reading). The search also
+carries on past a failed candidate, so a clean sibling *later* in the group is still found and
+used as the source. Before the fix only the first already-verified location was tried, its
+non-clean result was ignored, and `tests/scrub.rs` pins both behaviours: two locations rotted
+in place are both marked damaged, and a rotted first candidate plus a clean later one repairs
+from the later one.
+
 Closed in P1 by `just_cache restore` through the catalog (#18): restoring an object now
 verifies the bytes it writes against the object's **recorded checksum**, not against the
 cold copy's own bytes. The open-if-present rule the rest of the tool uses applies: a
@@ -669,7 +682,9 @@ Still open, and honestly so:
 - **Scrub has no schedule of its own.** `just_cache scrub` is an on-demand command; the
   background scheduler that decides how often to re-scrub is P2, and until it exists a
   location verified once is skipped until its content changes under the catalog (or the
-  damage record for it is cleared). `--rate` is what makes a cron-driven scrub safe to run
+  damage record for it is cleared) — unless it is the only candidate repair source for a
+  group that has rot, in which case it is re-read and a failed read is marked damaged
+  (#75, above). `--rate` is what makes a cron-driven scrub safe to run
   against a tier that is serving reads.
 - **`audit --json` does not carry the scrub section.** `audit --catalog` adds
   "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
