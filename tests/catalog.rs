@@ -557,6 +557,51 @@ fn an_unreadable_file_is_not_recorded_as_missing() {
     );
 }
 
+/// Issue #50 at the operator's surface: the second sync stops reading every file, says
+/// how many it trusted from the (size, mtime, inode) cache, and `--force-rehash` is the
+/// escape hatch for a rewrite that kept size and mtime.
+#[test]
+fn a_second_sync_reports_cached_digests_and_force_rehash_rereads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hot = tmp.path().join("hot");
+    let cold = tmp.path().join("cold");
+    fs::create_dir_all(&hot).unwrap();
+    fs::create_dir_all(&cold).unwrap();
+    fs::write(hot.join("a.bin"), b"payload one").unwrap();
+    fs::write(hot.join("b.bin"), b"payload two").unwrap();
+
+    let first = sync(&hot, &cold);
+    assert_exit(&first, 0);
+    assert!(
+        stdout(&first).contains("2 hashed, 0 trusted"),
+        "the first sync hashes everything and must say so:\n{}",
+        stdout(&first)
+    );
+
+    let second = sync(&hot, &cold);
+    assert_exit(&second, 0);
+    assert!(
+        stdout(&second).contains("0 hashed, 2 trusted"),
+        "the shortcut must be reported, not silent:\n{}",
+        stdout(&second)
+    );
+
+    let forced = bin()
+        .args(["catalog", "sync", "--watch"])
+        .arg(&hot)
+        .args(["--dest"])
+        .arg(&cold)
+        .arg("--force-rehash")
+        .output()
+        .expect("just_cache runs");
+    assert_exit(&forced, 0);
+    assert!(
+        stdout(&forced).contains("2 hashed, 0 trusted"),
+        "--force-rehash must re-read every file:\n{}",
+        stdout(&forced)
+    );
+}
+
 fn canonical(path: &Path) -> String {
     fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())

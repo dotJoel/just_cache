@@ -839,8 +839,12 @@ Still open, and honestly so:
   (§4, P2). The `state` column is likewise derived at sync from whether a hot and a cold copy
   both exist, not written by `restore`: a completed restore only becomes `present` after the
   next `catalog sync`, and until then `audit` tells a restore-in-progress from a true duplicate.
-- **Every file is hashed on every sync.** Correct, because identity is the hash, but not
-  cheap; there is no digest cache keyed on size and mtime yet.
+- **A same-size, same-mtime rewrite is invisible to the digest cache.** A sync keys a
+  file's digest on `(size, mtime, inode)` (#50, below), so a rewrite that preserves all
+  three — an in-place edit of exactly the same length with the mtime restored — returns
+  the stale digest and the sync reports no difference. `catalog sync --force-rehash`
+  reads every file again for exactly that case. Named rather than hidden: the cache is an
+  optimization, and this is the one change it cannot see.
 - **Journal records carry a size, not a digest.** Recovery refuses to link a name to a
   copy whose size does not match what the move promised, which is the strongest check
   available without hashing every file before every move. A same-size-but-corrupt copy
@@ -1152,6 +1156,23 @@ through a rename, a deleted replica, a replacement that is repointed and one tha
 irreconcilable delete, a report-only pass and a clean tree; the three resolution cases were
 checked to fail with the drop/repoint step removed, which is what makes them coverage rather
 than decoration.
+Closed by #50: `catalog sync` no longer hashes every file on every run. It keeps a digest
+cache in the catalog's own `digest_cache` table keyed on `(size, mtime, inode)`: a file whose
+identity still matches its recorded digest is not read, and only a changed or unseen file is
+hashed and re-recorded. The shortcut is never silent — a sync's summary now prints
+`digests: N hashed, M trusted from the (size, mtime, inode) cache`, and `SyncReport` carries
+both counts for callers. The cache lives in the catalog (under the `.just_cache` prefix, or
+beside `--catalog`), has no foreign key to `object`, and is written only after the ingest
+commits, so it is never a second source of truth: deleting the table — or the whole catalog —
+costs the next sync its time and changes nothing else, which
+`a_second_sync_trusts_the_digest_cache_instead_of_hashing`,
+`touching_a_file_makes_the_next_sync_hash_it_again`, and
+`losing_the_digest_cache_costs_time_not_correctness` pin (each fails if the trust branch is
+removed). The risk the key hides is named above: a rewrite preserving size *and* mtime *and*
+inode is not detected, so `catalog sync --force-rehash` re-reads every file on demand and
+rebuilds the cache as it goes. Deliberately out of scope: a scrub still reads every byte by
+definition, and an audit's hash is a verification rather than the same "is this the file I
+last saw" question — neither consults the cache.
 
 ## 10. Non-goals
 
