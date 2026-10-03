@@ -2,13 +2,13 @@
 
 Move idle files from a fast filesystem to slower local roots without changing their
 names. `just_cache` journals each move and includes tools to catalog, locate, audit,
-scrub and restore copies — so cold storage is something you can inspect and manage, not
-just a file move to remember.
+scrub and restore copies, so cold-storage files can be inspected and managed, not just
+moved.
 
 Point it at a directory and one or more cold-storage roots. On each sweep it walks the
-tree, uses filesystem access time to find idle files, and moves eligible files to a cold
-root, leaving a symlink at the original path. Programs that do not follow symlinks may
-need a different arrangement.
+tree, uses filesystem access time (where the mount records it) to find idle files, and
+moves eligible files to a cold root, leaving a symlink at the original path. Programs
+that do not follow symlinks may be unable to open these files.
 
 ```sh
 just_cache \
@@ -66,17 +66,17 @@ catalog and integrity commands.
 - `sweep --copies N` can require N verified copies on distinct configured destination
   roots before removing the source. Those roots may still be on the same host; this is
   not off-host backup.
-- `catalog sync` records file identities and locations in SQLite. `locate`, `audit`,
-  `restore` and `scrub` let you inspect those records, check stored copies, and restore
+- `catalog sync` records each file's content hash and locations in SQLite. `locate`,
+  `audit`, `restore` and `scrub` inspect those records, check stored copies, and restore
   files. Cataloging and scrubbing are explicit commands, not automatic background
   services.
-- The original path becomes a symlink. Software that does not follow symlinks may not
-  work with this provider.
+- The original path becomes a symlink. Software that does not follow symlinks may not see
+  the file.
 
-The value today is a local mover with move recovery and tools for tracking and checking
-copies. The larger plan — one namespace across local disks, LAN peers, cloud object
-storage and offline volumes — is not implemented yet. See [Design](#design) for that
-roadmap and its current boundary.
+Today just_cache is a local mover with move recovery and explicit commands to record,
+locate, check, and restore copies. The larger plan — one namespace across local disks,
+LAN peers, cloud object storage and offline volumes — is not implemented yet. See
+[Design](#design) for that roadmap and its current boundary.
 
 ## Configuration
 

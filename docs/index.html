@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>just_cache — local cold storage you can inspect and check</title>
+<title>just_cache — local cold storage you can inspect and verify</title>
 <meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Cloud and offline tiers are planned, not yet supported.">
 <style>
   :root {
@@ -193,11 +193,12 @@
     requires verified copies on distinct configured roots before retiring the source; the roots
     can still be on the same host. With the catalog, <code class="inline">locate</code> reports recorded
     locations, while <code class="inline">scrub</code> checks stored bytes against their recorded hashes
-    and can repair from a verified sibling. These catalog and scrub operations are explicit commands.
+    and can repair a damaged copy from a sibling copy whose bytes match its recorded hash.
+    These catalog and scrub operations are explicit commands.
   </p>
   <p>
     The longer-term design extends this catalog and namespace to LAN, cloud-object and offline
-    volume tiers, with retrieval requirements made explicit. Those providers are not implemented
+    volume tiers, with recall latency and cost declared per tier. Those providers are not implemented
     yet; the current tool handles local filesystem roots. <a href="design.md">See the design and roadmap.</a>
   </p>
 </section>
