@@ -28,8 +28,9 @@ and [`catalog resolve ...`](#the-catalog) concludes the differences it reports,
 [`locate ...`](#finding-an-object) says where an object lives,
 [`restore ...`](#restoring-a-file) brings an offloaded file back,
 [`scrub ...`](#scrubbing-for-bitrot) reads every stored copy back and verifies it against
-the catalog, and [`reconcile ...`](#reconciling-a-re-added-disk) rebuilds copies a
-re-added disk is missing.
+the catalog, [`reconcile ...`](#reconciling-a-re-added-disk) rebuilds copies a
+re-added disk is missing, and [`mount ...`](#mounting-the-namespace) serves the namespace
+as a real filesystem so a consumer that does not follow symlinks still sees bytes.
 
 ## Contents
 
@@ -47,6 +48,7 @@ re-added disk is missing.
 - 🔙 [Restoring a file](#restoring-a-file)
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
 - 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
+- 🗂️ [Mounting the namespace](#mounting-the-namespace)
 - ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
 - 🔨 [Building and testing](#building-and-testing)
 - 👷 [How this codebase is built](#how-this-codebase-is-built)
@@ -760,6 +762,47 @@ missing catalog file, since the recorded checksum a rebuild is proved against li
 Like `scrub`, it runs on demand — or on the cadence `schedule.toml` gives it
 ([Scheduling the maintenance passes](#scheduling-the-maintenance-passes)).
 
+## Mounting the namespace
+
+A consumer that does not follow symlinks — `rsync`'s defaults, some SMB clients,
+qBittorrent's verify — sees a migrated file as a link, not as bytes. `just_cache mount`
+serves the catalog's names as a real filesystem instead, so an offloaded file reads as
+its content:
+
+```sh
+mkdir /mnt/cache-view
+just_cache mount /mnt/cache-view \
+  --watch /mnt/cache/media \
+  --dest /mnt/cache/cold --dest /mnt/archive
+# ... and from another shell, `/mnt/cache-view/shows/ep1.mkv` is a real file
+fusermount3 -u /mnt/cache-view    # or Ctrl-C in the mounting terminal
+```
+
+What the mount is:
+
+- **The catalog's namespace, over the tiers of record.** `ls`, `stat` and `read` answer
+  from the bytes at each object's primary location — the watch root for a present file, a
+  cold tier for an offloaded one. The mountpoint must already exist and be empty.
+- **A write goes through to the tier of record.** A write to a mounted file changes the
+  bytes where they already live; a new file is created under the watch root (the hot
+  tier). The mount adds no second way to place bytes — no partial file, no journal entry —
+  and it never rewrites the catalog, so the next `catalog sync` picks up a rewrite exactly
+  as it picks up any other.
+- **Rename is confined to the watch root.** A hot name can be renamed (the tree shows it
+  afterwards); a name whose bytes are on a cold tier refuses with `EROFS`. Deletion is not
+  implemented (`unlink`/`rmdir` answer `EROFS`): it is a catalog transition (§3), a
+  separate issue. Access observation and inline recall are likewise the issues after this
+  one, not here.
+- **It fails closed.** No catalog is a usage error (a mount over none would present an
+  empty namespace); a catalog with no recorded roots, or a mountpoint that is missing or
+  not empty, is refused; a name whose bytes are gone answers `EIO`, never an empty file.
+  If the daemon dies, the kernel answers `ENOTCONN` — the mountpoint never reads as an
+  empty tree — and `Ctrl-C`/`SIGTERM` unmount before the process exits.
+
+`mount` needs `/dev/fuse` and the `fusermount3` helper; it is Unix-only, and no other
+subcommand depends on FUSE at run time, so the symlink mover and every read-only command
+keep working with no mount anywhere.
+
 ## Scheduling the maintenance passes
 
 `scrub` and `reconcile` are on-demand commands, and a small `schedule.toml` lets them run
@@ -924,7 +967,9 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/schedule.rs`](src/schedule.rs) | The maintenance schedule: `schedule.toml`, which pass is due at a given time, the last-run state file, and the free-space floor a pass is held back by. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile` and `schedule` subcommands) and the sweep loop. |
+| [`src/namespace.rs`](src/namespace.rs) | The catalog's names resolved into a directory tree, with a proven filesystem path to each object's tier of record — the testable half of `mount`. |
+| [`src/fuse.rs`](src/fuse.rs) | The FUSE adapter over the namespace: inode↔path, read/write through to the tier of record, and the fail-closed refusals. Unix-only; nothing else links `fuser`. |
+| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule` and `mount` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |

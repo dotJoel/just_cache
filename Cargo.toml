@@ -24,5 +24,19 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
 
+# The FUSE namespace provider (`just_cache mount`, issue #42). `default-features =
+# false` drops fuser's `libfuse` feature: the mount then talks to `/dev/fuse`
+# directly and only needs the `fusermount3` setuid helper at run time, so a build
+# host does not need libfuse headers — CI's `ubuntu-24.04` image has neither. The
+# binding is Unix-only; no other subcommand links it, so a sweep/audit on a host
+# with no FUSE kernel module still builds and runs.
+fuser = { version = "0.18", default-features = false }
+
+# Ctrl-C/SIGTERM handling so `mount` unmounts before it exits. fuser's pure-Rust
+# path does not install signal handlers; without this a SIGINT would kill the
+# process with the mount still live (an `ENOTCONN` mountpoint the operator has to
+# clear by hand), instead of the clean teardown the issue asks for.
+ctrlc = { version = "3", features = ["termination"] }
+
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { version = "1", features = ["fs"] }
