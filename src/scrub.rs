@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::catalog::{Catalog, CatalogError, ScrubTarget};
+use crate::catalog::{Catalog, CatalogError, MalformedRow, ScrubTarget};
 use crate::digest;
 use crate::restore;
 
@@ -142,6 +142,9 @@ enum Check {
     Missing,
     /// The location could not be read at all (permissions, I/O error).
     Unreadable(String),
+    /// The row was refused before any filesystem call: its tier is not a trusted root, or
+    /// its key would escape one. Reported, never touched (issue #72).
+    Malformed,
 }
 
 /// One repair that a scrub did, or (dry run) would do.
@@ -181,6 +184,9 @@ pub struct ScrubReport {
     pub damaged: Vec<DamageRecord>,
     pub missing: Vec<PathBuf>,
     pub unreadable: Vec<(PathBuf, String)>,
+    /// Catalog rows refused as paths (issue #72): reported, and no filesystem call was
+    /// made for them.
+    pub malformed: Vec<MalformedRow>,
     /// Tier roots that do not exist, named once each rather than as one missing file per
     /// location underneath them.
     pub skipped_tiers: Vec<String>,
@@ -196,6 +202,7 @@ impl ScrubReport {
             || !self.damaged.is_empty()
             || !self.missing.is_empty()
             || !self.unreadable.is_empty()
+            || !self.malformed.is_empty()
             || !self.skipped_tiers.is_empty()
     }
 
@@ -204,6 +211,9 @@ impl ScrubReport {
         let mut lines = Vec::new();
         for tier in &self.skipped_tiers {
             lines.push(format!("  tier not mounted, not checked: {tier}"));
+        }
+        for row in &self.malformed {
+            lines.push(row.describe());
         }
         for repair in &self.repairs {
             let verb = if repair.applied {
@@ -245,13 +255,14 @@ impl ScrubReport {
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!("scrub: {}", self.catalog.display())];
         lines.push(format!(
-            "  locations: {} ({} verified, {} already verified (skipped), {} repaired, {} damaged, {} missing)",
+            "  locations: {} ({} verified, {} already verified (skipped), {} repaired, {} damaged, {} missing, {} malformed)",
             self.locations,
             self.verified,
             self.already_verified,
             self.repairs.len(),
             self.damaged.len(),
-            self.missing.len()
+            self.missing.len(),
+            self.malformed.len()
         ));
         lines.extend(self.finding_lines());
         if !self.has_findings() {
@@ -281,6 +292,9 @@ pub struct ScrubRequest<'a> {
 pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
     let catalog = request.catalog;
     let targets = catalog.scrub_targets()?;
+    // The canonical roots a row's tier must be one of before its key becomes a path. Read
+    // once, so a hand-edited tier cannot be joined at all (issue #72).
+    let roots = catalog.roots()?;
     let mut limiter = RateLimiter::new(request.rate_kib_per_sec);
 
     let mut report = ScrubReport {
@@ -292,9 +306,13 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
 
     // A tier root that is not there is reported once, not as one missing file per location
     // underneath it: an unmounted disk is a different problem from rot, and its copies may
-    // be perfectly intact.
+    // be perfectly intact. A row whose tier is not a trusted root is not even stat'ed here;
+    // it is reported as malformed when its object is reached.
     let mut missing_tiers: BTreeSet<String> = BTreeSet::new();
     for target in &targets {
+        if target.path(&roots).is_err() {
+            continue;
+        }
         if !Path::new(&target.tier).is_dir() {
             missing_tiers.insert(target.tier.clone());
         }
@@ -313,6 +331,7 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
         scrub_object(
             catalog,
             &targets[start..index],
+            &roots,
             &mut limiter,
             request.dry_run,
             &missing_tiers,
@@ -327,6 +346,7 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
 fn scrub_object(
     catalog: &Catalog,
     group: &[ScrubTarget],
+    roots: &[PathBuf],
     limiter: &mut RateLimiter,
     dry_run: bool,
     missing_tiers: &BTreeSet<String>,
@@ -336,7 +356,7 @@ fn scrub_object(
         // A catalog row whose id is not a BLAKE3 digest cannot be verified against. Report
         // it as a catalog problem rather than calling the file corrupt.
         report.unreadable.push((
-            group[0].path(),
+            PathBuf::from(format!("{}/{}", group[0].tier, group[0].storage_key)),
             format!(
                 "catalog object id is {} bytes, not a 32-byte digest",
                 group[0].object.len()
@@ -348,6 +368,18 @@ fn scrub_object(
 
     let mut checks: Vec<Check> = Vec::with_capacity(group.len());
     for target in group {
+        // Every filesystem call below is reached only after the row has proved it stays
+        // under a trusted root; a refused row is reported and skipped untouched (#72).
+        let path = match target.path(roots) {
+            Ok(path) => path,
+            Err(error) => {
+                report
+                    .malformed
+                    .push(MalformedRow::new(&target.tier, &target.storage_key, &error));
+                checks.push(Check::Malformed);
+                continue;
+            }
+        };
         if missing_tiers.contains(&target.tier) {
             checks.push(Check::Missing);
             continue;
@@ -357,7 +389,7 @@ fn scrub_object(
             report.already_verified += 1;
             continue;
         }
-        let check = check_location(target, &expected, limiter);
+        let check = check_location(&path, target.size, &expected, limiter);
         match &check {
             Check::Clean => {
                 report.verified += 1;
@@ -365,9 +397,9 @@ fn scrub_object(
                     catalog.record_verified(&target.tier, &target.storage_key, &target.object)?;
                 }
             }
-            Check::Missing => report.missing.push(target.path()),
-            Check::Unreadable(detail) => report.unreadable.push((target.path(), detail.clone())),
-            Check::AlreadyVerified | Check::Corrupt => {}
+            Check::Missing => report.missing.push(path),
+            Check::Unreadable(detail) => report.unreadable.push((path, detail.clone())),
+            Check::AlreadyVerified | Check::Corrupt | Check::Malformed => {}
         }
         checks.push(check);
     }
@@ -397,7 +429,22 @@ fn scrub_object(
             if checks[index] != Check::AlreadyVerified {
                 continue;
             }
-            let check = check_location(target, &expected, limiter);
+            // Each candidate's path comes from the validating accessor: a row that does not
+            // stay under a trusted root is refused rather than read, and is reported as a
+            // catalog problem here instead of being silently skipped (#72).
+            let path = match target.path(roots) {
+                Ok(path) => path,
+                Err(error) => {
+                    report.malformed.push(MalformedRow::new(
+                        &target.tier,
+                        &target.storage_key,
+                        &error,
+                    ));
+                    checks[index] = Check::Malformed;
+                    continue;
+                }
+            };
+            let check = check_location(&path, target.size, &expected, limiter);
             // This location was counted as skipped during the first pass, but the fallback
             // read did real work. Move it from the skip count into the actual result count.
             report.already_verified -= 1;
@@ -411,14 +458,12 @@ fn scrub_object(
                 break;
             }
             match &check {
-                Check::Missing => report.missing.push(target.path()),
-                Check::Unreadable(detail) => {
-                    report.unreadable.push((target.path(), detail.clone()))
-                }
+                Check::Missing => report.missing.push(path),
+                Check::Unreadable(detail) => report.unreadable.push((path, detail.clone())),
                 // Corruption is the reason to keep looking and to mark it below; the loop
                 // simply carries on to the next already-verified candidate.
                 Check::Corrupt => {}
-                Check::Clean | Check::AlreadyVerified => unreachable!(),
+                Check::Clean | Check::AlreadyVerified | Check::Malformed => unreachable!(),
             }
             checks[index] = check;
         }
@@ -433,10 +478,16 @@ fn scrub_object(
 
     match source {
         Some(source_index) => {
-            let good = group[source_index].path();
+            let Ok(good) = group[source_index].path(roots) else {
+                return Ok(());
+            };
             for i in corrupt_indices {
                 let target = &group[i];
-                let path = target.path();
+                // A Corrupt location resolved successfully above, so this is the same path
+                // that was read; a refused row was never Corrupt.
+                let Ok(path) = target.path(roots) else {
+                    continue;
+                };
                 if dry_run {
                     report.repairs.push(RepairRecord {
                         path,
@@ -492,7 +543,10 @@ fn scrub_object(
             let mut locations = Vec::new();
             for i in corrupt_indices {
                 let target = &group[i];
-                locations.push(target.path());
+                let Ok(path) = target.path(roots) else {
+                    continue;
+                };
+                locations.push(path);
                 if !dry_run {
                     catalog.mark_damaged(
                         &target.tier,
@@ -515,17 +569,17 @@ fn scrub_object(
 
 /// Read one location back and compare it with the object's checksum.
 fn check_location(
-    target: &ScrubTarget,
+    path: &Path,
+    size: u64,
     expected: &blake3::Hash,
     limiter: &mut RateLimiter,
 ) -> Check {
-    let path = target.path();
     // `symlink_metadata`, not `metadata`: a symlink at a recorded location is not a copy.
     // `metadata` follows the final component, so a link to a byte-identical target would
     // stat as a regular file, hash clean, and be recorded verified — a name the tool
     // vouches for while the bytes it points at can be removed without the catalog
     // noticing, which is the invariant-6 shape.
-    match fs::symlink_metadata(&path) {
+    match fs::symlink_metadata(path) {
         Err(_) => Check::Missing,
         Ok(metadata) if !metadata.is_file() => {
             Check::Unreadable(format!("not a regular file: {}", path.display()))
@@ -533,8 +587,8 @@ fn check_location(
         // A wrong length is a mismatch on its own; there is no need to read a 40 GB file
         // to discover that a 12-byte one is not it. The digest is still the authority for
         // a same-size change, which is exactly the bit rot this exists to catch.
-        Ok(metadata) if metadata.len() != target.size => Check::Corrupt,
-        Ok(_) => match digest::file_digest_reading(&path, |bytes| limiter.account(bytes)) {
+        Ok(metadata) if metadata.len() != size => Check::Corrupt,
+        Ok(_) => match digest::file_digest_reading(path, |bytes| limiter.account(bytes)) {
             Ok(found) if found == *expected => Check::Clean,
             Ok(_) => Check::Corrupt,
             Err(error) => Check::Unreadable(error.to_string()),
