@@ -32,6 +32,12 @@
 //!   destination vanished, so exactly one copy is torn out and every later destination is
 //!   an ordinary one. `N` is a byte count here, not a copy ordinal, which is why it cannot
 //!   also name the copy — the first is the only one it can touch.
+//! * `replace-verified-dest=N` — on the **first** destination whose existing bytes verify
+//!   as an identical copy of the source, and *after* that verification but *before* the
+//!   source is removed, the destination is unlinked and replaced by a different file.
+//!   This is the window in which removing the source would delete the last verified copy
+//!   because the name no longer resolves to what was read. `N` is unused (the seam fires
+//!   once); it exists because the value grammar is uniform.
 //!
 //! A *set but unparseable* value panics rather than being ignored: a fault switch that
 //! silently no-ops would let a mistyped test pass green with no fault injected, which is
@@ -48,6 +54,7 @@ pub(crate) enum FaultMode {
     VanishReadback,
     CorruptReadback,
     UnlinkMidCopy,
+    ReplaceVerifiedDest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +77,7 @@ impl Fault {
             "vanish-readback" => FaultMode::VanishReadback,
             "corrupt-readback" => FaultMode::CorruptReadback,
             "unlink-mid-copy" => FaultMode::UnlinkMidCopy,
+            "replace-verified-dest" => FaultMode::ReplaceVerifiedDest,
             other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
         };
         let at = ordinal
@@ -92,4 +100,14 @@ static MID_COPY_DISARMED: AtomicBool = AtomicBool::new(false);
 /// The first caller wins the single `unlink-mid-copy` fault; every later copy is spared.
 pub(crate) fn claim_unlink_mid_copy() -> bool {
     !MID_COPY_DISARMED.swap(true, Ordering::SeqCst)
+}
+
+/// Disarms after the one `replace-verified-dest` seam has fired. Like `unlink-mid-copy`,
+/// per process: it models *a* destination being swapped, and the sweep must still be able
+/// to process the next file normally.
+static REPLACE_DEST_DISARMED: AtomicBool = AtomicBool::new(false);
+
+/// The first caller wins the single `replace-verified-dest` fault; later moves are spared.
+pub(crate) fn claim_replace_verified_dest() -> bool {
+    !REPLACE_DEST_DISARMED.swap(true, Ordering::SeqCst)
 }

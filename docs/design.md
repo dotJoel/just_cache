@@ -546,6 +546,23 @@ is kept. `tests/scrub.rs` and the `replication` module's tests both drive a link
 byte-identical target — with the link's own length equal to the source's, so the old
 length check waved it through — and fail when either guard is reverted.
 
+Closed by #71: a `--dest` path that resolves through a symlink no longer escapes the root.
+The mover now opens the destination directory once, walking each component *beneath* the
+root with `O_NOFOLLOW|O_DIRECTORY` (creating missing ones with `mkdirat`), and refuses a
+component that is a symlink (or is not a directory) with a named `DestinationSymlink` /
+`DestinationNotDirectory` report. The partial is created and the finished copy published
+with `openat`/`renameat` relative to that held descriptor, so a component swapped after
+resolution cannot redirect the write — resolving with `openat2(RESOLVE_BENEATH)` was the
+alternative, but per-component `O_NOFOLLOW` needs no kernel-version floor and no `unsafe`.
+The same descriptor is re-stat'ed (`fstat` of a fresh `O_NOFOLLOW` open, compared by
+`(st_dev, st_ino)`) immediately before the source is removed, so a destination replaced
+after its content verified leaves the source in place instead of deleting the last verified
+copy. Both behaviours have deterministic integration tests: a symlinked `--dest` component
+on a second filesystem (`tests/cross_device.rs`), and, through a new
+`JUST_CACHE_FAULT=replace-verified-dest` seam, an adoption whose destination is swapped in
+the verification-to-removal window (`tests/fault_injection.rs`). Both fail if the guard is
+reverted.
+
 Still open, and honestly so:
 
 - **The open-descriptor re-check is a fresh scan, not a lock (#77).** The sweep's
@@ -796,6 +813,18 @@ Still open, and honestly so:
   "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
   document has no `scrub` object yet; only the readable path reports it. The readable
   output is what ships, and the omission is named rather than silently implied.
+- **The symlinked-component guard covers the mover, not every writer.** #71 resolves and
+  holds the destination directory only in `move_file_with_symlink`. `copy_into_place`, which
+  `--copies` replication and `reconcile` call, still opens `dest.parent()` by path, so a
+  symlinked component under a `--dest` root reached by those paths is not yet refused. The
+  mover is where the sweep's bytes land first, which is what the issue asked to close; the
+  replication/restore writers are a follow-up, named here rather than left implied.
+- **Destination metadata is applied through a path, not the held descriptor.** `chmod`,
+  `chown`, xattr and timestamp helpers in this crate take a path; the partial's name is
+  private and unguessable and is created inside the verified directory, and the in-scope
+  escape (a symlink already in the destination tree) is refused before it. A component
+  swapped by a process with write access to the root's *ancestors* remains out of scope
+  (SECURITY.md), and is the reason the metadata helpers were not converted to `f*` variants.
 
 ## 10. Non-goals
 
@@ -830,6 +859,14 @@ Still open, and honestly so:
   exactly as it is — silently chmodding a file the operator already has would be a
   surprising side effect of running `catalog sync` — and a caller who wants it private
   changes the mode once, by hand.
+
+- **`openat2`/`RESOLVE_BENEATH` and sandboxing are not the containment mechanism.**
+  #71 refuses a symlinked destination component with per-component `O_NOFOLLOW` and holds
+  the resolved directory open for the writes that follow. That needs no minimum kernel
+  beyond ordinary `openat`, keeps `unsafe` out of the move layer (the crate already routes
+  Unix metadata through `rustix`, never raw `libc`), and draws the line at the
+  already-present symlink the issue is about. Landlock/seccomp confinement of the whole
+  process is a different, larger feature and is not implied by the fix.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.
 - **Locking a watched file against future opens is not attempted.** The pre-move

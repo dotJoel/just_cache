@@ -220,3 +220,52 @@ fn a_failed_cross_device_copy_leaves_no_partial_file_behind() {
         "the source bytes are untouched by a failed cross-device move"
     );
 }
+
+/// A symlink anywhere in the destination path *beneath* the root is refused. Following it
+/// would put the copy outside the root the operator named, and the symlink left in the
+/// watched tree would point there too — the SECURITY.md escape case this issue fixes.
+#[test]
+fn a_symlinked_component_under_the_destination_is_refused() {
+    let Some(second) = support::second_fs() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let cold = support::work_dir(&second, "cross-device-symlinked-dest");
+    // A directory outside the destination root: if the symlink were followed, this is
+    // where the copy would land.
+    let elsewhere = support::work_dir(&second, "cross-device-elsewhere");
+    fs::create_dir_all(watch.join("media")).unwrap();
+    let bytes = payload(32 * 1024);
+    fs::write(watch.join("media/big.bin"), &bytes).unwrap();
+
+    // `cold/media` is a symlink to a directory outside `cold`.
+    std::os::unix::fs::symlink(elsewhere.path(), cold.path().join("media")).unwrap();
+
+    let entries = scan(&watch);
+    let entry = find(&entries, "media/big.bin");
+    support::assert_cross_device(&watch, cold.path());
+    support::assert_rename_is_cross_device(&watch, cold.path());
+
+    let err = disk_management::move_file_with_symlink(cold.path(), entry)
+        .expect_err("a symlinked destination component must be refused");
+    assert!(
+        matches!(err, DiskError::DestinationSymlink { .. }),
+        "expected DestinationSymlink, got {err:?}"
+    );
+
+    // Nothing was written through the link, on either side of it.
+    assert!(
+        !elsewhere.path().join("big.bin").exists(),
+        "the copy must not land outside the destination root"
+    );
+    assert!(
+        !cold.path().join("media/big.bin").exists(),
+        "nothing may be written through the symlinked component"
+    );
+    // The source is untouched: still a real file with its bytes, and no link left behind.
+    let source = watch.join("media/big.bin");
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    assert!(!fs::symlink_metadata(&source).unwrap().is_symlink());
+    assert!(support::partial_files(cold.path()).is_empty());
+}
