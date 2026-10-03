@@ -40,6 +40,16 @@ fn parse_size_arg(text: &str) -> Result<u64, String> {
     scope::parse_size(text).map_err(|err| err.to_string())
 }
 
+/// Parse `--read-budget`. A zero budget is refused rather than accepted as "read nothing":
+/// the same reason `--rate 0` is, a switch that silently no-ops is a mistyped test.
+fn parse_read_budget(text: &str) -> Result<u64, String> {
+    let bytes = parse_size_arg(text)?;
+    if bytes == 0 {
+        return Err("--read-budget must be at least 1 byte".to_string());
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "just_cache",
@@ -503,9 +513,30 @@ struct ReconcileArgs {
     #[arg(long)]
     dry_run: bool,
 
+    /// Leave a destination alone unless it has at least this much free space, on top of
+    /// room for the rebuilt copy — the same floor `--min-free-gb` applies to a replicated
+    /// sweep. A tier below it is refused and named before any byte is read.
+    #[arg(long, value_name = "GB", default_value_t = 1.0)]
+    min_free_gb: f64,
+
+    /// Cap the total bytes one reconcile pass may read, as `512`, `64KiB` or `2GiB`.
+    ///
+    /// A rebuild reads its source twice — once to prove it matches the recorded checksum,
+    /// once to copy it — so this bounds how much of a busy tier one pass touches. An object
+    /// the budget cannot admit is deferred and reported, never silently skipped; because it
+    /// is left unchanged, the next pass resumes at it. Omit for unlimited.
+    #[arg(long, value_name = "SIZE", value_parser = parse_read_budget)]
+    read_budget: Option<u64>,
+
     /// Print only problems.
     #[arg(short, long)]
     quiet: bool,
+}
+
+impl ReconcileArgs {
+    fn min_free_bytes(&self) -> u64 {
+        (self.min_free_gb.max(0.0) * 1_073_741_824.0) as u64
+    }
 }
 
 fn main() -> ExitCode {
@@ -1303,6 +1334,8 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
     let request = reconcile::ReconcileRequest {
         catalog: &catalog,
         dry_run: args.dry_run,
+        min_free: args.min_free_bytes(),
+        read_budget: args.read_budget,
     };
     let report = match reconcile::reconcile(&request) {
         Ok(report) => report,

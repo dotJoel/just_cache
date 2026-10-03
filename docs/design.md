@@ -742,13 +742,21 @@ Still open, and honestly so:
   rewrite state) makes reconcile see a `present` object and skip it — the same `catalog
   sync` that reports the under-replication brings the state current, and reconcile acts on
   the catalog as recorded rather than re-deriving it.
-- **Reconcile hashes every sibling candidate it considers.** The `verified` flag is not
-  trusted as a source vouch (that is the whole point), so a rebuild reads its source once
-  to prove it and once to copy it. No read budget yet (`scrub` has `--rate`); a rebuild of
-  a large object on a busy tier is unthrottled.
-- **Reconcile has no free-space gate.** A replicated sweep refuses a destination below
-  `--min-free-gb`; a rebuild only fails when the copy itself fails, which is reported per
-  object. A pre-flight floor is a small, honest addition when someone needs it.
+- **Reconcile hashes every sibling candidate it considers; a read budget now bounds the
+  pass.** The `verified` flag is not trusted as a source vouch (that is the whole point),
+  so a rebuild reads its source once to prove it and once to copy it — the cost the pass
+  states. `--read-budget` (a *total*, not `scrub`'s per-second `--rate`) caps the bytes one
+  pass may read: an object the budget cannot admit is deferred and reported, and because a
+  deferred object is left byte-for-byte unchanged, the next pass resumes at it. What is
+  still open is the *number* of reads, not their total: every candidate that misses the
+  checksum is read before it is rejected, so a directory of near-miss siblings costs more
+  than the single read a match would.
+- **Reconcile refuses a destination below the free-space floor a replicated sweep uses.**
+  `--min-free-gb` (default 1.0, the sweep's value) is checked through the same
+  `disk_management::destination_with_room` a sweep calls, before any read: a destination
+  below the floor is left alone and reported, naming the root that would have been filled.
+  The check is by the object's recorded length, which is all the catalog holds, so a sparse
+  object whose allocated size is smaller may be refused conservatively (§10).
 
 - **Replication is opt-in and same-host.** `sweep --copies N` places a verified copy on
   N distinct `--dest` roots before it retires the source, and `catalog sync --copies N`
@@ -1039,6 +1047,27 @@ both renderings for the same catalog — before a scrub (nothing verified) and a
 hard-coded zero in both; `json_scrub_is_null_for_a_walk_based_audit` pins the no-catalog
 `null`. A unit test in `audit.rs` pins the object's exact shape.
 
+Closed by #49: `reconcile` now carries the two pre-flight gates §9 named. Before a byte is
+read for a rebuild, `destination_with_room` — the exact function a replicated sweep calls —
+answers whether the destination is above `--min-free-gb` (default 1.0, the sweep's default);
+a destination below it is refused and reported as `no room to rebuild`, naming the root that
+would have been filled, rather than being filled and failing the copy later. A
+`--read-budget` (human sizes: `512`, `64KiB`, `2GiB`; omitted means unlimited) is a *total*
+cap on a pass, deliberately not `scrub`'s per-second `--rate`: every read the pass plans —
+proving a sibling, hashing a copy already present to decide adopt-or-conflict, and the copy
+itself — is admitted against it *before* it happens, so the pass cannot start a read it
+cannot afford. An object the budget cannot admit is reported as `deferred` and left
+byte-for-byte unchanged; with no scrub-state row to mark it skipped, the next run simply
+finds it again, and the summary states the cost ("a rebuild reads its source once to prove
+it matches the recorded checksum and once to copy it") and how much of the budget was spent.
+Both gates only ever add records, so the exit-code contract is untouched: a gated pass is
+still `1` ("something was found"), never a clean `0`. `tests/reconcile.rs` drives the real
+binary for both — a destination under a floor far above any available space is refused with
+its root named and no copy written, and a pass stopped by a 1 KiB budget reports the object
+as deferred and leaves it absent, so a following pass with room rebuilds it — and both tests
+fail if the gates are removed. What is deliberately left to `scrub`, and named in §10, is
+*pacing*: a budget and a rate answer different questions.
+
 ## 10. Non-goals
 
 - **Deciding *when* to reconcile is not this feature's job.** `just_cache reconcile` is an
@@ -1116,3 +1145,13 @@ hard-coded zero in both; `json_scrub_is_null_for_a_walk_based_audit` pins the no
   already ship (#25, #36) are the pattern it points at, not a queue of rework. A seam that
   a later change proves malformed — or inert when it should fire — is a bug in the feature
   that owns it, fixed on its own terms rather than by reopening this rule.
+- **Reconcile's read budget is a total, not a pace.** `--read-budget` caps the bytes one
+  pass may read and defers what it cannot admit; it does not smooth those reads over time
+  the way `scrub --rate` does, so a pass that stays inside its budget still reads a busy
+  tier as fast as the disk allows. A rate limiter is a separate question (#49 stops at the
+  bound the acceptance criteria asked for).
+- **Reconcile's free-space check uses the recorded length, not the allocated size.** The
+  catalog holds an object's length and not its block count, so a sparse object whose holes
+  make it cost far less than its length is measured by the length and refused against the
+  floor conservatively. The mover measures allocation because it has the file in hand;
+  reconcile has only the row.

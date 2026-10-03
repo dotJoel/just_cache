@@ -80,9 +80,18 @@ fn replicated_sweep(watch: &Path, dests: &[&Path]) -> Output {
         .expect("just_cache runs")
 }
 
+/// `reconcile` with the free-space gate explicitly off: the default floor is a real tier
+/// gate (1.0 GiB, the sweep's value), and the cross-device destination this suite uses is
+/// a small tmpfs that must still take a copy. Tests about the gate itself call
+/// [`reconcile_with_floor`].
 fn reconcile(catalog: &Path, extra: &[&str]) -> Output {
+    reconcile_with_floor(catalog, "0", extra)
+}
+
+fn reconcile_with_floor(catalog: &Path, floor_gb: &str, extra: &[&str]) -> Output {
     let mut command = bin();
     command.arg("reconcile").arg("--catalog").arg(catalog);
+    command.args(["--min-free-gb", floor_gb]);
     command.args(extra);
     command.output().expect("just_cache runs")
 }
@@ -605,6 +614,104 @@ fn an_object_with_no_surviving_copy_is_reported_and_nothing_is_deleted() {
     assert!(fs::symlink_metadata(watch.join("clip.bin"))
         .unwrap()
         .is_symlink());
+}
+
+/// A rebuild refuses a destination below the free-space floor a replicated sweep applies,
+/// naming the root it would have filled, and leaves it absent. The floor is set far above
+/// any real filesystem so the refusal is deterministic rather than a bet on how full the
+/// test machine happens to be.
+#[test]
+fn a_destination_below_the_free_space_floor_is_refused_and_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let dest_a = tmp.path().join("cold-a");
+    let dest_b = tmp.path().join("cold-b");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&dest_a).unwrap();
+    fs::create_dir_all(&dest_b).unwrap();
+    let catalog = watch.join(CATALOG_NAME);
+    let bytes = payload(8192);
+    fs::write(watch.join("clip.bin"), &bytes).unwrap();
+
+    assert_exit(&catalog_sync(&watch, &[&dest_a, &dest_b], 2), 0);
+    assert_exit(&replicated_sweep(&watch, &[&dest_a, &dest_b]), 0);
+    assert_exit(&catalog_sync(&watch, &[&dest_a, &dest_b], 2), 0);
+
+    let missing = dest_b.join("clip.bin");
+    fs::remove_file(&missing).unwrap();
+    let root = fs::canonicalize(&dest_b).unwrap();
+
+    // A floor no filesystem can satisfy: the destination is below it whatever the machine.
+    let output = reconcile_with_floor(&catalog, "1000000000", &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("no room to rebuild") && text.contains(&root.display().to_string()),
+        "the refusal must name the root it would have filled; got:\n{text}"
+    );
+    assert!(!missing.exists(), "a gated destination must not be filled");
+
+    // The gate is only about free space: with it off, the same object rebuilds.
+    let output = reconcile(&catalog, &[]);
+    assert_exit(&output, 1);
+    assert_eq!(
+        fs::read(&missing).unwrap(),
+        bytes,
+        "with the floor off, the rebuild must still happen"
+    );
+}
+
+/// A pass stopped by the read budget reports the object as deferred and leaves it absent;
+/// a later pass with room rebuilds it. The deferral changes nothing, so the next run
+/// resumes where this one stopped — the state the report names.
+#[test]
+fn a_pass_stopped_by_the_read_budget_defers_and_a_later_pass_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let watch = tmp.path().join("hot");
+    let dest_a = tmp.path().join("cold-a");
+    let dest_b = tmp.path().join("cold-b");
+    fs::create_dir_all(&watch).unwrap();
+    fs::create_dir_all(&dest_a).unwrap();
+    fs::create_dir_all(&dest_b).unwrap();
+    let catalog = watch.join(CATALOG_NAME);
+    // 128 KiB: larger than the 1 KiB budget, small enough to rebuild cheaply.
+    let bytes = payload(128 * 1024);
+    fs::write(watch.join("clip.bin"), &bytes).unwrap();
+
+    assert_exit(&catalog_sync(&watch, &[&dest_a, &dest_b], 2), 0);
+    assert_exit(&replicated_sweep(&watch, &[&dest_a, &dest_b]), 0);
+    assert_exit(&catalog_sync(&watch, &[&dest_a, &dest_b], 2), 0);
+
+    let missing = dest_b.join("clip.bin");
+    fs::remove_file(&missing).unwrap();
+
+    // A budget smaller than even one hash of the source: the pass defers rather than reads.
+    let stopped = reconcile(&catalog, &["--read-budget", "1KiB"]);
+    // A gated pass is still "something was found", never a clean 0.
+    assert_exit(&stopped, 1);
+    let text = stdout(&stopped);
+    assert!(
+        text.contains("deferred") && text.contains("read budget"),
+        "the deferral must be reported, not silently skipped; got:\n{text}"
+    );
+    assert!(
+        !missing.exists(),
+        "a deferred object must be left exactly as it was"
+    );
+
+    // Nothing was changed, so a pass with room picks the same object up and rebuilds it.
+    let resumed = reconcile(&catalog, &["--read-budget", "1MiB"]);
+    assert_exit(&resumed, 1);
+    assert!(
+        stdout(&resumed).contains("rebuilt"),
+        "the next pass must resume at the deferred object:\n{}",
+        stdout(&resumed)
+    );
+    assert_eq!(fs::read(&missing).unwrap(), bytes);
+    assert!(
+        support::partial_files(&dest_b).is_empty(),
+        "a verified rebuild must leave no .just_cache-partial-* file"
+    );
 }
 
 /// A small guard for the helper shape above: `PathBuf` is used so `decode_hex` stays
