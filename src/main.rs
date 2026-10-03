@@ -109,6 +109,10 @@ enum Command {
     /// metadata, range reads, and `POST <path>?restore`) for consumers that cannot
     /// mount (issue #47).
     Gateway(GatewayArgs),
+    /// Serve an S3-compatible object endpoint backed by local directories, for LAN-peer
+    /// tiers (§4). Accepts PUT/GET/HEAD/DELETE for object keys, with SigV4 auth
+    /// verification (issue #142).
+    ObjectServer(ObjectServerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -819,6 +823,40 @@ struct GatewayArgs {
     quiet: bool,
 }
 
+/// Everything the S3-compatible object server needs. This is the server half of the
+/// LAN-peer tier (§4): a peer runs `just_cache object-server`, which speaks the same
+/// S3-compatible subset the object-store client uses — PUT/GET/HEAD/DELETE with SigV4
+/// auth, backed by local directories (#142).
+#[derive(Debug, Args)]
+struct ObjectServerArgs {
+    /// Address to listen on. Loopback by default; without `--insecure` a non-loopback
+    /// bind is refused because TLS is not yet implemented.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8731")]
+    listen: String,
+
+    /// The bucket name the server validates against every request. Must match the first
+    /// path segment of every incoming request path.
+    #[arg(long, value_name = "NAME")]
+    bucket: String,
+
+    /// Root directory to store objects under. Repeatable. Each root must be an existing
+    /// directory; a key is stored under the first root that resolves it.
+    #[arg(long, value_name = "DIR", required = true, num_args = 1..)]
+    root: Vec<PathBuf>,
+
+    /// Accept plain HTTP (for loopback testing). Without this flag a bind to a
+    /// non-loopback address is refused: TLS is not yet implemented.
+    #[arg(long)]
+    insecure: bool,
+
+    /// Where to read credentials from. A file path (first line = access key, second
+    /// line = secret access key) or an environment variable (value =
+    /// `ACCESS_KEY:with:colons:in:the:value`). For a file, pass the path; for an env
+    /// var, prefix with `$` (e.g. `--credential-source '$MY_CREDS'`).
+    #[arg(long, value_name = "SOURCE")]
+    credential_source: String,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -837,6 +875,7 @@ fn main() -> ExitCode {
         Some(Command::Mount(args)) => run_mount(args),
         Some(Command::Cache(args)) => run_cache(args),
         Some(Command::Gateway(args)) => run_gateway(args),
+        Some(Command::ObjectServer(args)) => run_object_server(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -3129,5 +3168,55 @@ fn run_gateway(args: GatewayArgs) -> ExitCode {
             eprintln!("just_cache: gateway failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Serve the object server on a local address until killed.
+///
+/// Exit `2` for a bad invocation (missing bucket, no credential source, no roots,
+/// non-loopback bind without `--insecure`); `1` if the listener fails while serving.
+fn run_object_server(args: ObjectServerArgs) -> ExitCode {
+    let credentials = parse_credential_source(&args.credential_source);
+    let creds = match credentials.load() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    let server = match just_cache::object_server::ObjectServer::bind(
+        &args.listen,
+        args.bucket,
+        args.root,
+        creds,
+        args.insecure,
+    ) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    if let Ok(addr) = server.local_addr() {
+        eprintln!("just_cache: object-server listening on http://{addr}/");
+    }
+
+    match server.serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("just_cache: object-server failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parse a `--credential-source` value: a path to a file, or `$ENV_VAR`.
+fn parse_credential_source(source: &str) -> just_cache::object_server::CredentialSource {
+    if let Some(var) = source.strip_prefix('$') {
+        just_cache::object_server::CredentialSource::Env(var.to_string())
+    } else {
+        just_cache::object_server::CredentialSource::File(PathBuf::from(source))
     }
 }

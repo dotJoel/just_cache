@@ -18,6 +18,7 @@ pub mod fuse;
 // the `gateway` subcommand reaches it.
 pub mod gateway;
 pub mod namespace;
+pub mod object_server;
 pub mod object_store;
 // Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
 // built without test cfg, so the fault seam has to be compiled into production and stay

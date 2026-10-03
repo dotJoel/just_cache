@@ -955,6 +955,27 @@ copy `restore` uses. The token may also be sent as the password of HTTP Basic, o
 `JUST_CACHE_GATEWAY_TOKEN`; it is never logged. The endpoint is plain HTTP and listens on
 loopback by default — put a TLS terminator in front before exposing it.
 
+## S3-compatible object server for LAN peers
+
+`object-server` is the server half of the LAN-peer tier: a peer runs it on their machine
+and it speaks the same S3-compatible subset the object-store client uses — PUT, GET, HEAD,
+DELETE with SigV4 auth — backed by local directories (#142).
+
+```sh
+just_cache object-server --bucket my-peer --root /mnt/disk1/objects --credential-source ./creds
+```
+
+The bucket name is validated against every request; credentials are read from a file
+or `$ENV_VAR`, never from the command line. Each `--root <DIR>` must be an existing
+directory; object keys must resolve inside one of them — `..` and absolute keys are
+refused, and a symlink escaping a root is caught at canonical lookup. Written bytes land
+via a `.partial` temp file in the same directory then atomic rename. Content-Length must
+match and Content-MD5 (if sent) is verified.
+
+Listen on loopback by default; `--insecure` allows plain HTTP for loopback testing, and
+on a non-loopback bind it prints a warning — TLS is not yet implemented (that is the
+follow-up work).
+
 ## Scheduling the maintenance passes
 
 `scrub` and `reconcile` are on-demand commands, and a small `schedule.toml` lets them run
@@ -1121,7 +1142,8 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
 | [`src/namespace.rs`](src/namespace.rs) | The catalog's names resolved into a directory tree, with a proven filesystem path to each object's tier of record — the testable half of `mount`. |
 | [`src/fuse.rs`](src/fuse.rs) | The FUSE adapter over the namespace: inode↔path, read/write through to the tier of record, and the fail-closed refusals. Unix-only; nothing else links `fuser`. |
-| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule` and `mount` subcommands) and the sweep loop. |
+|| [`src/object_server.rs`](src/object_server.rs) | The S3-compatible object server for LAN-peer tiers (#142): PUT/GET/HEAD/DELETE with SigV4 auth, path-containment, and atomic writes via `.partial` temp. |
+|| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule`, `mount`, `gateway` and `object-server` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |

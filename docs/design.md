@@ -93,7 +93,10 @@ Hard rules:
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
 than accepted and then treated as a filesystem. **As implemented (#141):** `fs` and
-`object` have drivers; `peer` and `offline` are still refused by name. The boundary rule (rule 2) is the type's own answer,
+`object` have drivers; `peer` and `offline` are still refused by name. **As implemented
+(#155 — the object-server):** a `peer` tier speaks the same S3-compatible subset the
+object-store client speaks — a peer runs `just_cache object-server` (the server half of
+#142), and the `peer` driver (the client half, the follow-up) connects to it. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -1579,6 +1582,17 @@ The `path` field remains the local scratch directory. E2E tests in
 interrupted upload keeps the source, a checksum mismatch adopts nothing. A manual run
 against a real S3 bucket is documented below since CI cannot cover a cloud endpoint
 deterministically.
+
+Closed by #155: `just_cache object-server` — the server half of the LAN-peer tier (#142). A
+peer runs this on their machine, speaking the same S3-compatible subset the object-store
+client (#141) uses: PUT/GET/HEAD/DELETE with SigV4 auth, backed by local directories under
+`--root`, validated against `--bucket`. Key containment is lexical + canonical (the #68/#71
+pattern); writes land via `.partial` temp + atomic rename; Content-Length/Content-MD5 are
+verified; the server fails closed on unknown requests. `--insecure` exists for plain HTTP on
+loopback; a non-loopback bind without TLS or `--insecure` is refused. TLS itself is the
+follow-up worker's, with the client half of the `peer` driver. Tests (7 unit tests) cover
+the PUT+GET round trip with real SigV4 signing, bad signature refusal, key escape refusal,
+atomicity, DELETE, Content-MD5 mismatch, and bind safety.
 
 ## 10. Non-goals
 
