@@ -1338,3 +1338,17 @@ therefore verified by a human running it with the gate set, and is named rather 
   and a read of an offloaded object does not pull it one tier up — those are the two issues
   after this one (§4, the issue's out-of-scope), and the mount is only the lookup/list/stat/
   read/write/rename over copies that are present.
+- **The mount's FUSE surface is deliberately incomplete, and the catalog is indexed once.**
+  `just_cache mount` (#42) implements the operations a read/write workload needs and refuses
+  the rest rather than answering them wrongly: `statfs` is the FUSE default, so `df`/`statvfs`
+  on the mount reports zeros and a consumer that checks free space before copying sees none;
+  `readlink` answers `ENOSYS`, so a symlink under the watch root that the catalog does not
+  name — one the mount therefore cannot serve as bytes — cannot be followed through it (a
+  symlink the mover left for a *catalogued* name never reaches `readlink`, because lookup
+  answers the tier of record instead); `chown` answers `EPERM`; and `symlink`/`link`/`mknod`
+  and the extended attributes answer `ENOSYS`. The namespace is also built **once, at mount
+  time**: a `catalog sync` that runs while the daemon serves is not observed until the next
+  mount, and a name created through the mount is served by the disk overlay before the
+  catalog knows it. Neither is a correctness hole — every read is still answered from a root
+  the catalog proved, and every row that cannot be resolved still refuses — but a long-lived
+  mount is a snapshot of the catalog it opened, not a live view of it.
