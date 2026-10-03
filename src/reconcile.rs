@@ -75,7 +75,9 @@ use crate::catalog::{
     STATE_PRESENT, STATE_RESTORING,
 };
 use crate::digest;
+use crate::disk_management;
 use crate::restore;
+use crate::scope::human_bytes;
 
 #[derive(Debug, Error)]
 pub enum ReconcileError {
@@ -111,6 +113,15 @@ pub enum ReconcileOutcome {
     Malformed { detail: String },
     /// The rebuild itself failed (permissions, a full disk, a torn read-back).
     Failed { detail: String },
+    /// The destination is below the free-space floor a replicated sweep applies, so the
+    /// rebuild was refused before a byte was read. The detail names the root that would
+    /// have been filled: this is the same `--min-free-gb` contract, reached through the
+    /// same `destination_with_room` a sweep calls, so the two gates cannot drift.
+    NoRoom { detail: String },
+    /// The pass's read budget could not admit this object's next read, so the object was
+    /// left exactly as it was and reported. Nothing was changed, so a later pass — with
+    /// more budget, or fewer objects ahead of it — finds it again and resumes there.
+    Deferred { detail: String },
 }
 
 impl ReconcileOutcome {
@@ -123,6 +134,8 @@ impl ReconcileOutcome {
             ReconcileOutcome::TierUnavailable => "tier-unavailable",
             ReconcileOutcome::NoSource { .. } => "no-source",
             ReconcileOutcome::Malformed { .. } => "malformed-catalog",
+            ReconcileOutcome::NoRoom { .. } => "no-room",
+            ReconcileOutcome::Deferred { .. } => "deferred",
             ReconcileOutcome::Failed { .. } => "failed",
         }
     }
@@ -176,6 +189,14 @@ impl ReconcileRecord {
                 self.path.display(),
                 self.object
             ),
+            ReconcileOutcome::NoRoom { detail } => {
+                format!("  no room to rebuild {}: {detail}", self.path.display())
+            }
+            ReconcileOutcome::Deferred { detail } => format!(
+                "  deferred {} (object {}): {detail}",
+                self.path.display(),
+                self.object
+            ),
             ReconcileOutcome::Failed { detail } => format!(
                 "  FAILED to rebuild {} (object {}): {detail}",
                 self.path.display(),
@@ -195,6 +216,14 @@ pub struct ReconcileReport {
     /// Destination tiers with a recorded floor, so an empty pass can say why it did
     /// nothing rather than look like a failure.
     pub tiers: usize,
+    /// The per-destination free-space floor this pass applied, in bytes (0 = no floor).
+    pub min_free: u64,
+    /// The total bytes the pass was allowed to read, or `None` for unlimited.
+    pub read_budget: Option<u64>,
+    /// Bytes the pass reserved against the budget, so the report can state what was spent.
+    pub reads: u64,
+    /// Objects left untouched because the read budget could not admit them.
+    pub deferred: usize,
     /// Every rebuild, adoption, refusal and failure, in object order.
     pub records: Vec<ReconcileRecord>,
 }
@@ -221,7 +250,7 @@ impl ReconcileReport {
         };
         let mut lines = vec![format!("reconcile: {}", self.catalog.display())];
         lines.push(format!(
-            "  objects: {} ({} destination tier(s) with a recorded floor); rebuilt: {}, adopted: {}, conflicts: {}, tiers unavailable: {}, no verified sibling: {}, malformed-catalog: {}, failed: {}",
+            "  objects: {} ({} destination tier(s) with a recorded floor); rebuilt: {}, adopted: {}, conflicts: {}, tiers unavailable: {}, no verified sibling: {}, malformed-catalog: {}, no room: {}, deferred: {}, failed: {}",
             self.objects,
             self.tiers,
             count("rebuilt"),
@@ -230,8 +259,35 @@ impl ReconcileReport {
             count("tier-unavailable"),
             count("no-source"),
             count("malformed-catalog"),
+            count("no-room"),
+            count("deferred"),
             count("failed")
         ));
+        // The cost, stated where the command reports it — the same number the budget is
+        // spent against: a rebuild proves its source, then copies it, so one object is two
+        // reads of the source. (The read-back of the fresh copy is the write's own bytes,
+        // not a second read of the tier.)
+        lines.push(
+            "  read cost: a rebuild reads its source once to prove it matches the recorded \
+             checksum and once to copy it"
+                .to_string(),
+        );
+        match self.read_budget {
+            Some(budget) => lines.push(format!(
+                "  read budget: {} of {} reserved; {} object(s) deferred to a later pass, \
+                 which resumes at them because a deferred object is left unchanged",
+                human_bytes(self.reads),
+                human_bytes(budget),
+                self.deferred
+            )),
+            None => lines.push("  read budget: unlimited".to_string()),
+        }
+        if self.min_free > 0 {
+            lines.push(format!(
+                "  free-space floor: {} per destination (the same --min-free-gb a sweep applies)",
+                human_bytes(self.min_free)
+            ));
+        }
         lines.extend(self.finding_lines());
         if self.records.is_empty() {
             lines.push("  every recorded copy floor is met or unreconcilable".to_string());
@@ -243,12 +299,78 @@ impl ReconcileReport {
     }
 }
 
+/// The total bytes one reconcile pass may read, or `None` for unlimited.
+///
+/// The pass's reads are all hashing: proving a sibling before it is copied from, hashing a
+/// copy already at a destination to decide adopt-or-conflict, and the copy itself. A rebuild
+/// reads its source once to prove it matches the recorded checksum and once to copy it, so
+/// the budget is usually spent at twice an object's length. It is deliberately a *total* and
+/// not `scrub`'s per-second `--rate`: the two answer different questions, and a pass that
+/// runs out of budget leaves every unread object byte-for-byte unchanged — there is no
+/// scrub-state row to mark it skipped — so the next run simply finds it again.
+#[derive(Debug)]
+pub struct ReadBudget {
+    limit: Option<u64>,
+    consumed: u64,
+}
+
+impl ReadBudget {
+    pub fn new(limit: Option<u64>) -> Self {
+        ReadBudget { limit, consumed: 0 }
+    }
+
+    /// Reserve `bytes` for a read that is about to happen, before it does.
+    ///
+    /// Returns `false` when the read would push the pass past its budget; a caller that gets
+    /// `false` must not read, and must report the object as deferred. Reserving up front
+    /// rather than counting after is what keeps a pass from starting a read it cannot afford
+    /// and being stopped mid-file by its own cap.
+    pub fn admit(&mut self, bytes: u64) -> bool {
+        match self.limit {
+            None => {
+                self.consumed = self.consumed.saturating_add(bytes);
+                true
+            }
+            Some(limit) if self.consumed.saturating_add(bytes) <= limit => {
+                self.consumed += bytes;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Bytes reserved so far (the reads the pass committed to).
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// The budget, for a report line that names it.
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+}
+
+/// The two pre-flight gates one pass applies — the free-space floor and the read budget —
+/// carried together so the pass threads one piece of state rather than two loose arguments.
+struct Gates {
+    min_free: u64,
+    budget: ReadBudget,
+}
+
 /// Everything one reconcile needs. Like `scrub`, it names no `--watch`/`--dest`: the
 /// catalog already holds every tier root and the floor recorded for it.
 pub struct ReconcileRequest<'a> {
     pub catalog: &'a Catalog,
     /// Resolve and report what would be rebuilt, writing neither a copy nor any row.
     pub dry_run: bool,
+    /// Leave a destination alone unless it has at least this much free space, on top of
+    /// room for the copy — the same floor `--min-free-gb` applies to a sweep. `0` means no
+    /// floor. Checked through the same `destination_with_room` a sweep calls.
+    pub min_free: u64,
+    /// Total bytes the pass may read, or `None` for unlimited. A rebuild reads its source
+    /// twice (prove, then copy), so this bounds how much of a busy tier one pass touches; an
+    /// object the budget cannot admit is deferred and reported, never silently skipped.
+    pub read_budget: Option<u64>,
 }
 
 /// Rebuild every missing replica that a surviving verified sibling can supply.
@@ -267,6 +389,10 @@ pub fn reconcile(request: &ReconcileRequest<'_>) -> Result<ReconcileReport, Reco
         dry_run: request.dry_run,
         objects: catalog.object_count()?,
         tiers: floors.len(),
+        min_free: request.min_free,
+        read_budget: request.read_budget,
+        reads: 0,
+        deferred: 0,
         records: Vec::new(),
     };
     // No recorded floor means no durability contract to maintain: a plain `catalog sync`
@@ -275,6 +401,10 @@ pub fn reconcile(request: &ReconcileRequest<'_>) -> Result<ReconcileReport, Reco
         return Ok(report);
     }
 
+    let mut gates = Gates {
+        min_free: request.min_free,
+        budget: ReadBudget::new(request.read_budget),
+    };
     for object in catalog.reconcile_objects()? {
         reconcile_object(
             catalog,
@@ -282,9 +412,12 @@ pub fn reconcile(request: &ReconcileRequest<'_>) -> Result<ReconcileReport, Reco
             &floors,
             &roots,
             request.dry_run,
+            &mut gates,
             &mut report,
         )?;
     }
+    // What the pass committed to read, for the report's budget line.
+    report.reads = gates.budget.consumed();
 
     Ok(report)
 }
@@ -312,8 +445,10 @@ fn reconcile_object(
     floors: &[(String, usize)],
     roots: &[PathBuf],
     dry_run: bool,
+    gates: &mut Gates,
     report: &mut ReconcileReport,
 ) -> Result<(), ReconcileError> {
+    let min_free = gates.min_free;
     let object_hex = hex(&object.object);
 
     // A hot copy is not relying on its replicas, so replication does not apply yet. This
@@ -461,47 +596,61 @@ fn reconcile_object(
             // Something is already there. Hash it: only the catalog's recorded checksum
             // can tell the object (adopt it, rewrite nothing) from a same-size stranger
             // (refuse it, touch nothing).
-            Ok(metadata) if metadata.is_file() => match digest::file_digest(&dest) {
-                Ok(found) if found == expected => {
-                    if !dry_run {
-                        catalog.record_replica(
-                            &object.object,
-                            &tier,
-                            &key,
-                            true,
-                            Some(&object.checksum),
-                        )?;
+            Ok(metadata) if metadata.is_file() => {
+                // Hashing the file is a read like any other: a budget that cannot admit it
+                // defers the object rather than reading past the cap.
+                if !gates.budget.admit(metadata.len()) {
+                    report.records.push(deferred_record(
+                        &object_hex,
+                        dest.clone(),
+                        metadata.len(),
+                        &gates.budget,
+                    ));
+                    report.deferred += 1;
+                    continue;
+                }
+                match digest::file_digest(&dest) {
+                    Ok(found) if found == expected => {
+                        if !dry_run {
+                            catalog.record_replica(
+                                &object.object,
+                                &tier,
+                                &key,
+                                true,
+                                Some(&object.checksum),
+                            )?;
+                        }
+                        report.records.push(ReconcileRecord {
+                            object: object_hex.clone(),
+                            path: dest,
+                            outcome: ReconcileOutcome::Adopted,
+                        });
+                        present += 1;
                     }
-                    report.records.push(ReconcileRecord {
+                    Ok(found) => report.records.push(ReconcileRecord {
                         object: object_hex.clone(),
                         path: dest,
-                        outcome: ReconcileOutcome::Adopted,
-                    });
-                    present += 1;
+                        outcome: ReconcileOutcome::Conflict {
+                            detail: format!(
+                                "holds a {}-byte file hashing to {} (recorded {}); left untouched",
+                                metadata.len(),
+                                found.to_hex(),
+                                expected.to_hex()
+                            ),
+                        },
+                    }),
+                    Err(error) => report.records.push(ReconcileRecord {
+                        object: object_hex.clone(),
+                        path: dest.clone(),
+                        outcome: ReconcileOutcome::Failed {
+                            detail: format!(
+                                "cannot read the existing file at {}: {error}",
+                                dest.display()
+                            ),
+                        },
+                    }),
                 }
-                Ok(found) => report.records.push(ReconcileRecord {
-                    object: object_hex.clone(),
-                    path: dest,
-                    outcome: ReconcileOutcome::Conflict {
-                        detail: format!(
-                            "holds a {}-byte file hashing to {} (recorded {}); left untouched",
-                            metadata.len(),
-                            found.to_hex(),
-                            expected.to_hex()
-                        ),
-                    },
-                }),
-                Err(error) => report.records.push(ReconcileRecord {
-                    object: object_hex.clone(),
-                    path: dest.clone(),
-                    outcome: ReconcileOutcome::Failed {
-                        detail: format!(
-                            "cannot read the existing file at {}: {error}",
-                            dest.display()
-                        ),
-                    },
-                }),
-            },
+            }
             Ok(_) => report.records.push(ReconcileRecord {
                 object: object_hex.clone(),
                 path: dest,
@@ -512,73 +661,124 @@ fn reconcile_object(
                 },
             }),
             // Absent: this is the copy to rebuild.
-            Err(_) => match resolve_source(catalog, object, &expected, roots, dry_run)? {
-                SourceResolution::None(detail) => report.records.push(ReconcileRecord {
-                    object: object_hex.clone(),
-                    path: dest,
-                    outcome: ReconcileOutcome::NoSource { detail },
-                }),
-                SourceResolution::Found(source) => {
-                    if dry_run {
-                        report.records.push(ReconcileRecord {
-                            object: object_hex.clone(),
-                            path: dest,
-                            outcome: ReconcileOutcome::Rebuilt {
-                                source,
-                                bytes: object.size,
-                                applied: false,
-                            },
-                        });
-                        present += 1;
-                        continue;
+            Err(_) => {
+                // Pre-flight free-space gate, through the same `destination_with_room` a
+                // replicated sweep uses, so the two gates cannot drift. Checked before any
+                // read: a tier below the floor is refused and named, not filled and then
+                // reported as a per-file failure after the copy.
+                if disk_management::destination_with_room(root, object.size, min_free).is_none() {
+                    report.records.push(ReconcileRecord {
+                        object: object_hex.clone(),
+                        path: dest.clone(),
+                        outcome: ReconcileOutcome::NoRoom {
+                            detail: no_room_detail(
+                                root,
+                                disk_management::available_space(root),
+                                object.size,
+                                min_free,
+                            ),
+                        },
+                    });
+                    continue;
+                }
+                match resolve_source(
+                    catalog,
+                    object,
+                    &expected,
+                    roots,
+                    dry_run,
+                    &mut gates.budget,
+                )? {
+                    SourceResolution::None(detail) => report.records.push(ReconcileRecord {
+                        object: object_hex.clone(),
+                        path: dest.clone(),
+                        outcome: ReconcileOutcome::NoSource { detail },
+                    }),
+                    SourceResolution::BudgetExhausted { needed } => {
+                        report.records.push(deferred_record(
+                            &object_hex,
+                            dest.clone(),
+                            needed,
+                            &gates.budget,
+                        ));
+                        report.deferred += 1;
                     }
-                    // Nested directories under an *existing* root are the mirrored layout
-                    // the mover already creates; the root itself is never created.
-                    if let Some(parent) = dest.parent() {
-                        if let Err(error) = fs::create_dir_all(parent) {
+                    SourceResolution::Found(source) => {
+                        if dry_run {
                             report.records.push(ReconcileRecord {
                                 object: object_hex.clone(),
                                 path: dest.clone(),
-                                outcome: ReconcileOutcome::Failed {
-                                    detail: format!(
-                                        "cannot create {} for the rebuilt copy: {error}",
-                                        parent.display()
-                                    ),
-                                },
-                            });
-                            continue;
-                        }
-                    }
-                    match restore::build_verified_copy(&source, &dest, &expected) {
-                        Ok(bytes) => {
-                            catalog.record_replica(
-                                &object.object,
-                                &tier,
-                                &key,
-                                true,
-                                Some(&object.checksum),
-                            )?;
-                            report.records.push(ReconcileRecord {
-                                object: object_hex.clone(),
-                                path: dest,
                                 outcome: ReconcileOutcome::Rebuilt {
                                     source,
-                                    bytes,
-                                    applied: true,
+                                    bytes: object.size,
+                                    applied: false,
                                 },
                             });
                             present += 1;
+                            continue;
                         }
-                        Err(error) => report.records.push(ReconcileRecord {
-                            object: object_hex.clone(),
-                            path: dest,
-                            outcome: ReconcileOutcome::Failed {
-                                detail: error.to_string(),
-                            },
-                        }),
+                        // The copy itself is one more read of the source; admit it before
+                        // the write so a budget that cannot afford it leaves the location
+                        // absent and the object deferred, never half-built.
+                        if !gates.budget.admit(object.size) {
+                            report.records.push(deferred_record(
+                                &object_hex,
+                                dest.clone(),
+                                object.size,
+                                &gates.budget,
+                            ));
+                            report.deferred += 1;
+                            continue;
+                        }
+                        // Nested directories under an *existing* root are the mirrored
+                        // layout the mover already creates; the root itself is never
+                        // created.
+                        if let Some(parent) = dest.parent() {
+                            if let Err(error) = fs::create_dir_all(parent) {
+                                report.records.push(ReconcileRecord {
+                                    object: object_hex.clone(),
+                                    path: dest.clone(),
+                                    outcome: ReconcileOutcome::Failed {
+                                        detail: format!(
+                                            "cannot create {} for the rebuilt copy: {error}",
+                                            parent.display()
+                                        ),
+                                    },
+                                });
+                                continue;
+                            }
+                        }
+                        match restore::build_verified_copy(&source, &dest, &expected) {
+                            Ok(bytes) => {
+                                catalog.record_replica(
+                                    &object.object,
+                                    &tier,
+                                    &key,
+                                    true,
+                                    Some(&object.checksum),
+                                )?;
+                                report.records.push(ReconcileRecord {
+                                    object: object_hex.clone(),
+                                    path: dest.clone(),
+                                    outcome: ReconcileOutcome::Rebuilt {
+                                        source,
+                                        bytes,
+                                        applied: true,
+                                    },
+                                });
+                                present += 1;
+                            }
+                            Err(error) => report.records.push(ReconcileRecord {
+                                object: object_hex.clone(),
+                                path: dest.clone(),
+                                outcome: ReconcileOutcome::Failed {
+                                    detail: error.to_string(),
+                                },
+                            }),
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -591,6 +791,9 @@ enum SourceResolution {
     Found(PathBuf),
     /// Nothing usable, with the reason.
     None(String),
+    /// The read budget would not admit the next sibling hash, so nothing further was read.
+    /// The object is deferred, not failed: a later pass with budget resumes here.
+    BudgetExhausted { needed: u64 },
 }
 
 /// Find a sibling that really is the object, by hashing it against the recorded checksum.
@@ -606,6 +809,7 @@ fn resolve_source(
     expected: &blake3::Hash,
     roots: &[PathBuf],
     dry_run: bool,
+    budget: &mut ReadBudget,
 ) -> Result<SourceResolution, ReconcileError> {
     let is_damaged = |location: &LocationRecord| {
         object
@@ -648,6 +852,12 @@ fn resolve_source(
         if !metadata.is_file() {
             continue;
         }
+        // Proving a sibling is a read; the budget admits it before the bytes move, so the
+        // pass never starts a hash it cannot afford.
+        let needed = metadata.len();
+        if !budget.admit(needed) {
+            return Ok(SourceResolution::BudgetExhausted { needed });
+        }
         match digest::file_digest(&path) {
             Ok(found) if found == *expected => return Ok(SourceResolution::Found(path)),
             Ok(found) => {
@@ -689,6 +899,49 @@ fn resolve_source(
 fn digest_of(checksum: &[u8]) -> Option<blake3::Hash> {
     let bytes: [u8; 32] = checksum.try_into().ok()?;
     Some(blake3::Hash::from_bytes(bytes))
+}
+
+/// The report line for a destination below the free-space floor: it names the root that
+/// would have been filled and by how much it is short, so the operator can tell which
+/// disk the gate stopped and why without re-running with a probe.
+fn no_room_detail(root: &Path, free: Option<u64>, needed: u64, min_free: u64) -> String {
+    let free = match free {
+        Some(bytes) => format!("{} free", human_bytes(bytes)),
+        None => "free space unknown".to_string(),
+    };
+    format!(
+        "{} is only {free}; the copy needs {} on top of the {} floor",
+        root.display(),
+        human_bytes(needed),
+        human_bytes(min_free)
+    )
+}
+
+/// One deferred object, reported with what the budget had already reserved and what the
+/// next read needed — the state the next pass resumes from, stated where the command
+/// reports rather than left to be inferred from a missing rebuild.
+fn deferred_record(
+    object_hex: &str,
+    path: PathBuf,
+    needed: u64,
+    budget: &ReadBudget,
+) -> ReconcileRecord {
+    let limit = match budget.limit() {
+        Some(bytes) => human_bytes(bytes),
+        None => "unlimited".to_string(),
+    };
+    ReconcileRecord {
+        object: object_hex.to_string(),
+        path,
+        outcome: ReconcileOutcome::Deferred {
+            detail: format!(
+                "read budget exhausted: {} of {limit} already reserved and this read needs {} \
+                 more; left untouched so the next pass resumes here",
+                human_bytes(budget.consumed()),
+                human_bytes(needed)
+            ),
+        },
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
