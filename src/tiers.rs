@@ -24,6 +24,14 @@
 //! volatile tier as a `--dest` root (a destination is a home) and as a policy target;
 //! everything else — treating a volatile tier as a copy location, a floor, a scrub source
 //! — is later work, and named as out of scope rather than half-built here.
+//!
+//! ## `[[cache]]` blocks are overlays, not tiers
+//!
+//! A `[[cache]]` table (§2.1, issue #46) describes a promotion target in front of one
+//! tier of record (`over`). It is parsed here, beside the tiers, but deliberately kept in
+//! a separate list: [`TierSet::tiers`] never yields a cache, so nothing that walks tiers —
+//! the catalog's locations, a copy floor, scrub, policy — can mistake one for a home. The
+//! overlay's runtime behaviour lives in [`crate::cache`].
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -153,6 +161,8 @@ pub enum TiersError {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TierSet {
     tiers: Vec<Tier>,
+    /// `[[cache]]` overlays, kept apart from `tiers` so no tier walk can yield one.
+    caches: Vec<CacheConfig>,
     /// The file this set was read from. `tiers.toml` may live inside the watched tree
     /// (the default is beside the watch root), so a sweep must be able to recognise its
     /// own config and leave it alone — see `Lifecycle::is_config_file`.
@@ -210,8 +220,14 @@ impl TierSet {
         for (name, tier) in raw.tiers {
             tiers.push(tier.into_tier(&name, text, path)?);
         }
+        let mut caches: Vec<CacheConfig> = Vec::with_capacity(raw.cache.len());
+        for cache in raw.cache {
+            let cache = cache.into_cache(&tiers, &caches, text, path)?;
+            caches.push(cache);
+        }
         Ok(TierSet {
             tiers,
+            caches,
             path: path.to_path_buf(),
         })
     }
@@ -222,6 +238,27 @@ impl TierSet {
 
     pub fn tiers(&self) -> &[Tier] {
         &self.tiers
+    }
+
+    /// Every `[[cache]]` overlay, in declaration order. Never part of [`TierSet::tiers`].
+    pub fn caches(&self) -> &[CacheConfig] {
+        &self.caches
+    }
+
+    /// The overlay declared under `name`, if any.
+    pub fn cache(&self, name: &str) -> Option<&CacheConfig> {
+        self.caches.iter().find(|cache| cache.name == name)
+    }
+
+    /// The overlay whose `path` is `root`, contains it, or sits inside it. A destination
+    /// root that overlaps an overlay in either direction would make cache bytes a home, so
+    /// the overlap — not only equality — is what the refusal is made of.
+    pub fn cache_overlapping(&self, root: &Path) -> Option<&CacheConfig> {
+        let wanted = canonical_or(root);
+        self.caches.iter().find(|cache| {
+            let path = canonical_or(&cache.path);
+            wanted.starts_with(&path) || path.starts_with(&wanted)
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&Tier> {
@@ -287,6 +324,15 @@ impl TierSet {
         for tier in &self.tiers {
             lines.push(format!("  {}", tier.describe()));
         }
+        if !self.caches.is_empty() {
+            lines.push(format!(
+                "caches: {} configured (ephemeral overlays, never data of record)",
+                self.caches.len()
+            ));
+            for cache in &self.caches {
+                lines.push(format!("  {}", cache.describe()));
+            }
+        }
         lines
     }
 }
@@ -317,6 +363,222 @@ impl Tier {
 #[derive(Debug, Deserialize)]
 struct RawFile {
     tiers: BTreeMap<String, RawTier>,
+    #[serde(default)]
+    cache: Vec<RawCache>,
+}
+
+/// How often a file must be read inside a window before it earns a cache copy:
+/// `promote_on = "2 accesses / 24h"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromoteOn {
+    pub accesses: u32,
+    pub window: std::time::Duration,
+}
+
+impl PromoteOn {
+    /// Parse `"N accesses / DURATION"` (`access` is accepted for N = 1).
+    pub fn parse(text: &str) -> Result<PromoteOn, String> {
+        let (count, window) = text
+            .split_once('/')
+            .ok_or_else(|| format!("`{text}` must be `N accesses / DURATION`"))?;
+        let mut words = count.split_whitespace();
+        let number = words.next().unwrap_or("");
+        let unit = words.next().unwrap_or("");
+        if words.next().is_some() || !matches!(unit, "access" | "accesses") {
+            return Err(format!("`{text}` must be `N accesses / DURATION`"));
+        }
+        let accesses: u32 = number
+            .parse()
+            .map_err(|_| format!("`{number}` in `{text}` is not a whole number of accesses"))?;
+        if accesses == 0 {
+            // Zero would promote every file ever opened, which is a full mirror, not a
+            // cache — and almost certainly a typo.
+            return Err(format!("`{text}` needs at least 1 access"));
+        }
+        let window = crate::policy::parse_duration(window)
+            .map_err(|err| format!("window in `{text}`: {err}"))?;
+        if window.is_zero() {
+            return Err(format!(
+                "`{text}` has a zero window, which no access can meet"
+            ));
+        }
+        Ok(PromoteOn { accesses, window })
+    }
+}
+
+/// One `[[cache]]` overlay (§2.1): a promotion target in front of tier `over`.
+///
+/// Only the values the design names are accepted: `kind = "fs"`, `evict = "lru"`,
+/// `write_policy = "write-invalidate"`. A writeback cache is refused rather than parsed,
+/// because RAM has no battery and a writeback overlay on a storage server is a data-loss
+/// design (§2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheConfig {
+    pub name: String,
+    /// The tier of record this overlay accelerates. Always a configured persistent tier.
+    pub over: String,
+    pub kind: String,
+    pub path: PathBuf,
+    pub max_size: u64,
+    pub promote_on: PromoteOn,
+}
+
+impl CacheConfig {
+    pub fn describe(&self) -> String {
+        format!(
+            "{}: over={} kind={} path={} max_size={} promote_on={} accesses / {}s evict=lru \
+             write_policy=write-invalidate (ephemeral)",
+            self.name,
+            self.over,
+            self.kind,
+            self.path.display(),
+            crate::scope::human_bytes(self.max_size),
+            self.promote_on.accesses,
+            self.promote_on.window.as_secs()
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCache {
+    name: toml::Spanned<String>,
+    over: toml::Spanned<String>,
+    kind: toml::Spanned<String>,
+    path: toml::Spanned<String>,
+    max_size: toml::Spanned<String>,
+    promote_on: toml::Spanned<String>,
+    evict: toml::Spanned<String>,
+    write_policy: toml::Spanned<String>,
+}
+
+impl RawCache {
+    fn into_cache(
+        self,
+        tiers: &[Tier],
+        earlier: &[CacheConfig],
+        text: &str,
+        file: &Path,
+    ) -> Result<CacheConfig, TiersError> {
+        let invalid = |span: std::ops::Range<usize>, detail: String| TiersError::Invalid {
+            path: file.to_path_buf(),
+            detail: format!("line {}: {detail}", line_at(text, span.start)),
+        };
+        let name = self.name.get_ref().trim().to_string();
+        if name.is_empty() {
+            return Err(invalid(
+                self.name.span(),
+                "a cache has an empty `name`".into(),
+            ));
+        }
+        // A cache sharing a tier's name would let a policy rule or a `--dest` lookup by
+        // name resolve to the overlay, so the namespaces are kept disjoint.
+        if tiers.iter().any(|tier| tier.name == name) || earlier.iter().any(|c| c.name == name) {
+            return Err(invalid(
+                self.name.span(),
+                format!("cache `{name}` reuses a name already given to a tier or cache"),
+            ));
+        }
+        let over_name = self.over.get_ref().trim();
+        let over =
+            tiers
+                .iter()
+                .find(|tier| tier.name == over_name)
+                .ok_or_else(|| {
+                    invalid(
+                self.over.span(),
+                format!("cache `{name}`: `over` names tier `{over_name}`, which is not configured"),
+            )
+                })?;
+        if !over.is_home() {
+            return Err(invalid(
+                self.over.span(),
+                format!(
+                    "cache `{name}`: `over` names volatile tier `{over_name}`; an overlay sits in \
+                     front of a tier of record"
+                ),
+            ));
+        }
+        let kind = self.kind.get_ref().trim().to_string();
+        if kind != "fs" {
+            return Err(invalid(
+                self.kind.span(),
+                format!("cache `{name}`: kind `{kind}` is not supported; only `fs` exists"),
+            ));
+        }
+        let raw_path = self.path.get_ref().trim();
+        let path = PathBuf::from(raw_path);
+        if raw_path.is_empty() || !path.is_absolute() {
+            return Err(invalid(
+                self.path.span(),
+                format!("cache `{name}`: path `{raw_path}` must be a non-empty absolute path"),
+            ));
+        }
+        // An overlay inside (or around) a tier root would put cache bytes where the walk,
+        // the catalog sync and scrub read data of record — exactly the confusion §2.1
+        // forbids. Refuse the overlap rather than hope every reader skips it.
+        let canonical = canonical_or(&path);
+        if let Some(tier) = tiers.iter().find(|tier| {
+            let root = canonical_or(&tier.path);
+            canonical.starts_with(&root) || root.starts_with(&canonical)
+        }) {
+            return Err(invalid(
+                self.path.span(),
+                format!(
+                    "cache `{name}`: path {} overlaps tier `{}` ({}); an overlay must live \
+                     outside every tier of record",
+                    path.display(),
+                    tier.name,
+                    tier.path.display()
+                ),
+            ));
+        }
+        let max_size = crate::scope::parse_size(self.max_size.get_ref()).map_err(|err| {
+            invalid(
+                self.max_size.span(),
+                format!("cache `{name}`: max_size: {err}"),
+            )
+        })?;
+        if max_size == 0 {
+            return Err(invalid(
+                self.max_size.span(),
+                format!("cache `{name}`: max_size must be greater than zero"),
+            ));
+        }
+        let promote_on = PromoteOn::parse(self.promote_on.get_ref()).map_err(|err| {
+            invalid(
+                self.promote_on.span(),
+                format!("cache `{name}`: promote_on {err}"),
+            )
+        })?;
+        if self.evict.get_ref().trim() != "lru" {
+            return Err(invalid(
+                self.evict.span(),
+                format!(
+                    "cache `{name}`: evict `{}` is not supported; only `lru` exists",
+                    self.evict.get_ref()
+                ),
+            ));
+        }
+        if self.write_policy.get_ref().trim() != "write-invalidate" {
+            return Err(invalid(
+                self.write_policy.span(),
+                format!(
+                    "cache `{name}`: write_policy `{}` is refused; only `write-invalidate` is \
+                     safe — a writeback overlay in RAM loses acknowledged writes on power loss \
+                     (docs/design.md §2.1)",
+                    self.write_policy.get_ref()
+                ),
+            ));
+        }
+        Ok(CacheConfig {
+            name,
+            over: over.name.clone(),
+            kind,
+            path,
+            max_size,
+            promote_on,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]

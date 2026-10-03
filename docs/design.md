@@ -128,6 +128,24 @@ Two consequences worth stating early:
   reboot deliberately rather than being re-warmed by re-reading. Media is already
   served acceptably from SSD, and the page cache covers incidental reuse for free.
 
+**As implemented (#46).** `[[cache]]` blocks are parsed beside the tiers in `tiers.toml`
+but kept in a separate list, so no walk over tiers — `location`, copy floors, scrub,
+policy — can yield one. Only `kind = "fs"`, `evict = "lru"` and `write_policy =
+"write-invalidate"` are accepted; `writeback` is refused at parse with the reason above.
+`over` must name a configured persistent tier, a cache's `path` must exist (never
+created) and must not overlap any tier root, and a cache name may not reuse a tier's.
+`mount` serves read-only opens through the overlay (`src/cache.rs`): a read that meets
+`promote_on` copies the home's bytes into `<path>/.just_cache-overlay-<name>/` and is
+served from the copy; LRU evicts until the new copy fits `max_size`, and a file larger
+than `max_size` is never promoted. A write-open, truncate or rename drops the copy before
+touching the home, and every hit re-checks the home's size/mtime/inode so a home changed
+outside the mount is never served stale. A `--dest` overlapping an overlay and a policy
+rule naming one are refused by name. Residency is mirrored into `cache_residency` for
+observability only (`just_cache cache status`, every line marked ephemeral). On restart
+the overlay is **emptied, not re-derived**: re-deriving would mean trusting bytes nothing
+watched while the process was down, so the "residency survives a reboot" note above is
+the deliberate cost of correctness for now (§9).
+
 ## 3. The catalog is the source of truth
 
 SQLite (single host) or Postgres (multi-host). One row per file version:
@@ -1272,6 +1290,25 @@ flag fails both tests in `tests/noatime_hashing.rs`. Gap: a file the tool does n
 still takes the plain-open fallback and can be refreshed by the read; that path is not
 exercised end to end, because the suite does not run as a second user.
 
+Closed by #46: a `[[cache]]` overlay is a promotion target, never a tier of record. The
+config is parsed and validated beside the tiers (`writeback`, a non-`lru` eviction, an
+`over` that is missing or volatile, a path overlapping a tier root, a reused name are each
+refused with the line); `TierSet::tiers` never yields a cache. Promotion copies bytes into
+an overlay-owned directory and moves nothing; LRU eviction keeps the overlay at or under
+`max_size`; a write, truncate or rename through the mount drops the copy first; a hit
+whose home changed behind the mount is dropped and re-read from home. A cache is refused
+as a `--dest` (on every subcommand that checks volatile tiers) and as a policy `from`/`to`.
+Losing the overlay is not data loss: no journal entry, no scrub state, no `location` row,
+and the overlay reopens empty, clearing its `cache_residency` rows. `tests/cache_overlay.rs`
+covers promotion, LRU eviction at `max_size`, write-invalidate, stale-home detection,
+reopen-empty, the `--dest` and policy refusals, and `cache status` marking residency
+ephemeral. Still open, and named: the FUSE call sites (`open`/`setattr`/`rename` calling
+`invalidate`) are exercised only through the library API, because the real-mount test is
+gated on `/dev/fuse`; a writer that opened its handle *before* a concurrent promotion is
+caught only by the size/mtime/inode re-check on the next hit, so a same-size rewrite within
+one mtime tick could be served stale until the next invalidating call; and residency does
+not yet survive a restart (the overlay is emptied instead).
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
@@ -1338,8 +1375,8 @@ exercised end to end, because the suite does not run as a second user.
   configured object — a name, a driver, a recall class, a volatility, a copy floor, a cost
   — and lets `locate`/`audit` speak in those names, and refuses a volatile tier as a
   destination. Lifecycle rules are evaluated by #41 (above); nothing
-  acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1) are a later
-  issue, and the only driver implemented is the existing `fs` symlink mover: an `object`,
+  acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1) are served
+  only through `mount` (#46), and the only driver implemented is the existing `fs` symlink mover: an `object`,
   `offline`, or `peer` tier parses and is named, but no bytes move to or from it. A
   config that named such a tier as a `--dest` would be accepted only because the destination
   still has to exist as a local directory — the driver half is P3.
