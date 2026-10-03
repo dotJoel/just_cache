@@ -320,6 +320,12 @@ struct CatalogSyncArgs {
     /// many copies happen to exist. Default 1.
     #[arg(long, value_name = "N", default_value_t = 1)]
     copies: usize,
+
+    /// Read every file again instead of trusting the (size, mtime, inode) digest cache.
+    /// Use after a rewrite that kept the same size and mtime, which the cache key cannot
+    /// see; the cache is rebuilt as the forced sync runs.
+    #[arg(long)]
+    force_rehash: bool,
 }
 
 /// Everything `catalog resolve` needs. It mirrors `catalog sync`'s tree inputs — the same
@@ -861,6 +867,7 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    catalog.set_force_rehash(args.force_rehash);
 
     // The copy floor is a per-tier property (#20), and a configured tier now carries its
     // own: `copies` in `tiers.toml` is the floor for that disk. Recorded once per tier,

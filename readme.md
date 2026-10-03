@@ -483,6 +483,13 @@ remains).
 ```sh
 just_cache catalog resolve --watch /mnt/cache/media --dest /mnt/disk-slow/media --apply
 ```
+The first sync reads every file's bytes, because identity *is* the hash. Later syncs do
+not: a digest is cached against the file's `(size, mtime, inode)`, so an unchanged file is
+trusted without being read again, and the summary reports which it did —
+`digests: N hashed, M trusted from the (size, mtime, inode) cache`. The cache is a cache,
+not a second source of truth: deleting it, or the whole catalog, costs the next sync its
+time and nothing else. The one change the key cannot see is a rewrite that preserves size
+*and* mtime *and* inode; `catalog sync --force-rehash` reads every file again for that case.
 
 ## Auditing consistency
 

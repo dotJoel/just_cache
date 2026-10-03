@@ -175,6 +175,21 @@ CREATE INDEX IF NOT EXISTS damage_by_object ON damage(object_id);
 CREATE TABLE IF NOT EXISTS root (
     path TEXT PRIMARY KEY
 );
+-- The digest cache (issue #50): a file's BLAKE3 digest keyed by the identity it was
+-- computed against, so a sync that sees the same (size, mtime, inode) does not read the
+-- bytes again. It is a cache, never a source of truth — deliberately no foreign key to
+-- `object`, because a row here is worthless the moment the file's identity changes and
+-- losing the whole table costs a sync its time, not its correctness. `CREATE TABLE IF
+-- NOT EXISTS` is the whole migration, so a catalog written before this gains it on the
+-- next open with no `ALTER TABLE` and no window in which a half-upgraded schema is read.
+CREATE TABLE IF NOT EXISTS digest_cache (
+    path        TEXT PRIMARY KEY,      -- canonical path the digest was computed at
+    size        INTEGER NOT NULL,
+    mtime_secs  INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL,
+    inode       INTEGER NOT NULL,
+    object_id   BLOB NOT NULL          -- the BLAKE3 digest, a value not a reference
+);
 ";
 
 #[derive(Debug, Error)]
@@ -578,6 +593,12 @@ pub struct SyncReport {
     pub objects_ingested: usize,
     pub names_ingested: usize,
     pub locations_ingested: usize,
+    /// Files this sync read the bytes of to get their digest.
+    pub hashed: usize,
+    /// Files whose (size, mtime, inode) still matched the digest cache, so the recorded
+    /// digest was trusted and the bytes were not read. Reported alongside `hashed` so the
+    /// shortcut is never silent: a sync that stopped hashing everything has to say so.
+    pub trusted: usize,
     pub differences: Vec<Difference>,
 }
 
@@ -606,6 +627,12 @@ impl SyncReport {
             self.names_ingested,
             self.locations,
             self.locations_ingested
+        ));
+        // A sync that stopped hashing every file must say so: "hashed 0, trusted 500" is
+        // the point of the digest cache, and hiding it would make a silent shortcut of it.
+        lines.push(format!(
+            "  digests: {} hashed, {} trusted from the (size, mtime, inode) cache",
+            self.hashed, self.trusted
         ));
         if self.differences.is_empty() {
             lines.push("no differences: the catalog agrees with the tree".to_string());
@@ -787,6 +814,67 @@ struct Applied {
     differences: Vec<Difference>,
 }
 
+/// The identity a digest is only valid for: the (size, mtime, inode) triple (issue #50).
+///
+/// mtime is nanosecond-precise from `stat`, and the inode is included so a delete-and-
+/// recreate at the same path with the same size and a restored mtime — which reuses the
+/// time key but almost never the inode — is not mistaken for the old bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    size: u64,
+    mtime_secs: i64,
+    mtime_nanos: i64,
+    inode: u64,
+}
+
+/// One remembered digest, and the file identity it was computed against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedDigest {
+    identity: FileIdentity,
+    object: ObjectId,
+}
+
+/// The digest cache for one sync: loaded before the walk, consulted per file, written
+/// back after a successful ingest.
+///
+/// This is a *cache* and must never be read as a source of truth. A miss (no row, or a
+/// row whose identity no longer matches) just means the file is hashed, exactly as every
+/// sync did before #50, so deleting the table — or the whole catalog — costs time and
+/// nothing else. The one thing the key cannot see is a rewrite that preserves size *and*
+/// mtime *and* inode; that is the limitation §9 names, and `--force-rehash` is the way
+/// out of it.
+#[derive(Debug, Default)]
+struct DigestCache {
+    /// path -> digest, from the table as it was before this sync.
+    entries: BTreeMap<String, CachedDigest>,
+    /// Entries re-hashed this sync, to be written back. Trusted entries are not rewritten.
+    updated: BTreeMap<String, CachedDigest>,
+    /// Files whose bytes were read for their digest.
+    hashed: usize,
+    /// Files whose recorded digest was trusted because the identity matched.
+    trusted: usize,
+}
+
+impl DigestCache {
+    /// The recorded digest for `path`, when the file still carries the identity the
+    /// digest was computed against.
+    fn trusted_digest(&self, path: &str, identity: &FileIdentity) -> Option<&ObjectId> {
+        let entry = self.entries.get(path)?;
+        (entry.identity == *identity).then_some(&entry.object)
+    }
+
+    /// Remember a digest just computed, keyed by the identity it holds for.
+    fn remember(&mut self, path: &str, identity: FileIdentity, object: &ObjectId) {
+        self.updated.insert(
+            path.to_string(),
+            CachedDigest {
+                identity,
+                object: object.clone(),
+            },
+        );
+    }
+}
+
 /// One side of a symlink, resolved far enough to ingest.
 enum LinkState {
     /// Resolves to a regular file under a configured `--dest`.
@@ -805,6 +893,8 @@ enum LinkState {
 pub struct Catalog {
     conn: Connection,
     path: PathBuf,
+    /// When set, `sync` ignores the digest cache and re-hashes every file (issue #50).
+    force_rehash: bool,
 }
 
 impl Catalog {
@@ -849,7 +939,11 @@ impl Catalog {
             path: path.clone(),
             source,
         })?;
-        Ok(Catalog { conn, path })
+        Ok(Catalog {
+            conn,
+            path,
+            force_rehash: false,
+        })
     }
 
     /// Open the catalog only if it already exists, never creating one.
@@ -879,6 +973,16 @@ impl Catalog {
         &self.path
     }
 
+    /// Make the next `sync` re-hash every file, ignoring the digest cache (issue #50).
+    ///
+    /// The cache key is (size, mtime, inode). A rewrite that preserves all three — an
+    /// in-place edit of exactly the same length with the mtime restored — is invisible to
+    /// it, so an operator who suspects one needs a way to read every byte again. This is
+    /// that switch; the cache is repopulated as the forced sync goes.
+    pub fn set_force_rehash(&mut self, force: bool) {
+        self.force_rehash = force;
+    }
+
     /// Ingest the current state of `watch` and `dests`, reporting — never reconciling —
     /// anything that contradicts what the catalog already recorded.
     ///
@@ -886,9 +990,18 @@ impl Catalog {
     /// its path and the error) as [`DifferenceKind::Unreadable`], the rest of the tree is
     /// ingested, and nothing is inferred about the file itself (issue #53).
     pub fn sync(&mut self, watch: &Path, dests: &[PathBuf]) -> Result<SyncReport, CatalogError> {
-        let observation = observe(watch, dests)?;
+        let mut cache = self.load_digest_cache()?;
+        if self.force_rehash {
+            // Drop what we would have trusted, not what we know: the updated rows below
+            // still repopulate the cache, so this is a one-shot re-read.
+            cache.entries.clear();
+        }
+        let observation = observe(watch, dests, &mut cache)?;
         let existing = self.load_state()?;
         let applied = self.apply(&observation, &existing)?;
+        // Written after the ingest commits: the cache is not part of the catalog's
+        // authority, so it must never be able to roll an ingest back or block one.
+        self.store_digest_cache(&cache)?;
         // Under-replication is computed after the ingest but from the observation, so a
         // copy that vanished between the walk and the transaction is still counted as
         // absent — the floor is about what is really on the disks, not what was.
@@ -904,6 +1017,8 @@ impl Catalog {
             objects_ingested: applied.objects_new,
             names_ingested: applied.names_new,
             locations_ingested: applied.locations_new,
+            hashed: cache.hashed,
+            trusted: cache.trusted,
             differences,
         })
     }
@@ -948,7 +1063,13 @@ impl Catalog {
         dests: &[PathBuf],
         apply: bool,
     ) -> Result<ResolveReport, CatalogError> {
-        let observation = observe(watch, dests)?;
+        // `resolve` re-observes exactly as `sync` does, so it reads the same digest cache: an
+        // unchanged file is trusted rather than hashed a second time, and a rewrite the key
+        // cannot see is missed here for the same reason it is missed by a sync (#50). The
+        // cache is not written back: `resolve` ingests nothing, so it has no new identity of
+        // record to store.
+        let mut cache = self.load_digest_cache()?;
+        let observation = observe(watch, dests, &mut cache)?;
         let existing = self.load_state()?;
         let watch_tier = observation.watch_tier.clone();
 
@@ -1165,6 +1286,62 @@ impl Catalog {
             resolutions,
             irreconcilable,
         })
+    }
+
+    /// The digest cache as it was written by an earlier sync.
+    fn load_digest_cache(&self) -> Result<DigestCache, CatalogError> {
+        let mut cache = DigestCache::default();
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, mtime_secs, mtime_nanos, inode, object_id FROM digest_cache",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CachedDigest {
+                    identity: FileIdentity {
+                        size: row.get::<_, i64>(1)?.max(0) as u64,
+                        mtime_secs: row.get(2)?,
+                        mtime_nanos: row.get(3)?,
+                        inode: row.get::<_, i64>(4)?.max(0) as u64,
+                    },
+                    object: row.get(5)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, entry) = row?;
+            cache.entries.insert(path, entry);
+        }
+        Ok(cache)
+    }
+
+    /// Write back every digest this sync computed. Trusted rows are already correct and
+    /// are left untouched, so a sync that hashed nothing writes nothing.
+    fn store_digest_cache(&mut self, cache: &DigestCache) -> Result<(), CatalogError> {
+        let tx = self.conn.transaction()?;
+        for (path, entry) in &cache.updated {
+            tx.execute(
+                "INSERT INTO digest_cache
+                     (path, size, mtime_secs, mtime_nanos, inode, object_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                     size = excluded.size,
+                     mtime_secs = excluded.mtime_secs,
+                     mtime_nanos = excluded.mtime_nanos,
+                     inode = excluded.inode,
+                     object_id = excluded.object_id",
+                params![
+                    path,
+                    entry.identity.size as i64,
+                    entry.identity.mtime_secs,
+                    entry.identity.mtime_nanos,
+                    entry.identity.inode as i64,
+                    entry.object
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Objects that have fewer verified copies than their recorded tier floor.
@@ -2232,7 +2409,11 @@ fn surviving_location(
 /// Cold tiers are walked first so an orphaned copy is visible even when no name points
 /// at it; the name pass then adds names (and re-adds the same locations, which the map
 /// dedupes). Nothing here writes anything.
-fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError> {
+fn observe(
+    watch: &Path,
+    dests: &[PathBuf],
+    cache: &mut DigestCache,
+) -> Result<Observation, CatalogError> {
     let watch_root = canonical(watch);
     let watch_tier = key_of(&watch_root);
     let dest_roots: Vec<(PathBuf, String)> = dests
@@ -2266,7 +2447,7 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
             if entry.is_symlink {
                 continue;
             }
-            match hash_path(&mut hashes, &entry.path) {
+            match hash_path(&mut hashes, cache, &entry.path) {
                 Ok(id) => {
                     record_object(
                         &mut observation,
@@ -2304,7 +2485,7 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
                 LinkState::Cold { target, key, tier } => {
                     // The bytes are on a cold tier; a failed read there leaves neither the
                     // name nor the cold location observable, so both are marked unreadable.
-                    let read = hash_path(&mut hashes, &target).and_then(|id| {
+                    let read = hash_path(&mut hashes, cache, &target).and_then(|id| {
                         let size = fs::metadata(&target)
                             .map(|metadata| metadata.len())
                             .map_err(|source| CatalogError::Checksum {
@@ -2350,7 +2531,7 @@ fn observe(watch: &Path, dests: &[PathBuf]) -> Result<Observation, CatalogError>
                 }
             }
         } else {
-            match hash_path(&mut hashes, &entry.path) {
+            match hash_path(&mut hashes, cache, &entry.path) {
                 Ok(id) => {
                     record_object(&mut observation, &id, entry.size, access);
                     let key = key_of(&entry.relative);
@@ -2421,19 +2602,86 @@ fn list(root: &Path) -> Result<Vec<disk_management::FileEntry>, CatalogError> {
 
 fn hash_path(
     hashes: &mut BTreeMap<PathBuf, ObjectId>,
+    cache: &mut DigestCache,
     path: &Path,
 ) -> Result<ObjectId, CatalogError> {
     let key = canonical(path);
     if let Some(id) = hashes.get(&key) {
         return Ok(id.clone());
     }
+    let identity = file_identity(path)?;
+    let cache_key = key_of(&key);
+    // The cache hit is the whole of issue #50: the bytes are not read when the file still
+    // carries the (size, mtime, inode) the recorded digest was computed against. The
+    // counter is what keeps it from being silent — see `SyncReport::hashed`/`trusted`.
+    if let Some(id) = cache.trusted_digest(&cache_key, &identity).cloned() {
+        // Trusting the cache must not swallow #53. A file can lose read permission with
+        // its (size, mtime, inode) untouched — a chmod changes none of them — so a cache
+        // hit on an unreadable file would otherwise skip the read it can no longer do and
+        // report the sync clean. Opening the descriptor costs no bytes of I/O, so the
+        // shortcut still avoids reading every file; it just fails here, per file, exactly
+        // where a real read would, and the caller's Err arm marks the name and location
+        // unreadable. Without this, `an_unreadable_file_is_not_recorded_as_missing`'s
+        // second sync exits 0 and invents agreement the tree does not have.
+        fs::File::open(path).map_err(|source| CatalogError::Checksum {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        cache.trusted += 1;
+        hashes.insert(key, id.clone());
+        return Ok(id);
+    }
     let hash = digest::file_digest(path).map_err(|source| CatalogError::Checksum {
         path: path.to_path_buf(),
         source,
     })?;
     let id = hash.as_bytes().to_vec();
+    cache.remember(&cache_key, identity, &id);
+    cache.hashed += 1;
     hashes.insert(key, id.clone());
     Ok(id)
+}
+
+/// The (size, mtime, inode) a digest is only valid for.
+///
+/// Failure to stat is a checksum error, the same shape as a failed read: the walk already
+/// saw the file, so a stat that now fails means it is gone or unreadable, and a sync never
+/// guesses in that case.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<FileIdentity, CatalogError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).map_err(|source| CatalogError::Checksum {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(FileIdentity {
+        size: metadata.len(),
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: metadata.mtime_nsec(),
+        inode: metadata.ino(),
+    })
+}
+
+/// The identity on a platform without inode/mtime-nsec: size and whole-second mtime, and
+/// no inode. Coarser, so it trusts less often — a cache that misses just hashes again.
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Result<FileIdentity, CatalogError> {
+    let metadata = fs::metadata(path).map_err(|source| CatalogError::Checksum {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(FileIdentity {
+        size: metadata.len(),
+        mtime_secs: mtime,
+        mtime_nanos: 0,
+        inode: 0,
+    })
 }
 
 fn record_object(observation: &mut Observation, id: &ObjectId, size: u64, access: i64) {
@@ -2981,5 +3229,106 @@ mod tests {
         // The rest of the tree is in; nothing was inferred about the file that failed.
         assert!(catalog.object_for_path("readable.bin").unwrap().is_some());
         assert!(catalog.object_for_path("locked.bin").unwrap().is_none());
+    }
+
+    fn tree_with_two_files(tmp: &Path) -> (PathBuf, PathBuf) {
+        let watch = tmp.join("hot");
+        let cold = tmp.join("cold");
+        fs::create_dir_all(&watch).unwrap();
+        fs::create_dir_all(&cold).unwrap();
+        fs::write(watch.join("a.bin"), b"payload").unwrap();
+        fs::write(watch.join("b.bin"), b"a different payload").unwrap();
+        (watch, cold)
+    }
+
+    #[test]
+    fn a_second_sync_trusts_the_digest_cache_instead_of_hashing() {
+        // Issue #50's headline: the first sync reads every file, the second reads none,
+        // and the report says which it did. A test that only counted objects would pass
+        // even if the cache were ignored, so these assert the hashed/trusted counters.
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, cold) = tree_with_two_files(tmp.path());
+
+        let mut catalog = catalog_in(tmp.path());
+        let first = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(first.hashed, 2, "a fresh cache hashes everything");
+        assert_eq!(first.trusted, 0);
+
+        let second = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(second.hashed, 0, "an unchanged file is never read again");
+        assert_eq!(second.trusted, 2, "both files are answered from the cache");
+        assert!(!second.has_differences(), "{:?}", second.differences);
+    }
+
+    #[test]
+    fn touching_a_file_makes_the_next_sync_hash_it_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, cold) = tree_with_two_files(tmp.path());
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+
+        // Advance the mtime without touching the bytes: the cache key is (size, mtime,
+        // inode), so a changed mtime must invalidate the recorded digest even though the
+        // size is identical.
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        let file = fs::File::options()
+            .write(true)
+            .open(watch.join("a.bin"))
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        drop(file);
+
+        let report = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(report.hashed, 1, "the touched file is re-read");
+        assert_eq!(report.trusted, 1, "the untouched file is trusted");
+    }
+
+    #[test]
+    fn losing_the_digest_cache_costs_time_not_correctness() {
+        // The cache is never a second source of truth (invariants 8/9): deleting it makes
+        // the next sync read every byte, and changes nothing else about the catalog.
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, cold) = tree_with_two_files(tmp.path());
+
+        let mut catalog = catalog_in(tmp.path());
+        let first = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(first.objects_ingested, 2);
+        catalog
+            .conn
+            .execute("DELETE FROM digest_cache", [])
+            .unwrap();
+
+        let report = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(report.hashed, 2, "a deleted cache degrades to a full hash");
+        assert_eq!(report.trusted, 0);
+        assert_eq!(
+            report.objects_ingested, 0,
+            "the catalog itself is untouched: only the time was lost"
+        );
+        assert!(!report.has_differences(), "{:?}", report.differences);
+    }
+
+    #[test]
+    fn force_rehash_reads_every_file_even_when_the_cache_matches() {
+        // The named limitation: a same-size, same-mtime rewrite is invisible to the key.
+        // `set_force_rehash` is the operator's way to read every byte regardless.
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, cold) = tree_with_two_files(tmp.path());
+
+        let mut catalog = catalog_in(tmp.path());
+        catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+
+        catalog.set_force_rehash(true);
+        let report = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(report.hashed, 2, "a forced sync ignores the cache");
+        assert_eq!(report.trusted, 0);
+
+        // One-shot: the next sync trusts the rebuilt cache again.
+        catalog.set_force_rehash(false);
+        let after = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
+        assert_eq!(after.trusted, 2);
+        assert_eq!(after.hashed, 0);
     }
 }
