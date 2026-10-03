@@ -19,6 +19,7 @@ pub mod policy;
 pub mod reconcile;
 pub mod replication;
 pub mod restore;
+pub mod schedule;
 pub mod scope;
 pub mod scrub;
 pub mod tiers;
@@ -56,6 +57,10 @@ pub use reconcile::{
 pub use replication::{replicate, ReplicaPlacement, ReplicaStatus, ReplicationOutcome};
 pub use restore::{
     build_verified_copy, replace_from_verified, RestoreError, RestoreOutcome, RestoreRequest,
+};
+pub use schedule::{
+    human_duration, is_due, next_run, roots_below_floor, unix_seconds, Pass, PassSchedule,
+    ScheduleError, ScheduleSet, ScheduleState, SCHEDULE_FILE_NAME, SCHEDULE_STATE_NAME,
 };
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
 pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};

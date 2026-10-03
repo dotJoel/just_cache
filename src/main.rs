@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -26,6 +26,7 @@ use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::policy::{Lifecycle, RuleSet};
 use just_cache::reconcile;
 use just_cache::restore::{self, RestoreError, RestoreRequest};
+use just_cache::schedule::{self, Pass, ScheduleSet, ScheduleState, SCHEDULE_STATE_NAME};
 use just_cache::scope::{self, Scope};
 use just_cache::scrub::{self, ScrubRequest};
 use just_cache::tiers::TierSet;
@@ -92,6 +93,9 @@ enum Command {
     /// Rebuild copies that are missing from a destination root (a disk re-added after a
     /// sweep), from a surviving sibling that verifies against the recorded checksum.
     Reconcile(ReconcileArgs),
+    /// Run the maintenance passes (`scrub`, `reconcile`) that `schedule.toml` says are due,
+    /// and report the next planned run when asked.
+    Schedule(ScheduleArgs),
 }
 
 /// Everything the mover needs. Also the whole CLI when no subcommand is given.
@@ -539,6 +543,45 @@ impl ReconcileArgs {
     }
 }
 
+/// Everything `schedule` needs. Like `scrub` and `reconcile` it names no `--watch`/`--dest`:
+/// the catalog already holds every tier root, and the schedule config and its state default
+/// to sitting beside it.
+#[derive(Debug, Args)]
+struct ScheduleArgs {
+    /// The catalog the scheduled passes act on. It must already exist: a pass needs the
+    /// object identity and tier roots only the catalog records.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+
+    /// Schedule configuration (`schedule.toml`): a cadence for each pass, plus the optional
+    /// `rate` (scrub) and `min_free_gb` floor that make a cron-driven pass safe. Defaults to
+    /// `schedule.toml` beside the catalog, consulted only when it is already there — never
+    /// created. An explicitly named file that is missing or malformed is an error.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Where last-run times are kept. Defaults to `.just_cache-schedule.state` beside the
+    /// catalog. It is internal bookkeeping under the `.just_cache` prefix the walk skips, and
+    /// is written only by `--run`.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
+
+    /// Run the passes that are due now. Without this the command only reports the schedule
+    /// and each pass's next planned run, and changes nothing.
+    #[arg(long)]
+    run: bool,
+
+    /// With `--run`, report what a due pass would do without moving a byte, changing a row,
+    /// or recording a last-run time (so the pass stays due).
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Evaluate the schedule as if the clock read this Unix second, instead of now. For
+    /// tests, and for asking what the next tick would do.
+    #[arg(long, value_name = "UNIX_SECS")]
+    now: Option<u64>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -551,6 +594,7 @@ fn main() -> ExitCode {
         Some(Command::Restore(args)) => run_restore(args),
         Some(Command::Scrub(args)) => run_scrub(args),
         Some(Command::Reconcile(args)) => run_reconcile(args),
+        Some(Command::Schedule(args)) => run_schedule(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -1359,6 +1403,248 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
         ExitCode::from(EXIT_FINDINGS)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Run the maintenance passes `schedule.toml` says are due, and report the next planned run.
+///
+/// The contract (design §9): with nothing configured, nothing runs — the on-demand
+/// behaviour is the default. A pass that runs and finds something prints its report once and
+/// exits `1` (the same house exit code a manual pass uses); a pass that finds nothing is
+/// quiet. A pass held back by the free-space floor is reported and stays due. Exit `2` is a
+/// bad invocation — a missing catalog or an explicitly named config that is not there.
+fn run_schedule(args: ScheduleArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} is not an existing file",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // The config and its state file default to sitting beside the catalog, which is beside
+    // the watch root for the default catalog path — the placement `tiers.toml`/`policy.toml`
+    // already use, and where the operator keeps the rest of the config.
+    let base = args
+        .catalog
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let schedule = match &args.config {
+        Some(path) => match ScheduleSet::load(path) {
+            Ok(set) => Some(set),
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => match ScheduleSet::load_beside(base) {
+            Ok(set) => set,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
+    let Some(schedule) = schedule else {
+        // No schedule is the documented default, not an error: report it and do nothing.
+        println!(
+            "schedule: no schedule configured ({}); nothing runs",
+            ScheduleSet::default_path(base).display()
+        );
+        return ExitCode::SUCCESS;
+    };
+
+    let catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let roots = match catalog.roots() {
+        Ok(roots) => roots,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let state_path = args
+        .state
+        .clone()
+        .unwrap_or_else(|| base.join(SCHEDULE_STATE_NAME));
+    let mut state = ScheduleState::load(&state_path);
+
+    // Injected time is what makes "which pass is due at a given instant" a decision a test
+    // can ask about without sleeping out a real schedule window.
+    let now = match args.now {
+        Some(secs) => match UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+            Some(now) => now,
+            None => {
+                eprintln!("just_cache: --now {secs} is out of range");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => SystemTime::now(),
+    };
+
+    if !args.run {
+        report_schedule(&schedule, &state, &roots, now);
+        return ExitCode::SUCCESS;
+    }
+
+    let mut findings = false;
+    let mut ran = false;
+    for (pass, config) in schedule.passes() {
+        let last = state.last_run(pass);
+        if !schedule::is_due(last, config.every, now) {
+            continue;
+        }
+        // A scheduled pass can write (a scrub a repair, a reconcile a rebuild), so it is
+        // held back while any root the catalog records is below its floor. The pass stays
+        // due: the next check reports the disk again and it runs as soon as there is room.
+        let floor = config.min_free_bytes();
+        let below = schedule::roots_below_floor(&roots, floor);
+        if !below.is_empty() {
+            findings = true;
+            let names: Vec<String> = below.iter().map(|p| p.display().to_string()).collect();
+            println!(
+                "{}: held back, below the {} free-space floor: {}",
+                pass.name(),
+                scope::human_bytes(floor),
+                names.join(", ")
+            );
+            continue;
+        }
+
+        match pass {
+            Pass::Scrub => {
+                let request = ScrubRequest {
+                    catalog: &catalog,
+                    rate_kib_per_sec: config.rate_kib_per_sec,
+                    dry_run: args.dry_run,
+                };
+                match scrub::scrub(&request) {
+                    Ok(report) => {
+                        if report.has_findings() {
+                            findings = true;
+                            for line in report.summary_lines() {
+                                println!("{line}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("just_cache: scrub pass failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Pass::Reconcile => {
+                let request = reconcile::ReconcileRequest {
+                    catalog: &catalog,
+                    dry_run: args.dry_run,
+                    // The same floor this pass was just held back against, so the scheduler's
+                    // check and the rebuild's pre-flight cannot disagree.
+                    min_free: floor,
+                    // `schedule.toml` refuses `rate` on a reconcile pass (only scrub has a
+                    // read budget), so a scheduled rebuild stays unthrottled; `reconcile
+                    // --read-budget` is the CLI's knob for bounding one by hand.
+                    read_budget: None,
+                };
+                match reconcile::reconcile(&request) {
+                    Ok(report) => {
+                        if report.has_findings() {
+                            findings = true;
+                            for line in report.summary_lines() {
+                                println!("{line}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("just_cache: reconcile pass failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+
+        ran = true;
+        // A dry run did nothing, so recording it would make the real pass look "already
+        // run"; leave the state alone and the pass stays due.
+        if !args.dry_run {
+            state.set_last_run(pass, now);
+        }
+    }
+
+    if ran && !args.dry_run {
+        if let Err(err) = state.save(&state_path) {
+            // The pass itself succeeded; a lost timestamp costs at most one extra pass.
+            eprintln!(
+                "just_cache: could not record the schedule state in {}: {err}",
+                state_path.display()
+            );
+        }
+    }
+
+    if findings {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The read-only view: each configured pass, its cadence, and the next planned run.
+///
+/// This is the operator's answer to "what runs next" — a pass that is due says so, and one
+/// with a floor that would hold it back says which root is below it before a cron tick
+/// finds out the hard way.
+fn report_schedule(
+    schedule: &ScheduleSet,
+    state: &ScheduleState,
+    roots: &[PathBuf],
+    now: SystemTime,
+) {
+    println!("schedule: {}", schedule.path().display());
+    for (pass, config) in schedule.passes() {
+        let last = state.last_run(pass);
+        let when = if schedule::is_due(last, config.every, now) {
+            match last {
+                Some(last) => format!("due now (last run {})", schedule::format_time(last)),
+                None => "due now (never run)".to_string(),
+            }
+        } else {
+            format!(
+                "next run {}",
+                schedule::format_time(schedule::next_run(last, config.every, now))
+            )
+        };
+
+        let mut notes = Vec::new();
+        if let Some(rate) = config.rate_kib_per_sec {
+            notes.push(format!("rate {rate} KiB/s"));
+        }
+        if config.min_free_bytes() > 0 {
+            notes.push(format!(
+                "free-space floor {}",
+                scope::human_bytes(config.min_free_bytes())
+            ));
+        }
+        let below = schedule::roots_below_floor(roots, config.min_free_bytes());
+        if !below.is_empty() {
+            let names: Vec<String> = below.iter().map(|p| p.display().to_string()).collect();
+            notes.push(format!("held back now by {}", names.join(", ")));
+        }
+        let suffix = if notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", notes.join(", "))
+        };
+        println!(
+            "  {}: every {} — {when}{suffix}",
+            pass.name(),
+            schedule::human_duration(config.every)
+        );
     }
 }
 
