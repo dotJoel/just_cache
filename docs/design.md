@@ -409,6 +409,19 @@ preserves holes — and `tests/scrub.rs` measures `st_blocks` across a scrub of 
 sparse file and asserts it is unchanged. The §9 warning was about the copy path, which was
 already fixed; it did not apply to verification reads.
 
+Closed in P1 by #75: the resume path no longer discards a repair candidate's verdict. When a
+group has rot but no sibling verified clean *this run*, `scrub` re-reads its already-verified
+locations as possible repair sources — and that re-read is now recorded as the location's real
+verdict rather than thrown away. A candidate that has rotted since it was last verified
+replaces its `AlreadyVerified` entry with `Corrupt`, so it joins the damage pass and
+`mark_damaged` drops its `scrub_state` row instead of leaving a row that keeps claiming the
+bytes were verified (which every later scrub would skip without reading). The search also
+carries on past a failed candidate, so a clean sibling *later* in the group is still found and
+used as the source. Before the fix only the first already-verified location was tried, its
+non-clean result was ignored, and `tests/scrub.rs` pins both behaviours: two locations rotted
+in place are both marked damaged, and a rotted first candidate plus a clean later one repairs
+from the later one.
+
 Closed in P1 by `just_cache restore` through the catalog (#18): restoring an object now
 verifies the bytes it writes against the object's **recorded checksum**, not against the
 cold copy's own bytes. The open-if-present rule the rest of the tool uses applies: a
@@ -425,6 +438,22 @@ already holds the right bytes is still the idempotent no-op and `--remove-copy` 
 drops the cold copy only after the restored file verifies. Without a catalog the restore
 is byte-for-byte what it was before (verify against the cold copy; a pre-corrupt copy
 cannot be caught — there is nothing independent to compare against, see below).
+
+Hardened as a security fix (#70): `restore` now proves a cold copy lives under a `--dest`
+root before it acts on one. A symlink in the watched tree is writable by anyone who can
+write the tree, so its target is not accepted as a copy on trust: with an unchecked target,
+`restore --remove-copy` deletes an arbitrary file the operator can read, and a plain
+`restore` copies an out-of-tree file into the watched tree. The link target is now accepted
+only when `canonicalize` puts it under a canonicalized `--dest` root — the same containment
+`audit::resolve_target` applies to a watched symlink — and a target that escapes every root
+is a *foreign link*, dropped rather than guessed at. The mirrored candidate is held to the
+same test, so a name inside a tier that is itself a symlink out of it is no more a copy; and
+`--remove-copy` re-tests containment immediately before its one unrecoverable delete rather
+than trusting a proof made in `locate`. Finally, a path argument whose relative part carries
+a `..` component is refused before any lookup, copy or delete: `absolute()` is lexical and
+does not resolve `..`, so `T/../escaped.bin` would otherwise strip to `../escaped.bin` and
+name a file outside the tree. `tests/restore.rs` drives all three refusals through the real
+binary, and each fails when the fix is reverted.
 
 Closed in P1 by `just_cache audit` reading the catalog (#19): "audit is a query" (§3) is
 now true rather than an aspiration. When a catalog exists — `--catalog <FILE>`, or the
@@ -467,6 +496,55 @@ is a usage error here, because the recorded checksum a rebuild is proved against
 from it. What is deliberately out of scope is deciding *when* to reconcile (§10, like
 scrub scheduling) and verifying copies that are present — a stat per location answers
 "is this copy absent", and anything more is the scrubber's job.
+
+Closed in P1 by the journal-record containment check (#68): `journal::repair` no longer acts
+on the paths a record names without first proving they are paths it is allowed to touch. A
+`rel` that is absolute, or that contains a `..` component, is refused — `watch_root.join`
+discards the root for an absolute path and does not resolve `..`, so either shape let a
+hand-edited or truncated journal line make the sweep create a symlink (with a
+size-checked-but-never-hashed destination) or delete a `.just_cache-partial-*` file
+anywhere on the filesystem, before the first move ran. The joined source is also required
+to sit under the watched root, the same `strip_prefix` containment `restore` applies
+(§4), and a record's `dest` must sit under one of the `--dest` roots the invocation was
+given. A refused record is reported as `REFUSED a journal record` and kept in the journal
+so the operator sees the line on the next run; nothing it names is touched. This is the
+`SECURITY.md` in-scope case (a journal line that escapes the watched tree or a destination
+root), and `tests/journal.rs` writes such lines and asserts the outside paths are
+untouched — the test fails if the check is removed.
+
+Closed in P1 by `catalog sync` (#73): the catalog is now opened as the untrusted input it
+can be. Its default path is inside the watched tree, and SQLite opens a database with a
+plain `open(2)` and writes predictable `-journal`/`-wal`/`-shm` siblings beside it, so a
+symlink planted at any of those names used to make the tool write, truncate or unlink the
+link's target as its own user. Now the name is created with `O_CREAT|O_EXCL` and mode 0600
+(exact under any umask, because umask can only clear bits 0600 does not have), an existing
+name is refused unless it is a regular file (`symlink_metadata`, so a dangling link is
+refused rather than reported absent by `exists`), the sibling names are refused the same
+way *before* the database is created, and SQLite is opened with `SQLITE_OPEN_NOFOLLOW`.
+`open_existing` — the mover's read-only path — refuses a symlink too instead of following
+it. Nothing is read or written through the link. Left open and named rather than hidden: the
+foreign-owner refusal (a catalog owned by another uid inside a group- or world-writable
+directory) has no deterministic test, because producing it needs a second user or root, so
+it is only as good as the code that reads it; and the sibling check is a stat taken before
+SQLite's own open, so a writer that swaps a name in that window is not covered — a race no
+unprivileged test can win, and one that `SQLITE_OPEN_NOFOLLOW` narrows for the database file
+itself. What is *not* fixed here is a catalog an earlier version already created 0644: this
+change fixes creation, not the mode of a file already on disk (§10).
+
+Closed by the symlink-location hardening (security review, #76): a symlink at a stored
+location is no longer accepted as a copy. `scrub`'s `check_location` used `fs::metadata`,
+which follows the final component, so a link to a byte-identical target statted as a
+regular file, hashed clean, and was recorded verified in `scrub_state`;
+`replication::place` rejected only a directory and then hashed through the link, so a
+symlink whose own target text happened to be the source's size was `Adopted` and counted
+toward the floor — letting the source be retired over a name whose target can be removed
+without the catalog noticing (the invariant-6 shape). Both now stat with
+`symlink_metadata` and require `metadata.is_file()`, matching `reconcile` and `restore`,
+which already refused a non-regular location. A link is reported `Unreadable` by scrub and
+`Failed` by place, is never recorded verified, and does not satisfy the floor; the source
+is kept. `tests/scrub.rs` and the `replication` module's tests both drive a link to a
+byte-identical target — with the link's own length equal to the source's, so the old
+length check waved it through — and fail when either guard is reverted.
 
 Still open, and honestly so:
 
@@ -685,7 +763,9 @@ Still open, and honestly so:
 - **Scrub has no schedule of its own.** `just_cache scrub` is an on-demand command; the
   background scheduler that decides how often to re-scrub is P2, and until it exists a
   location verified once is skipped until its content changes under the catalog (or the
-  damage record for it is cleared). `--rate` is what makes a cron-driven scrub safe to run
+  damage record for it is cleared) — unless it is the only candidate repair source for a
+  group that has rot, in which case it is re-read and a failed read is marked damaged
+  (#75, above). `--rate` is what makes a cron-driven scrub safe to run
   against a tier that is serving reads.
 - **`audit --json` does not carry the scrub section.** `audit --catalog` adds
   "never scrubbed"/"damaged" counts to its readable output, but the hand-written JSON
@@ -712,7 +792,19 @@ Still open, and honestly so:
 - Mounting an offline volume or streaming recall from an object store: `locate` reports the
   state that makes a copy unreadable and `restore` reads a mounted tier, but bringing a
   volume online is out of band (P2/P3) and a read command never mutates catalog or disk.
+- **`restore` refuses a lexically-unresolved path rather than resolving it.** A path
+  argument carrying a `..` component, or a link target that escapes every `--dest`, is a
+  refusal, not something to `canonicalize` and then act on: canonicalizing to decide what a
+  path "really" is would lose the symlink state `restore` exists to see, and would make the
+  command act on a name the operator did not give it. The operator re-runs with the path as
+  the filesystem spells it (§9, #70).
 - Multi-user quotas/permissions: single-trust-domain system.
+- **Tightening a catalog that already exists is not this guard's job.** #73 fixes how a
+  catalog is *created* and *opened*: a fresh one is 0600, and a symlink at its name or a
+  SQLite sibling is refused. A catalog an earlier version already created 0644 is left
+  exactly as it is — silently chmodding a file the operator already has would be a
+  surprising side effect of running `catalog sync` — and a caller who wants it private
+  changes the mode once, by hand.
 - Backup *tooling* (dedupe, snapshots of the whole tree): this is a lifecycle engine;
   backup apps are consumers via the gateway.
 - **Locking a watched file against future opens is not attempted.** The pre-move

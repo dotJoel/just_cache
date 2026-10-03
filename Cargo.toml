@@ -20,7 +20,7 @@ tempfile = "3"
 # The Unix metadata work (ownership, xattrs, SEEK_DATA/SEEK_HOLE) goes through
 # rustix rather than raw libc, so the move layer stays free of `unsafe`.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { version = "1", features = ["fs"] }
