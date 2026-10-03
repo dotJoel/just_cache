@@ -421,12 +421,14 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   P2 is closed.)*
 - **P3 — remote tiers**: object-store driver (chunked, resumable, encrypted);
   LAN-peer driver; offline-volume driver with vault tracking and insert-prompt recall.
-  *(In progress — this is the phase being worked: the encrypted envelope bytes crossing the
-  machine boundary must go through (#140), the object-store driver (#141), the LAN-peer
-  driver (#142), the offline-volume driver with vault tracking and the insert prompt (#143),
-  and delete plus garbage collection on tiers that are not mounted (#144). Encryption comes
-  first because every later driver crosses the boundary and rule 2 makes it the seam, not a
-  wrap.)*
+  *(In progress — this is the phase being worked, one issue at a time because every driver
+  adds a variant to the same `kind` dispatch: the tier edge becomes a driver seam and an
+  unsupported `kind` is refused (#146), then the encrypted envelope every boundary-crossing
+  driver must go through (#140), the object-store driver (#141), the LAN-peer driver (#142),
+  the offline-volume driver with vault tracking and the insert prompt (#143), and delete plus
+  garbage collection on tiers that are not mounted (#144). The envelope follows the seam
+  rather than leading it because the seam is what decides what "crosses the boundary" means;
+  rule 2 then makes encryption the seam's requirement, not a wrap applied later.)*
 - **P4 — cost-aware policy**: per-tier cost models, placement reports, rule
   suggestions from observed access.
 
