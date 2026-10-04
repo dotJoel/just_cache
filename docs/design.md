@@ -455,16 +455,14 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   P2 is closed.)*
 - **P3 — remote tiers**: object-store driver (chunked, resumable, encrypted);
   LAN-peer driver; offline-volume driver with vault tracking and insert-prompt recall.
-  *(In progress — this is the phase being worked, one issue at a time because every driver
-  adds a variant to the same `kind` dispatch: the tier edge becomes a driver seam and an
-  unsupported `kind` is refused (#146), then the encrypted envelope every boundary-crossing
-  driver must go through (#140), the object-store driver (#141), the LAN-peer driver (#142 —
-  *done*, see §9),
-  the offline-volume driver with vault tracking and the insert prompt (#143 — *done*, see
-  §9), and delete plus
-  garbage collection on tiers that are not mounted (#144). The envelope follows the seam
-  rather than leading it because the seam is what decides what "crosses the boundary" means;
-  rule 2 then makes encryption the seam's requirement, not a wrap applied later.)*
+  *(Done: the tier edge became a driver seam that refuses an unsupported `kind` (#146); the
+  encrypted envelope every boundary-crossing driver passes through (#140); the object-store
+  driver (#141); the LAN-peer driver (#142); the offline-volume driver with vault tracking
+  and the insert prompt (#143); and delete plus garbage collection on tiers that are not
+  mounted (#144). The envelope follows the seam rather than leading it because the seam is
+  what decides what "crosses the boundary" means, and rule 2 then makes encryption the seam's
+  requirement rather than a wrap applied later. Each driver lands as a variant of the same
+  `kind` dispatch; what each leaves open is in §9. P3 is closed.)*
 - **P4 — cost-aware policy**: per-tier cost models, placement reports, rule
   suggestions from observed access.
 
@@ -483,8 +481,8 @@ the tool surface has to express, and they do not exist yet: tool names and schem
 much a public API as the CLI is, and agents get pinned by the prompts they are written
 into, so designing them ahead of the drivers buys a rewrite rather than a head start.
 Waiting costs nothing in rework — the CLI's `--json` output is already the contract an
-adapter would wrap. If a concrete need to drive the tool from an agent appears while P3
-is in flight, that is the evidence to pull it forward; speculation is not.
+adapter would wrap. If a concrete need to drive the tool from an agent appears, that is the
+evidence to start it; speculation is not.
 
 ## 9. Known gaps (tracked, not hidden)
 
@@ -899,7 +897,7 @@ Still open, and honestly so:
   and the operator can see that in the command they ran. With a floor of 2 and one other
   disk the second copy lands on that disk on the **same host** — this is replication
   across a disk failure, not off-host backup (§10); a machine-level loss still takes both
-  copies. Off-host tiers are P3.
+  copies. Off-host copies are what the remote drivers provide (§8).
 - **A copy the mover could not verify is unknown, never good.** The mover counts only a
   copy whose read-back digest matched, and it does not retire the source until the floor
   is met; the catalog's `location.verified` is 0 until a sync hashes the bytes, and rows
@@ -1794,9 +1792,9 @@ What #144 records honestly rather than hides:
   with an I/O budget for it. A copy that is present but unverified is not touched here.
 - **Off-host replication is not what a floor of 2 buys.** The `--copies` floor replicates
   within (or across) the destinations on one host; it survives a disk failure, not the
-  loss of the machine or a site. Remote/object/offline tiers are P3, and until they exist
-  a floor of 2 is not a backup. More than one copy *per disk* is backup tooling too, and
-  is out of scope (§6.1 of the issue).
+  loss of the machine or a site. Remote/object/offline tiers are a separate mechanism (§8),
+  so the `--copies` floor itself is not a backup. More than one copy *per disk* is backup
+  tooling too, and is out of scope (§6.1 of the issue).
 - Block-level tiering (dm-cache/bcache/L2ARC): different layer, no per-file policy;
   out of scope but composes (a block cache in front of this is fine).
 - Mounting an offline volume or streaming recall from an object store: `locate` reports the
@@ -1835,15 +1833,13 @@ What #144 records honestly rather than hides:
   exist. The residual gap is declared in §9 rather than hidden behind a check that
   cannot promise it.
 
-- **The tier config describes tiers; it does not yet drive them.** #40 makes a tier a
-  configured object — a name, a driver, a recall class, a volatility, a copy floor, a cost
-  — and lets `locate`/`audit` speak in those names, and refuses a volatile tier as a
-  destination. Lifecycle rules are evaluated by #41 (above); nothing
-  acts on `recall` or `cost` beyond reporting them, cache overlays (§2.1) are served
-  only through `mount` (#46), and the only driver implemented is the existing `fs` symlink mover: an `object`,
-  `offline`, or `peer` tier parses and is named, but no bytes move to or from it. A
-  config that named such a tier as a `--dest` would be accepted only because the destination
-  still has to exist as a local directory — the driver half is P3.
+- **The tier config drives the drivers; it does not yet act on `recall` or `cost`.** #40 makes
+  a tier a configured object — a name, a driver, a recall class, a volatility, a copy floor, a
+  cost — and lets `locate`/`audit` speak in those names, and refuses a volatile tier as a
+  destination. Lifecycle rules are evaluated by #41 (above); the `fs`, `object`, `peer` and
+  `offline` drivers move bytes to and from their tiers (P3, #140–#144), cache overlays (§2.1)
+  are served only through `mount` (#46), and nothing acts on `recall` or `cost` beyond
+  reporting them — that is P4.
 
 - **Promoting a recalled file is not the mover's job.** #41 evaluates `up = { on_access }`
   and `explain` names the rule that would promote, but no sweep performs a promotion:
