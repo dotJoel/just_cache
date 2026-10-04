@@ -84,8 +84,8 @@ catalog and integrity commands.
 Today just_cache is a local mover with move recovery and explicit commands to record,
 locate, check, restore and delete copies, plus a FUSE mount and a WebDAV gateway over the
 same catalog. The larger plan — one namespace across local disks, LAN peers, cloud object
-storage and offline volumes — is in progress: the object-store driver landed (#141), the
-LAN-peer tier followed (#142) — a peer runs `just_cache object-server`, and a `peer`
+storage and offline volumes — covers all of them: the object-store driver (#141), the
+LAN-peer tier (#142) — a peer runs `just_cache object-server`, and a `peer`
 tier moves bytes to it over the same S3-compatible wire — and the offline-volume driver
 landed (#143): an `offline` tier exports to a volume a person inserts, tracks where each
 volume is in the catalog's `volume` ledger, and refuses a read that cannot reach it with an
