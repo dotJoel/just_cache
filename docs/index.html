@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>just_cache — local cold storage you can inspect and verify</title>
-<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Local, LAN-peer, cloud-object and offline tiers are all supported, served as one namespace over every tier.">
+<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Local, LAN-peer, cloud-object and offline tiers are served as one namespace, and its read-only answers go to coding agents over MCP.">
 <style>
   :root {
     --bg: #0b0f14;
@@ -157,7 +157,7 @@
 <header>
   <div class="wordmark"><span class="prompt">$</span> <span>~/storage</span> <span class="sep">::</span> <span>tiered&nbsp;mover</span></div>
   <h1>just_cache<span class="dot">.</span></h1>
-  <p class="lede">Move idle files to slower local storage without renaming their paths. just_cache journals moves and includes tools to catalog, locate, audit, scrub and restore copies.</p>
+  <p class="lede">Move idle files to slower local storage without renaming their paths. just_cache journals moves and includes tools to catalog, locate, audit, scrub and restore copies — and serves those read-only answers to a coding agent over MCP.</p>
 </header>
 
 <div class="term">
@@ -297,9 +297,13 @@
     <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
     <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
     <div class="feat"><div class="name">mcp</div><p>Serves the read-only questions — locate, explain, audit, a dry-run scrub — to a coding agent over MCP on stdio. Starts with its client and exits with it, and no tool moves, repairs or deletes anything; <code class="inline">restore</code> appears only when the operator opts in.</p></div>
+    <div class="feat"><div class="name">schedule</div><p>Runs the maintenance passes <code class="inline">schedule.toml</code> says are due and prints, per pass, the next planned run — so cron can show what it will do before it does it.</p></div>
+    <div class="feat"><div class="name">unpin</div><p>Clears a pin set by <code class="inline">pin</code>.</p></div>
     <div class="feat"><div class="name">cache</div><p>A RAM or SSD overlay in front of a durable tier: promotion copies bytes, eviction is LRU against a size cap, and residency is never data of record.</p></div>
     <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
     <div class="feat"><div class="name">gc</div><p>Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
+    <div class="feat"><div class="name">object-server</div><p>Serves an S3-compatible object endpoint backed by local directories, so a LAN peer can be a tier without running a full tool install. SigV4 auth; writes land through the same verified path.</p></div>
+    <div class="feat"><div class="name">volume</div><p>The vault ledger for offline-volume tiers: which physical volume is in a tier's drive and where the others are. The catalog is the source of truth — no marker file is ever written into the volume.</p></div>
   </div>
 </section>
 
