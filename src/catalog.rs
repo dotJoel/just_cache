@@ -123,10 +123,19 @@ CREATE TABLE IF NOT EXISTS lifecycle (
     rule         TEXT,                 -- which rule decided the last transition
     observed     INTEGER NOT NULL DEFAULT 0 -- 1 once a namespace provider recorded access
 );
+-- The vault ledger for offline-volume tiers (#143). A volume is a physical disk a person
+-- inserts; the catalog is the only place its whereabouts are recorded (no marker file is
+-- ever written into the volume — the catalog is the source of truth, §3). `state` is one of
+-- 'in_vault' | 'mounted' | 'loaned' | 'lost'. `tier` names the offline tier whose drive
+-- holds this volume *while it is mounted*, and is NULL otherwise: at most one volume is
+-- mounted per tier, and the export/recall path reads this binding to know which volume's
+-- bytes a location key refers to. A state other than 'mounted' clears the binding — a
+-- volume that has left the drive is no longer the one the tier's root resolves to.
 CREATE TABLE IF NOT EXISTS volume (
     id    TEXT PRIMARY KEY,            -- 'drawer-07'
     state TEXT NOT NULL,               -- 'in_vault' | 'mounted' | 'loaned' | 'lost'
-    note  TEXT
+    note  TEXT,
+    tier  TEXT                         -- the tier whose drive holds it while mounted
 );
 -- The durability floor, recorded once per tier rather than guessed from how many
 -- locations happen to exist (issue #20). Sweep --copies N declares it; a missing copy
@@ -277,6 +286,53 @@ pub enum CatalogError {
         #[source]
         source: std::io::Error,
     },
+    #[error("`{state}` is not a volume state; the states are {supported}")]
+    InvalidVolumeState {
+        state: String,
+        supported: &'static str,
+    },
+    #[error("a volume id must not be empty")]
+    EmptyVolumeId,
+    /// Two volumes claiming the same tier's drive at once is the confusion the one-mounted
+    /// rule exists to prevent: the recall path would have no single answer for which
+    /// volume's bytes a location key names.
+    #[error(
+        "volume `{existing}` is already recorded mounted in tier `{tier}`; only one volume \
+         can be in a tier's drive at a time"
+    )]
+    VolumeTierOccupied { tier: String, existing: String },
+}
+
+/// The states a volume may be recorded in, §3's `volume.state`. The set is fixed so a
+/// typo (`monted`) is refused by name rather than stored and later read as "not mounted".
+pub const VOLUME_STATES: [&str; 4] = ["in_vault", "mounted", "loaned", "lost"];
+
+/// The state meaning a volume is in the drive and its bytes are reachable at the tier's
+/// configured root.
+pub const VOLUME_MOUNTED: &str = "mounted";
+
+/// [`VOLUME_STATES`] as a refusal message spells it.
+pub const VOLUME_STATES_LIST: &str = "in_vault, mounted, loaned, lost";
+
+/// One row of the `volume` vault ledger: a physical disk, where it is, and — while it is
+/// mounted — the offline tier whose drive holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeRecord {
+    pub id: String,
+    /// One of [`VOLUME_STATES`].
+    pub state: String,
+    /// A free-text note the operator may leave (`where it went`, `replaced`, …).
+    pub note: Option<String>,
+    /// The offline tier whose drive holds this volume while `state == "mounted"`; `None`
+    /// for every other state (a volume out of the drive binds no tier).
+    pub tier: Option<String>,
+}
+
+impl VolumeRecord {
+    /// True when this volume is in a drive and therefore readable at the tier's root.
+    pub fn is_mounted(&self) -> bool {
+        self.state == VOLUME_MOUNTED
+    }
 }
 
 /// How a name or a location disagrees with what the catalog recorded.
@@ -2220,6 +2276,128 @@ impl Catalog {
         Ok(true)
     }
 
+    /// Every volume in the vault ledger, ordered by id.
+    ///
+    /// The ledger is offline-tier bookkeeping only (§3): it says where a physical disk is,
+    /// not where any object lives. Nothing that decides placement or durability reads it.
+    pub fn volumes(&self) -> Result<Vec<VolumeRecord>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, state, note, tier FROM volume ORDER BY id")?;
+        let rows = stmt.query_map([], volume_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The volume recorded under `id`, if any.
+    pub fn volume(&self, id: &str) -> Result<Option<VolumeRecord>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, state, note, tier FROM volume WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], volume_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The volume currently recorded `mounted` in `tier`, if any. This is the binding the
+    /// export and recall paths read to know which volume's bytes a `<volume-id>/<path>`
+    /// storage key refers to; the one-mounted rule below keeps it a single answer.
+    pub fn mounted_volume_for_tier(
+        &self,
+        tier: &str,
+    ) -> Result<Option<VolumeRecord>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, state, note, tier FROM volume WHERE tier = ?1 AND state = ?2")?;
+        let mut rows = stmt.query_map(params![tier, VOLUME_MOUNTED], volume_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record or update a volume's state, and — when it is `mounted` — bind it to a tier.
+    ///
+    /// Only `mounted` binds a tier; every other state clears the binding, because a volume
+    /// out of the drive is not the one a tier's root resolves to. At most one volume may be
+    /// mounted per tier: a second is refused by name, since two would leave recall with no
+    /// single answer for which volume holds a location's bytes. Returns the stored row.
+    pub fn set_volume(
+        &self,
+        id: &str,
+        state: &str,
+        tier: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<VolumeRecord, CatalogError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(CatalogError::EmptyVolumeId);
+        }
+        if !VOLUME_STATES.contains(&state) {
+            return Err(CatalogError::InvalidVolumeState {
+                state: state.to_string(),
+                supported: VOLUME_STATES_LIST,
+            });
+        }
+        let binding = if state == VOLUME_MOUNTED {
+            tier.map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(tier_name) = &binding {
+            if let Some(existing) = self.mounted_volume_for_tier(tier_name)? {
+                if existing.id != id {
+                    return Err(CatalogError::VolumeTierOccupied {
+                        tier: tier_name.clone(),
+                        existing: existing.id,
+                    });
+                }
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO volume (id, state, note, tier) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 state = excluded.state,
+                 note = excluded.note,
+                 tier = excluded.tier",
+            params![id, state, note, binding],
+        )?;
+        Ok(VolumeRecord {
+            id: id.to_string(),
+            state: state.to_string(),
+            note: note.map(str::to_string),
+            tier: binding,
+        })
+    }
+
+    /// Make the `(tier, storage_key)` location the object's primary one, clearing the flag
+    /// on its other locations. Returns the number of location rows updated.
+    ///
+    /// The mover's `record_replica` writes every copy un-primary (the local-disk path keeps
+    /// its symlink as the tier of record). An offline export has no local representation,
+    /// so the volume copy *is* the tier of record and is marked primary here (§3, §4).
+    pub fn promote_location_primary(
+        &self,
+        object: &[u8],
+        tier: &str,
+        storage_key: &str,
+    ) -> Result<usize, CatalogError> {
+        let changed = self.conn.execute(
+            "UPDATE location
+                SET is_primary = CASE WHEN tier = ?2 AND storage_key = ?3 THEN 1 ELSE 0 END
+              WHERE object_id = ?1",
+            params![object, tier, storage_key],
+        )?;
+        Ok(changed)
+    }
+
     /// Ensure an object row exists, inserting it if it does not.
     ///
     /// For the object-store path: a sweep may encounter an object that has not yet been
@@ -3309,11 +3487,35 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             "ALTER TABLE lifecycle ADD COLUMN observed INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    // `volume.tier` (#143): the tier whose drive holds a volume while it is mounted. A
+    // catalog written before offline tiers gains it as NULL — the honest value, because
+    // nothing was recorded about which drive any volume was in. Same `pragma_table_info`
+    // pattern as `location.verified`: `CREATE TABLE IF NOT EXISTS` cannot add a column to
+    // an existing file.
+    let has_volume_tier: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('volume') WHERE name = 'tier'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_volume_tier == 0 {
+        conn.execute_batch("ALTER TABLE volume ADD COLUMN tier TEXT;")?;
+    }
     Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Map one `volume` row to a [`VolumeRecord`]. The column order is fixed by every query
+/// that reads the ledger, so one helper keeps them from drifting apart.
+fn volume_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VolumeRecord> {
+    Ok(VolumeRecord {
+        id: row.get(0)?,
+        state: row.get(1)?,
+        note: row.get(2)?,
+        tier: row.get(3)?,
+    })
 }
 
 /// RFC 3339 in UTC, without a date crate: the tool has no business growing a dependency
@@ -3913,5 +4115,116 @@ mod tests {
         let after = catalog.sync(&watch, std::slice::from_ref(&cold)).unwrap();
         assert_eq!(after.trusted, 2);
         assert_eq!(after.hashed, 0);
+    }
+
+    /// The vault ledger records a volume and reads it back verbatim (#143). The ledger is
+    /// bookkeeping only — nothing here decides where an object lives — so the row is exactly
+    /// what was written.
+    #[test]
+    fn a_volume_is_recorded_and_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = catalog_in(tmp.path());
+        assert!(catalog.volumes().unwrap().is_empty());
+
+        let stored = catalog
+            .set_volume("drawer-07", "mounted", Some("drawer"), Some("shelf-a"))
+            .unwrap();
+        assert_eq!(stored.id, "drawer-07");
+        assert_eq!(stored.state, "mounted");
+        assert_eq!(stored.tier.as_deref(), Some("drawer"));
+        assert!(stored.is_mounted());
+
+        let read = catalog.volume("drawer-07").unwrap().unwrap();
+        assert_eq!(read, stored, "the row is read back unchanged");
+        assert_eq!(catalog.volumes().unwrap().len(), 1);
+    }
+
+    /// At most one volume may be mounted per tier: two would leave recall with no single
+    /// answer for which volume holds a location's bytes. A non-mounted state clears the
+    /// binding, so the drive can be reused.
+    #[test]
+    fn only_one_volume_may_be_mounted_per_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = catalog_in(tmp.path());
+        catalog
+            .set_volume("drawer-07", "mounted", Some("drawer"), None)
+            .unwrap();
+
+        let err = catalog
+            .set_volume("drawer-08", "mounted", Some("drawer"), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::VolumeTierOccupied { .. }),
+            "a second mounted volume for one tier is refused: {err}"
+        );
+
+        // Re-recording the same volume is not a conflict.
+        catalog
+            .set_volume("drawer-07", "mounted", Some("drawer"), Some("still in"))
+            .unwrap();
+
+        // `in_vault` clears the binding, so another volume may take the drive.
+        let out = catalog
+            .set_volume("drawer-07", "in_vault", None, None)
+            .unwrap();
+        assert_eq!(out.tier, None, "a volume out of the drive binds no tier");
+        assert!(catalog.mounted_volume_for_tier("drawer").unwrap().is_none());
+        catalog
+            .set_volume("drawer-08", "mounted", Some("drawer"), None)
+            .unwrap();
+        assert_eq!(
+            catalog
+                .mounted_volume_for_tier("drawer")
+                .unwrap()
+                .unwrap()
+                .id,
+            "drawer-08"
+        );
+    }
+
+    /// A state that is not one of §3's four is refused by name, so a typo cannot be stored
+    /// and later read as "not mounted".
+    #[test]
+    fn an_unknown_volume_state_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = catalog_in(tmp.path());
+        let err = catalog
+            .set_volume("drawer-07", "monted", Some("drawer"), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::InvalidVolumeState { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("in_vault, mounted, loaned, lost"),
+            "the refusal lists the states: {err}"
+        );
+        let empty = catalog.set_volume("", "mounted", None, None).unwrap_err();
+        assert!(matches!(empty, CatalogError::EmptyVolumeId), "{empty}");
+    }
+
+    /// An older catalog gains `volume.tier` on the next open, and its existing rows read
+    /// back with the honest `None` — nothing was recorded about which drive they were in.
+    #[test]
+    fn a_catalog_written_before_volume_tier_gains_the_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalog.sqlite");
+        {
+            // A volume table the shape the schema had before #143, plus one row.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE volume (
+                     id    TEXT PRIMARY KEY,
+                     state TEXT NOT NULL,
+                     note  TEXT
+                 );
+                 INSERT INTO volume (id, state, note) VALUES ('drawer-01', 'in_vault', NULL);",
+            )
+            .unwrap();
+        }
+        let catalog = Catalog::open(&path).unwrap();
+        let row = catalog.volume("drawer-01").unwrap().unwrap();
+        assert_eq!(row.state, "in_vault");
+        assert_eq!(row.tier, None, "an old row binds no tier — the truth");
     }
 }

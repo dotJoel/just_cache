@@ -355,6 +355,22 @@ impl Recaller {
             .filter(|root| root.as_path() != self.watch.as_path())
             .collect();
         let hot = self.watch.join(path);
+        // Offline tiers travel with the request so a read of an object whose only copy is
+        // on a volume can be served (or refused with the insert prompt) through the same
+        // `restore` the slow-tier path uses. An object/peer tier's download still needs the
+        // operator's config, which the mount does not carry; offline volumes do not.
+        let offline_tiers: Vec<crate::tiers::Tier> = self
+            .tiers
+            .as_ref()
+            .map(|tiers| {
+                tiers
+                    .tiers()
+                    .iter()
+                    .filter(|tier| tier.kind == crate::tiers::TierKind::Offline)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         restore::restore(&RestoreRequest {
             path: &hot,
             watch: &self.watch,
@@ -363,6 +379,7 @@ impl Recaller {
             catalog: Some(&catalog),
             object_tier_configs: &[],
             encryption_keys: &[],
+            offline_tiers: &offline_tiers,
         })
         .map_err(|err| failed(err.to_string()))?;
 
