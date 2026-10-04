@@ -44,8 +44,10 @@ in the summary line, so do not read a green run as coverage unless that variable
 process cannot time from outside — a destination vanishing between the copies of one sweep, a
 read-back failing on bytes that were just written, a partial file observed while bytes are
 still moving — is injected by setting `JUST_CACHE_FAULT` to a `mechanism=N` spec. The grammar
-and the one-shot claims are in `src/faults.rs`; the seams it arms fire in `src/replication.rs`
-and `src/disk_management.rs`. The variable is inert unless set, and a set-but-malformed spec
+and the one-shot claims are in `src/faults.rs`; the seams it arms fire in `src/replication.rs`,
+`src/disk_management.rs`, `src/catalog_delete.rs` (`delete-after-commit=N`) and `src/gc.rs`
+(`gc-after-delete=N`, aborting after the Nth GC unlink). The variable is inert unless set, and a
+set-but-malformed spec
 panics deliberately: a fault switch that silently no-opped would let a mistyped test pass
 green with nothing injected. `tests/fault_injection.rs` is the worked example.
 

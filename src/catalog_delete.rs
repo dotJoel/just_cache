@@ -19,18 +19,31 @@
 //! Every refusal is decided before the transaction writes anything, so a delete either
 //! commits whole or changes nothing. The refusals are the cases where finishing would
 //! need a judgement the tool must not make on its own: a pin, a damaged copy (the only
-//! evidence of what the bytes should be, §9), a tier that is not mounted (its bytes
-//! cannot be removed, and dropping their rows would orphan them unseen), a row that does
-//! not resolve under a recorded root.
+//! evidence of what the bytes should be, §9), a row that does not resolve under a
+//! recorded root and names no volume.
+//!
+//! # A tier that is not mounted is not a refusal (issue #144)
+//!
+//! When a released copy sits on a tier that is not reachable *now* — an `fs` root that is
+//! not mounted, or an `offline` volume that is not the one in the drive — the delete is
+//! still committed: the release is recorded in `pending_removal` as `(tier, storage_key)`,
+//! not only as a path, and the same code that finishes a crashed delete completes it on
+//! the next pass, once the tier returns. The old behaviour refused whole and left the file
+//! undeletable; §9 named that refusal as the gap this closes. Completion is deliberately
+//! conservative: an `offline` location resolves to `<mount>/<relative>` **only** when the
+//! volume ledger says the exact volume named by the storage key is the one mounted in that
+//! tier, so bytes are never unlinked from the wrong disk.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
 use super::{canonical, hex, key_of, now_seconds, resolve_location_path, Catalog, CatalogError};
 use crate::digest;
+use crate::offline;
+use crate::tiers::TierSet;
 
 const KIND_BYTES: &str = "bytes";
 const KIND_LINK: &str = "link";
@@ -42,11 +55,6 @@ pub enum DeleteRefusal {
     NotNamed { path: String },
     #[error("{path} is pinned until {until} (unix seconds); unpin it first")]
     Pinned { path: String, until: i64 },
-    #[error(
-        "{path}: a copy is on {tier}, which is not mounted; deleting now would drop the \
-         row for bytes nothing could remove"
-    )]
-    TierUnmounted { path: String, tier: String },
     #[error(
         "{path}: the copy at {tier}/{storage_key} is recorded as damaged ({detail}); a \
          human decides what happens to the only evidence of those bytes"
@@ -101,6 +109,13 @@ pub enum RemovalOutcome {
         path: PathBuf,
         reason: String,
     },
+    /// The released bytes are on a tier that is not reachable now. The intent stays in
+    /// `pending_removal` and is completed when the tier returns (issue #144); the location
+    /// is named here so silence is never the answer.
+    Deferred {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 /// The committed result of one delete.
@@ -113,6 +128,34 @@ pub struct DeleteOutcome {
     /// Location rows released by the transition.
     pub locations_released: usize,
     pub removals: Vec<RemovalOutcome>,
+}
+
+/// One file the transition released, as recorded in `pending_removal`.
+struct PendingRow {
+    /// The path to unlink when the location resolves to one; a `<tier>/<key>` surrogate
+    /// for an offline copy whose mount is not knowable yet. Never unlinked unless it came
+    /// from [`resolve_released`], which is what makes the surrogate safe.
+    path: PathBuf,
+    kind: &'static str,
+    /// The released location, when it is one (`None` for a name symlink).
+    tier: Option<String>,
+    storage_key: Option<String>,
+}
+
+/// A `pending_removal` row as read back: `(path, object, size, kind, tier, storage_key)`.
+type PendingRecord = (String, Vec<u8>, i64, String, Option<String>, Option<String>);
+
+/// Where a recorded `(tier, storage_key)` resolves to, or why it cannot be finished yet.
+enum Released {
+    /// A path that exists now and is safe to unlink. `sealed` marks an `offline` copy:
+    /// its bytes on the volume are the encrypted envelope, so the plaintext digest and
+    /// size the row carries cannot (and need not) be re-checked before the unlink.
+    Ready { path: PathBuf, sealed: bool },
+    /// Correct and recorded, but the tier is not reachable now: keep the intent.
+    Deferred { path: PathBuf, reason: String },
+    /// The row itself cannot be trusted (a key that escapes, a volume the ledger does not
+    /// know). Kept and reported, never guessed at.
+    Refused { reason: String },
 }
 
 impl Catalog {
@@ -206,7 +249,7 @@ impl Catalog {
             return Err(DeleteRefusal::WouldStrandNames { path }.into());
         }
 
-        let mut pending: Vec<(PathBuf, &str)> = Vec::new();
+        let mut pending: Vec<PendingRow> = Vec::new();
         for (tier, key) in &released {
             let damage: Option<String> = tx
                 .query_row(
@@ -225,32 +268,49 @@ impl Catalog {
                 }
                 .into());
             }
-            let file = resolve_location_path(tier, key, &roots).map_err(|err| {
-                DeleteRefusal::Unresolvable {
-                    path: path.clone(),
-                    tier: tier.clone(),
-                    storage_key: key.clone(),
-                    detail: err.detail().to_string(),
+            // An `offline` copy: its key is `<volume-id>/<relative>` and the volume ledger
+            // vouches for the id. The tier is a configured name, not a root, and the mount
+            // is unknown until the volume is inserted — record the location and let the
+            // resolver finish it when the volume is the mounted one (never otherwise).
+            let offline_volume = match offline::parse_storage_key(key) {
+                Some((volume_id, _)) if volume_exists(&tx, &volume_id)? => Some(volume_id),
+                _ => None,
+            };
+            let target = match offline_volume {
+                Some(_) => PathBuf::from(format!("{tier}/{key}")),
+                None => {
+                    // A filesystem location: it must resolve under a recorded root. An
+                    // absent root directory is *not* a refusal any more (#144) — the
+                    // intent is recorded and completed when the tier returns; only a tier
+                    // that is not a root, or a key that escapes one, is refused by name.
+                    resolve_location_path(tier, key, &roots).map_err(|err| {
+                        DeleteRefusal::Unresolvable {
+                            path: path.clone(),
+                            tier: tier.clone(),
+                            storage_key: key.clone(),
+                            detail: err.detail().to_string(),
+                        }
+                    })?
                 }
-            })?;
-            // An unmounted tier reads as a missing root directory. Its bytes cannot be
-            // removed, and releasing their row anyway would leave them on that disk with
-            // nothing recording they exist (out of scope here: the vault model, P3).
-            if !Path::new(tier).is_dir() {
-                return Err(DeleteRefusal::TierUnmounted {
-                    path,
-                    tier: tier.clone(),
-                }
-                .into());
-            }
-            pending.push((file, KIND_BYTES));
+            };
+            pending.push(PendingRow {
+                path: target,
+                kind: KIND_BYTES,
+                tier: Some(tier.clone()),
+                storage_key: Some(key.clone()),
+            });
         }
         // The name's own entry in the tree: the hot file (already listed above when it
         // is a location) or the symlink a migrated name is.
         let name_file = watch_root.join(&path);
         if let Ok(metadata) = fs::symlink_metadata(&name_file) {
             if metadata.file_type().is_symlink() {
-                pending.push((name_file, KIND_LINK));
+                pending.push(PendingRow {
+                    path: name_file,
+                    kind: KIND_LINK,
+                    tier: None,
+                    storage_key: None,
+                });
             }
         }
 
@@ -278,11 +338,19 @@ impl Catalog {
                     .map_err(CatalogError::from)?;
             }
         }
-        for (file, kind) in &pending {
+        for row in &pending {
             tx.execute(
-                "INSERT OR IGNORE INTO pending_removal (path, object_id, size, kind)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![key_of(file), object, size, kind],
+                "INSERT OR IGNORE INTO pending_removal
+                     (path, object_id, size, kind, tier, storage_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key_of(&row.path),
+                    object,
+                    size,
+                    row.kind,
+                    row.tier,
+                    row.storage_key
+                ],
             )
             .map_err(CatalogError::from)?;
         }
@@ -313,22 +381,59 @@ impl Catalog {
     /// file is the one just checked, so size and type suffice; on recovery the window may
     /// have been arbitrarily long, and a new file written at the same path must never be
     /// removed on the strength of an old transaction.
+    ///
+    /// A row that records a `(tier, storage_key)` is resolved before its `path` is used:
+    /// an absent tier, or an offline volume that is not the one in the drive, leaves the
+    /// row in place and reports it as [`RemovalOutcome::Deferred`] (issue #144).
     pub fn finish_pending_removals(
         &mut self,
         verify: bool,
     ) -> Result<Vec<RemovalOutcome>, CatalogError> {
-        let rows: Vec<(String, Vec<u8>, i64, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path, object_id, size, kind FROM pending_removal ORDER BY path")?;
+        let tiers = self.pending_tiers.clone().or_else(|| self.tiers_beside());
+        let roots = self.roots()?;
+        let rows: Vec<PendingRecord> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, object_id, size, kind, tier, storage_key
+                   FROM pending_removal ORDER BY path",
+            )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })?;
             rows.collect::<Result<_, _>>()?
         };
         let mut outcomes = Vec::with_capacity(rows.len());
-        for (path_text, object, size, kind) in rows {
-            let path = PathBuf::from(&path_text);
+        for (path_text, object, size, kind, tier, storage_key) in rows {
+            let recorded = PathBuf::from(&path_text);
+            // Resolve the recorded location when the row names one; otherwise the `path`
+            // column is authoritative (a name symlink, or a row predating #144).
+            let (path, sealed) = match (kind.as_str(), &tier, &storage_key) {
+                (KIND_BYTES, Some(tier), Some(key)) => {
+                    match resolve_released(self, tier, key, &roots, tiers.as_ref()) {
+                        Released::Ready { path, sealed } => (path, sealed),
+                        Released::Deferred { path, reason } => {
+                            outcomes.push(RemovalOutcome::Deferred { path, reason });
+                            continue;
+                        }
+                        Released::Refused { reason } => {
+                            // Never guessed at, and never dropped: forgetting the row would
+                            // forget a file entirely.
+                            outcomes.push(RemovalOutcome::Deferred {
+                                path: recorded,
+                                reason,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                _ => (recorded, false),
+            };
             let outcome = match fs::symlink_metadata(&path) {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     RemovalOutcome::AlreadyGone(path)
@@ -346,6 +451,11 @@ impl Catalog {
                         }
                     } else if !metadata.is_file() {
                         Err("no longer a regular file".to_string())
+                    } else if sealed {
+                        // An offline copy is the encrypted envelope: its plaintext size and
+                        // digest cannot be checked against the sealed bytes, and the ledger
+                        // already vouched for the volume the row names. Type is enough.
+                        Ok(())
                     } else if metadata.len() != size as u64 {
                         Err(format!("size is now {}, released {size}", metadata.len()))
                     } else if verify {
@@ -369,9 +479,13 @@ impl Catalog {
                     }
                 }
             };
-            // A failed unlink keeps its row so the next pass retries; every other outcome
-            // has settled what happens to that file.
-            if !matches!(outcome, RemovalOutcome::Failed { .. }) {
+            // A failed unlink keeps its row so the next pass retries; a deferred location
+            // keeps it until its tier returns. Every other outcome has settled what
+            // happens to that file.
+            if !matches!(
+                outcome,
+                RemovalOutcome::Failed { .. } | RemovalOutcome::Deferred { .. }
+            ) {
                 self.conn.execute(
                     "DELETE FROM pending_removal WHERE path = ?1",
                     params![path_text],
@@ -393,5 +507,136 @@ impl Catalog {
             out.push(PathBuf::from(row?));
         }
         Ok(out)
+    }
+
+    /// The tier configuration beside this catalog, when there is one — open-if-present,
+    /// never created, the rule every other config lookup follows. Used to locate an
+    /// `offline` tier's mount when finishing a deferred removal (#144).
+    fn tiers_beside(&self) -> Option<TierSet> {
+        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        TierSet::load_beside(dir).ok().flatten()
+    }
+}
+
+/// Whether the ledger records a volume with this id. That is what makes a `<id>/<path>`
+/// storage key an `offline` location rather than a filesystem key.
+fn volume_exists(conn: &Connection, id: &str) -> Result<bool, CatalogError> {
+    let found: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM volume WHERE id = ?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    Ok(found != 0)
+}
+
+/// Resolve a released `(tier, storage_key)` to the file to unlink now, or say why not.
+///
+/// A filesystem tier is one of the catalog's recorded roots: its location resolves under
+/// that root, and an absent root directory defers rather than refuses. An `offline` tier
+/// is a configured name whose key is `<volume-id>/<relative>`; it resolves to
+/// `<mount>/<relative>` only when the ledger says the *same* volume is the one mounted in
+/// the tier, so a removal is never carried out against the wrong disk.
+fn resolve_released(
+    catalog: &Catalog,
+    tier: &str,
+    storage_key: &str,
+    roots: &[PathBuf],
+    tiers: Option<&TierSet>,
+) -> Released {
+    if roots.iter().any(|root| root.as_path() == Path::new(tier)) {
+        return match resolve_location_path(tier, storage_key, roots) {
+            Err(err) => Released::Refused {
+                reason: err.detail().to_string(),
+            },
+            Ok(path) => {
+                if Path::new(tier).is_dir() {
+                    Released::Ready {
+                        path,
+                        sealed: false,
+                    }
+                } else {
+                    Released::Deferred {
+                        path,
+                        reason: format!(
+                            "tier `{tier}` is not mounted; the copy is held until it returns"
+                        ),
+                    }
+                }
+            }
+        };
+    }
+    let Some((volume_id, relative)) = offline::parse_storage_key(storage_key) else {
+        return Released::Refused {
+            reason: format!(
+                "`{tier}/{storage_key}` is neither a recorded root nor a volume storage key"
+            ),
+        };
+    };
+    match catalog.volume(&volume_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Released::Refused {
+                reason: format!(
+                    "no volume `{volume_id}` is recorded in the ledger; `{tier}/{storage_key}` \
+                     cannot be finished"
+                ),
+            }
+        }
+        Err(err) => {
+            return Released::Refused {
+                reason: err.to_string(),
+            }
+        }
+    }
+    let Some(tier_config) = tiers.and_then(|set| set.get(tier)) else {
+        return Released::Deferred {
+            path: PathBuf::from(format!("{tier}/{storage_key}")),
+            reason: format!(
+                "tier `{tier}` is offline and no tiers.toml beside the catalog describes its \
+                 mount; insert the volume and place a tiers.toml so the removal can finish"
+            ),
+        };
+    };
+    let mount = tier_config.path.clone();
+    match catalog.mounted_volume_for_tier(tier) {
+        Err(err) => Released::Refused {
+            reason: err.to_string(),
+        },
+        Ok(Some(mounted)) if mounted.id == volume_id => {
+            if !mount.is_dir() {
+                Released::Deferred {
+                    path: PathBuf::from(format!("{tier}/{storage_key}")),
+                    reason: format!(
+                        "volume `{volume_id}` is recorded mounted in tier `{tier}` but {} is \
+                         not there; insert it and run the next pass",
+                        mount.display()
+                    ),
+                }
+            } else {
+                let path = mount.join(&relative);
+                if path.starts_with(&mount) {
+                    Released::Ready { path, sealed: true }
+                } else {
+                    Released::Refused {
+                        reason: format!("`{storage_key}` escapes the mount {}", mount.display()),
+                    }
+                }
+            }
+        }
+        Ok(Some(mounted)) => Released::Deferred {
+            path: PathBuf::from(format!("{tier}/{storage_key}")),
+            reason: format!(
+                "tier `{tier}` holds volume `{}`, not `{volume_id}`; nothing is removed from \
+                 the wrong volume",
+                mounted.id
+            ),
+        },
+        Ok(None) => Released::Deferred {
+            path: PathBuf::from(format!("{tier}/{storage_key}")),
+            reason: format!(
+                "volume `{volume_id}` is not mounted in tier `{tier}`; insert it and run the \
+                 next pass"
+            ),
+        },
     }
 }

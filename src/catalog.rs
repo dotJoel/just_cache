@@ -61,6 +61,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
 
 use crate::digest;
+use crate::tiers::TierSet;
 
 #[path = "catalog_delete.rs"]
 mod delete;
@@ -207,11 +208,22 @@ CREATE TABLE IF NOT EXISTS root (
 -- resurrected, or a cold copy counted as an orphaned object nobody asked to keep.
 -- `kind` is 'bytes' (a regular file that must still be `object_id`'s bytes) or 'link'
 -- (the symlink a migrated name was). No foreign key: the object row is already gone.
+--
+-- `tier`/`storage_key` (issue #144) carry the *location* the bytes were released from, so
+-- a copy whose tier cannot be reached now can still be finished when it returns: a delete
+-- whose copy sits on an absent tier records the intent here and completes it on the next
+-- pass, rather than refusing and leaving the file undeletable. `path` stays the primary
+-- key and still names the file to unlink when the location resolves to a path; for an
+-- `offline` copy (whose mount is unknown until the volume is inserted) it holds a
+-- `<tier>/<storage_key>` surrogate that never collides with a real absolute path and is
+-- never unlinked directly — `tier`/`storage_key` are what the resolver reads.
 CREATE TABLE IF NOT EXISTS pending_removal (
-    path       TEXT PRIMARY KEY,
-    object_id  BLOB NOT NULL,
-    size       INTEGER NOT NULL,
-    kind       TEXT NOT NULL
+    path        TEXT PRIMARY KEY,
+    object_id   BLOB NOT NULL,
+    size        INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    tier        TEXT,
+    storage_key TEXT
 );
 CREATE TABLE IF NOT EXISTS digest_cache (
     path        TEXT PRIMARY KEY,      -- canonical path the digest was computed at
@@ -1085,6 +1097,11 @@ pub struct Catalog {
     path: PathBuf,
     /// When set, `sync` ignores the digest cache and re-hashes every file (issue #50).
     force_rehash: bool,
+    /// The tier config this invocation loaded, so a command that finishes a pending
+    /// removal from an `offline` tier can locate its mount (issue #144). `None` falls back
+    /// to `tiers.toml` beside the catalog. Set by the CLI, never read from the catalog
+    /// file: the config is not catalog state.
+    pending_tiers: Option<TierSet>,
 }
 
 impl Catalog {
@@ -1141,6 +1158,7 @@ impl Catalog {
             conn,
             path,
             force_rehash: false,
+            pending_tiers: None,
         })
     }
 
@@ -1179,6 +1197,13 @@ impl Catalog {
     /// that switch; the cache is repopulated as the forced sync goes.
     pub fn set_force_rehash(&mut self, force: bool) {
         self.force_rehash = force;
+    }
+
+    /// Record the tier config this invocation loaded, so `finish_pending_removals` can
+    /// resolve an `offline` tier's mount when a command names a config not beside the
+    /// catalog (#144). Setting `None` restores the default: `tiers.toml` beside the file.
+    pub fn set_pending_tiers(&mut self, tiers: Option<TierSet>) {
+        self.pending_tiers = tiers;
     }
 
     /// Ingest the current state of `watch` and `dests`, reporting — never reconciling —
@@ -3499,6 +3524,23 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     if has_volume_tier == 0 {
         conn.execute_batch("ALTER TABLE volume ADD COLUMN tier TEXT;")?;
+    }
+    // `pending_removal.tier`/`storage_key` (#144): the released location, so a delete
+    // whose tier is absent can be finished when it returns. A catalog written before this
+    // gains them as NULL, which the resolver reads as "the path column is the file" — the
+    // honest meaning for every row such a catalog holds. Same `pragma_table_info` pattern
+    // as the columns above: `CREATE TABLE IF NOT EXISTS` cannot add a column to an
+    // existing file.
+    let has_pending_tier: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('pending_removal') WHERE name = 'tier'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_pending_tier == 0 {
+        conn.execute_batch(
+            "ALTER TABLE pending_removal ADD COLUMN tier TEXT;
+             ALTER TABLE pending_removal ADD COLUMN storage_key TEXT;",
+        )?;
     }
     Ok(())
 }

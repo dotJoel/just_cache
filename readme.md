@@ -46,6 +46,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🧾 [Auditing consistency](#auditing-consistency)
 - 🧭 [Finding an object](#finding-an-object)
 - 🗑️ [Deleting an object](#deleting-an-object)
+- ♻️ [Garbage collection](#garbage-collection)
 - 🔙 [Restoring a file](#restoring-a-file)
 - 📌 [Pinning a file](#pinning-a-file)
 - 🧽 [Scrubbing for bitrot](#scrubbing-for-bitrot)
@@ -567,14 +568,51 @@ just_cache catalog delete shows/old.mkv \
   goes. A delete that would leave the remaining names with no copy is refused.
 - **It refuses rather than doing part of the job**, naming the reason: the path is not
   catalogued, the object is pinned, a copy is recorded as damaged (the only evidence of what
-  those bytes should be), a tier is not mounted (its bytes cannot be removed, and dropping
-  their rows would orphan them unseen), or a row does not resolve under a recorded root.
+  those bytes should be), or a row does not resolve under a recorded root.
+- **A copy on a tier that is not mounted is deferred, never refused.** The release commits
+  and is recorded as `(tier, storage_key)` in `pending_removal`; the next `catalog sync`,
+  `resolve --apply`, `delete` or `gc --apply` finishes it once the tier is back. An offline
+  copy is finished only when the volume ledger says the volume its key names is the one
+  mounted in that tier — never a different volume's bytes. Silence is the only wrong answer,
+  so the deferred location is named as the delete reports.
 - **It is auditable.** The name is gone from `audit` and `locate`, and no orphan copy is left
-  counted as good. Deleting from an unmounted tier, and a general garbage collector for bytes
-  no delete reaches, are out of scope.
+  counted as good. Bytes that no delete reaches are left for `gc`.
 
 Through the mount, `unlink` and `rmdir` perform the same transition instead of answering
 `EROFS` (see [Mounting the namespace](#mounting-the-namespace)).
+
+## Garbage collection
+
+A delete releases the bytes the catalog vouches for, but nothing removes bytes no *row* ever
+referenced — an aborted export, a copy whose row was reconciled away, a retired partial, a
+file dropped by hand. `gc` finds them, per configured tier, and removes them only when asked:
+
+```sh
+just_cache gc --catalog /mnt/cache/media/.just_cache-catalog.sqlite          # report only
+just_cache gc --catalog /mnt/cache/media/.just_cache-catalog.sqlite --apply  # remove them
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--catalog <FILE>` | The catalog to collect against. It must already exist. |
+| `--tier <NAME>` | Restrict the pass to one configured tier, by name (`[tiers.cold]`) or by root path. |
+| `--apply` | Remove what the pass found. Without it, `gc` changes no byte. |
+| `--tiers <FILE>` | Tier config (`tiers.toml`) beside the catalog by default, read only if already there. Needed only to reach an `offline` tier's mount. |
+| `--json` | Print the report as JSON. |
+| `-q` / `--quiet` | Only problems and the bytes that would be removed. |
+
+- **Report first, act on request.** The default pass names every unreferenced file, partial
+  and empty directory, and its byte count, and exits `1` so cron can alert. Nothing is
+  removed without `--apply`, and `gc` never runs as part of a read or a sweep.
+- **A row is a claim, however weak.** An object with no *name* but a `location` row is kept,
+  and so is a copy whose row is *unverified* — unknown is not none. Only bytes no row
+  references at all are garbage.
+- **Nothing outside a configured root.** The pass walks the recorded roots (and, when a
+  `tiers.toml` describes it, a mounted offline tier), never crosses a mount point, never
+  follows a symlink, and never touches the catalog, a journal or a config file.
+- **Interruption is journalled.** Each unlink is recorded in `.just_cache-gc-journal` beside
+  the catalog first; a crash after an unlink leaves an entry for a file that is already gone,
+  and the next pass drops it cleanly. `gc` never writes a catalog row.
 
 ## Auditing consistency
 
