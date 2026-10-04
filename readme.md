@@ -89,7 +89,9 @@ LAN-peer tier followed (#142) — a peer runs `just_cache object-server`, and a 
 tier moves bytes to it over the same S3-compatible wire — and the offline-volume driver
 landed (#143): an `offline` tier exports to a volume a person inserts, tracks where each
 volume is in the catalog's `volume` ledger, and refuses a read that cannot reach it with an
-insert prompt instead of a missing-file error. See [Design](#design) for that
+insert prompt instead of a missing-file error (#143); and a delete or a garbage collection
+reaches bytes on a tier that is not mounted (#144) — a released copy on an absent tier is
+held until it returns, never guessed at. See [Design](#design) for that
 roadmap and its current boundary.
 
 ## Configuration
@@ -334,7 +336,8 @@ the same filesystem-side as `replica-lost`.
 Distinctness is by configured root, not by device: two directories on one pool are two
 destinations. With a floor of 2 and one other disk, the second copy lands on that other
 disk **on the same host** — this survives a disk failure, not the loss of the machine.
-Off-host copies are the phase in progress (P3).
+Off-host copies are what the remote tiers provide: an S3-compatible object store (#141), a
+LAN peer (#142), or an offline volume a person inserts (#143).
 
 ## How a file is chosen
 
@@ -1262,12 +1265,13 @@ cloud object storage (#141) and a LAN peer (#142) — both over the same S3-comp
 sealed by the envelope — and an offline volume (#143), whose bytes live on a disk the
 operator inserts and whose whereabouts the catalog's `volume` ledger records.
 
-The design in [`docs/design.md`](docs/design.md) describes the intended extension: one
+The design in [`docs/design.md`](docs/design.md) describes the extension: one
 catalog and namespace across local disks, LAN peers, cloud object storage and removable
 offline volumes, with recall latency and restore requirements made explicit. The offline
 tier keeps files discoverable in the catalog while naming the physical volume needed
-to retrieve them. Those providers, the FUSE namespace and automated lifecycle policy are
-planned work, not features in the current binary.
+to retrieve them. Those remote tiers and the sealed envelope, plus the FUSE namespace
+and delete/GC on a tier that is not mounted, are implemented (#140–#144); automated
+lifecycle policy remains planned work, not a feature in the current binary.
 
 That cross-provider namespace is the longer-term distinction from a local mover. Today,
 the practical benefit is a journaled local mover with commands for cataloging, locating,
