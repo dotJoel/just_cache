@@ -160,12 +160,12 @@ impl TierKind {
         }
     }
 
-    /// True when a transport driver for this kind exists. `fs`, `object` and `peer` are
-    /// served; `offline` is the one kind the design names that no driver serves yet. The
-    /// parse refuses a kind without one, so this is the single place to flip as drivers
-    /// land — and the tests that pin the refusals are the reminder to flip it.
+    /// True when a transport driver for this kind exists. All four kinds are served:
+    /// `fs`, `object` and `peer`, and — as of #143 — `offline`, whose driver exports to a
+    /// mounted volume. The parse refuses a kind without one (an unknown spelling), so this
+    /// remains the single place to flip as drivers land.
     pub fn is_served(self) -> bool {
-        matches!(self, TierKind::Fs | TierKind::Object | TierKind::Peer)
+        true
     }
 
     /// §2 rule 2: "anything crossing the machine boundary is encrypted first." The envelope
@@ -215,6 +215,11 @@ pub struct Tier {
     /// object-server, so its client config is the object-store config). Kept here so
     /// callers that match on `kind` can reach the config without a second lookup.
     pub object_config: Option<crate::object_store::ObjectTierConfig>,
+    /// The offline-volume configuration, present when `kind == Offline`: the physical
+    /// vaults this tier's volumes live in, and the envelope key §2 rule 2 requires because
+    /// the volume itself leaves the host. Kept here for the same reason as
+    /// `object_config`.
+    pub offline_config: Option<OfflineTierConfig>,
 }
 
 impl Tier {
@@ -222,6 +227,49 @@ impl Tier {
     /// actually live on.
     pub fn is_home(&self) -> bool {
         self.volatility == Volatility::Persistent
+    }
+
+    /// The physical places this offline tier's volumes live. Empty for every other kind.
+    /// Used by the insert prompt: a refusal that cannot say where to look is not advice.
+    pub fn vaults(&self) -> &[String] {
+        self.offline_config
+            .as_ref()
+            .map(|config| config.vaults.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// Configuration for one `offline` tier (#143): an exported volume a person inserts.
+///
+/// Unlike the object and peer tiers, an offline tier has no wire endpoint. What it has is
+/// a `path` (the mount point, present only while a volume is in the drive) and `vaults`
+/// (the shelves its volumes live on when they are not). The envelope key is required for
+/// the same reason it is on object and peer tiers: §2 rule 2 puts encryption on every edge
+/// that leaves the machine, and a volume leaving the building is exactly that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineTierConfig {
+    /// The tier name (the `[tiers.<name>]` key).
+    pub name: String,
+    /// The physical places this tier's volumes live, as written in `vaults`.
+    pub vaults: Vec<String>,
+    /// Where the envelope key lives: a file path or an environment variable name. The key
+    /// is 64 hex characters (32 bytes). Never on argv, never in a log line or a catalog row.
+    pub encryption_key: crate::object_store::CredentialSource,
+}
+
+impl OfflineTierConfig {
+    /// Load the envelope key. Errors name the source, never the key value — the same
+    /// contract the object-store tiers honour.
+    pub fn load_encryption_key(
+        &self,
+    ) -> Result<crate::envelope::Key, crate::object_store::ObjectStoreError> {
+        let hex = self.encryption_key.load_single()?;
+        crate::envelope::Key::from_hex(&hex).map_err(|source| {
+            crate::object_store::ObjectStoreError::Envelope {
+                tier: self.name.clone(),
+                source,
+            }
+        })
     }
 }
 
@@ -451,6 +499,12 @@ impl Tier {
         if let Some(ref obj) = self.object_config {
             use std::fmt::Write;
             let _ = write!(line, " endpoint={} bucket={}", obj.endpoint, obj.bucket);
+        }
+        if let Some(ref offline) = self.offline_config {
+            use std::fmt::Write;
+            // The key's *source* is named, never its value; the vaults are the actionable
+            // part of an offline tier's description (where to go for the volume).
+            let _ = write!(line, " vaults={}", offline.vaults.join(", "));
         }
         line
     }
@@ -713,6 +767,10 @@ struct RawTier {
     insecure: bool,
     #[serde(default)]
     chunk_size: Option<toml::Spanned<String>>,
+    /// The physical places an `offline` tier's volumes live (#143). Required and non-empty
+    /// for that kind; ignored by every other kind.
+    #[serde(default)]
+    vaults: Vec<String>,
 }
 
 impl RawTier {
@@ -744,8 +802,8 @@ impl RawTier {
         // landing changes — and the test that pins this refusal is the reminder.
         if !kind.is_served() {
             return Err(invalid(format!(
-                "line {}: tier `{name}` kind `{}` has no transport driver yet; `fs`, \
-                 `object` and `peer` are served, so this tier cannot be a file's home",
+                "line {}: tier `{name}` kind `{}` has no transport driver yet, so this tier \
+                 cannot be a file's home",
                 line_at(text, self.kind.span().start),
                 kind
             )));
@@ -798,6 +856,70 @@ impl RawTier {
             other => other.to_string(),
         });
         let cost = cost.filter(|cost| !cost.trim().is_empty());
+
+        // Offline-volume validation (#143): an offline tier has a mount point and vaults,
+        // never a wire endpoint. The four wire fields are refused by name rather than
+        // ignored — a config that says `endpoint` on an offline tier means something the
+        // operator wrote and the tool did not understand (invariant 3). `vaults` is
+        // required and non-empty: a tier that can be absent with no stated place to look
+        // is not actionable advice. The envelope key is required because §2 rule 2 puts
+        // the envelope on every edge that leaves the machine, and the volume does.
+        let offline_config = if kind == TierKind::Offline {
+            let refuse = |span: std::ops::Range<usize>, field: &str| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `offline` names `{field}`, which belongs to a \
+                     wire driver (`object`/`peer`); an offline volume has no {field} — remove it",
+                    line_at(text, span.start)
+                ))
+            };
+            if let Some(field) = &self.endpoint {
+                return Err(refuse(field.span(), "endpoint"));
+            }
+            if let Some(field) = &self.bucket {
+                return Err(refuse(field.span(), "bucket"));
+            }
+            if let Some(field) = &self.region {
+                return Err(refuse(field.span(), "region"));
+            }
+            if let Some(field) = &self.credential_source {
+                return Err(refuse(field.span(), "credential_source"));
+            }
+            let vaults: Vec<String> = self
+                .vaults
+                .iter()
+                .map(|vault| vault.trim().to_string())
+                .filter(|vault| !vault.is_empty())
+                .collect();
+            if vaults.is_empty() {
+                return Err(invalid(format!(
+                    "line {}: tier `{name}` kind `offline` requires a non-empty `vaults` list \
+                     (the physical places its volumes live); a tier that can be absent with no \
+                     stated place to look is not actionable advice",
+                    line_at(text, self.kind.span().start)
+                )));
+            }
+            let encryption_key = self.encryption_key.as_ref().ok_or_else(|| {
+                invalid(format!(
+                    "line {}: tier `{name}` kind `offline` requires `encryption_key` (a file \
+                     path or an environment variable prefixed with `$`; the volume leaves the \
+                     host, so docs/design.md §2 rule 2 requires the envelope)",
+                    line_at(text, self.kind.span().start)
+                ))
+            })?;
+            let enc_key_str = encryption_key.get_ref().trim();
+            let enc_key = if let Some(var) = enc_key_str.strip_prefix('$') {
+                crate::object_store::CredentialSource::Env(var.to_string())
+            } else {
+                crate::object_store::CredentialSource::File(PathBuf::from(enc_key_str))
+            };
+            Some(OfflineTierConfig {
+                name: name.to_string(),
+                vaults,
+                encryption_key: enc_key,
+            })
+        } else {
+            None
+        };
 
         // Object-tier validation (#141, extended by #142): require the remote-store
         // fields when kind is Object or Peer (a peer runs the object-server, so it is
@@ -938,6 +1060,7 @@ impl RawTier {
             copies: copies as usize,
             cost,
             object_config,
+            offline_config,
         })
     }
 }

@@ -1,16 +1,16 @@
 //! The tier seam, through the parser a real config goes through.
 //!
-//! §2 says a tier's `kind` is "which transport driver serves this tier". `fs`, `object`
-//! and `peer` have drivers today; `offline` does not, so what these tests pin is the
-//! refusal for the latter: a kind nothing serves must not be accepted and then served as
-//! an ordinary local directory, which is what a free-text `kind` did until this seam
-//! existed (invariant 3 — refuse what you do not understand). The two facts the seam has
-//! to answer are pinned here too: which kinds have a driver, and which ones put bytes on
-//! the far side of the machine boundary (rule 2, the envelope).
+//! §2 says a tier's `kind` is "which transport driver serves this tier". All four kinds
+//! the design names — `fs`, `object`, `peer` and, as of #143, `offline` — have drivers, so
+//! what these tests pin is how each parses and what the seam answers: which kinds are
+//! served, and which ones put bytes on the far side of the machine boundary (rule 2, the
+//! envelope). An unknown spelling is still refused by name, naming the tier, the kind and
+//! the line — a kind nothing serves must not be accepted and then served as an ordinary
+//! local directory (invariant 3 — refuse what you do not understand).
 
 use std::path::Path;
 
-use just_cache::tiers::{TierKind, TierSet, TiersError};
+use just_cache::tiers::{TierKind, TierSet};
 
 fn config(kind: &str) -> String {
     format!(
@@ -39,6 +39,17 @@ fn config_peer(extra: &str) -> String {
     )
 }
 
+/// A config for a working `offline` tier: a mount point, a vault list, and the envelope
+/// key §2 rule 2 requires because the volume leaves the host. `extra` lets a test add a
+/// field (a wire field, a second vault, …).
+fn config_offline(extra: &str) -> String {
+    format!(
+        "[tiers.tier]\nkind = \"offline\"\npath = \"/mnt/volumes/drawer\"\n\
+         volatility = \"persistent\"\nrecall = \"hours\"\ncopies = 1\n\
+         vaults = [\"shelf-a\", \"shelf-b\"]\nencryption_key = \"$ENC_KEY\"\n{extra}\n"
+    )
+}
+
 /// The type answers the two questions a driver seam exists to answer, without a config.
 #[test]
 fn the_kind_always_answers_the_seam_questions() {
@@ -49,51 +60,94 @@ fn the_kind_always_answers_the_seam_questions() {
     );
 
     for kind in TierKind::ALL {
-        if kind == TierKind::Fs || kind == TierKind::Object || kind == TierKind::Peer {
-            assert!(kind.is_served(), "{kind} is served by a driver");
-            if kind == TierKind::Fs {
-                assert!(
-                    !kind.crosses_machine_boundary(),
-                    "a local root keeps its bytes on this machine, so rule 2 does not apply"
-                );
-            } else {
-                assert!(
-                    kind.crosses_machine_boundary(),
-                    "`{kind}` leaves this machine — the envelope is required"
-                );
-            }
+        assert!(
+            kind.is_served(),
+            "`{kind}` has a driver as of #143, so the seam must say so"
+        );
+        if kind == TierKind::Fs {
+            assert!(
+                !kind.crosses_machine_boundary(),
+                "a local root keeps its bytes on this machine, so rule 2 does not apply"
+            );
         } else {
             assert!(
-                !kind.is_served(),
-                "no driver serves `{kind}` yet; is_served is what a driver flips"
-            );
-            assert!(
                 kind.crosses_machine_boundary(),
-                "`{kind}` leaves this machine — bytes (peer) or the volume itself \
+                "`{kind}` leaves this machine — bytes (object/peer) or the volume itself \
                  (offline) — so the envelope is required"
             );
         }
     }
 }
 
-/// A kind the design names but no driver serves is refused, naming the tier, the kind and
-/// the line — the input that used to parse and then behave as a local directory.
+/// An `offline` tier is served: it parses into a tier carrying its vaults and a key
+/// source, and the seam reports it crosses the machine boundary (the volume leaves the
+/// host, so rule 2 requires the envelope).
 #[test]
-fn a_kind_with_no_driver_is_refused_by_name() {
-    let error = TierSet::parse(&config("offline"), Path::new("/tmp/tiers.toml"))
-        .expect_err("an unserved kind must be refused");
-    let text = error.to_string();
+fn an_offline_tier_parses_with_its_vaults_and_key() {
+    let set = TierSet::parse(&config_offline(""), Path::new("/tmp/tiers.toml")).unwrap();
+    let tier = set.get("tier").unwrap();
+    assert_eq!(tier.kind, TierKind::Offline);
+    assert!(tier.kind.is_served(), "offline is served as of #143");
     assert!(
-        text.contains("kind `offline` has no transport driver yet"),
-        "the refusal must say which kind and why: {text}"
+        tier.kind.crosses_machine_boundary(),
+        "the volume leaves the host, so the envelope is required"
+    );
+    assert_eq!(
+        tier.vaults(),
+        ["shelf-a".to_string(), "shelf-b".to_string()],
+        "vaults are where the tier's volumes live"
     );
     assert!(
-        text.contains("tier `tier`") && text.contains("line 2"),
-        "the refusal must name the tier and the line: {text}"
+        tier.offline_config.is_some(),
+        "an offline tier carries its offline config"
+    );
+}
+
+/// An offline tier with no `vaults` is refused by line: a tier that can be absent with no
+/// stated place to look is not actionable advice (the insert prompt needs somewhere to send
+/// the operator).
+#[test]
+fn an_offline_tier_without_vaults_is_refused_by_line() {
+    let text = concat!(
+        "[tiers.tier]\nkind = \"offline\"\npath = \"/mnt/volumes/drawer\"\n",
+        "volatility = \"persistent\"\nrecall = \"hours\"\ncopies = 1\n",
+        "encryption_key = \"$ENC_KEY\"\n"
+    );
+    let err = TierSet::parse(text, Path::new("/tmp/tiers.toml")).unwrap_err();
+    assert!(err.to_string().contains("vaults"), "{err}");
+    assert!(err.to_string().contains("line 2"), "{err}");
+}
+
+/// An offline tier with no `encryption_key` is refused: the volume leaves the host, so
+/// §2 rule 2 requires the envelope.
+#[test]
+fn an_offline_tier_without_encryption_key_is_refused_by_line() {
+    let text = concat!(
+        "[tiers.tier]\nkind = \"offline\"\npath = \"/mnt/volumes/drawer\"\n",
+        "volatility = \"persistent\"\nrecall = \"hours\"\ncopies = 1\n",
+        "vaults = [\"shelf-a\"]\n"
+    );
+    let err = TierSet::parse(text, Path::new("/tmp/tiers.toml")).unwrap_err();
+    assert!(err.to_string().contains("encryption_key"), "{err}");
+    assert!(err.to_string().contains("line 2"), "{err}");
+}
+
+/// A wire field on an offline tier is refused by name rather than ignored: `endpoint` on an
+/// offline tier means something the operator wrote and the tool did not understand.
+#[test]
+fn an_offline_tier_with_a_wire_field_is_refused_by_name() {
+    let err = TierSet::parse(
+        &config_offline("endpoint = \"s3.example.com\""),
+        Path::new("/tmp/tiers.toml"),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("endpoint"),
+        "the refusal names the field: {err}"
     );
     assert!(
-        matches!(error, TiersError::Invalid { .. }),
-        "an unserved kind is an invalid config, not a syntax error"
+        err.to_string().contains("offline"),
+        "the refusal names the kind: {err}"
     );
 }
 

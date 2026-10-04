@@ -117,6 +117,9 @@ pub enum RestoreError {
     )]
     CatalogUnknownPath { path: PathBuf },
 
+    #[error("cannot restore {path} from an offline volume: {detail}")]
+    OfflineVolume { path: PathBuf, detail: String },
+
     #[error(
         "cannot restore {path}: the catalog records a malformed checksum {checksum:?}; \
          nothing was touched"
@@ -259,6 +262,10 @@ pub struct RestoreRequest<'a> {
     /// with this driver share one key per invocation; the key-value never appears in an
     /// error or a log line.
     pub encryption_keys: &'a [crate::envelope::Key],
+    /// Configured offline tiers, so a file whose only copy is on a volume can be read back
+    /// (and refused with the insert prompt when the volume is not mounted). Empty means the
+    /// restore cannot reach an offline tier even if the catalog records one.
+    pub offline_tiers: &'a [crate::tiers::Tier],
 }
 
 /// Bring the object at `request.path` back from a cold tier.
@@ -307,12 +314,29 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         .as_ref()
         .map(|record| record.locations.as_slice())
         .unwrap_or(&[]);
+    // An offline tier's mounted root has exactly a filesystem cold tier's layout — the
+    // encrypted bytes sit at the mirrored relative path — but they are not plaintext
+    // copies. Excluding offline roots from the filesystem search keeps the ciphertext from
+    // being mistaken for a cold copy; the offline driver below reads it through the
+    // envelope (D3, D5). Nothing here decides what may be deleted: `ensure_removable` still
+    // sees only the trusted roots.
+    let offline_roots: Vec<PathBuf> = request
+        .offline_tiers
+        .iter()
+        .map(|tier| fs::canonicalize(&tier.path).unwrap_or_else(|_| tier.path.clone()))
+        .collect();
+    let fs_dests: Vec<PathBuf> = request
+        .dests
+        .iter()
+        .filter(|dest| !under_any_root(dest, &offline_roots))
+        .cloned()
+        .collect();
     // The roots a recorded location row may be joined against: the `--dest` roots this
     // invocation was given, plus every root the catalog itself recorded at sync. A tier the
     // catalog knows but this invocation was not handed is exactly the case a bare filesystem
     // search cannot serve, and `resolve_location_path` still refuses any row that does not
     // provably stay under one of these.
-    let roots = trusted_roots(request.dests, request.catalog)?;
+    let roots = trusted_roots(&fs_dests, request.catalog)?;
     let watch_tier = fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
 
     match fs::symlink_metadata(&path) {
@@ -322,7 +346,7 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
         Ok(metadata) if metadata.is_file() => match locate(
             &path,
             &relative,
-            request.dests,
+            &fs_dests,
             recorded_locations,
             &watch_tier,
             &roots,
@@ -382,7 +406,7 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
             let cold = locate(
                 &path,
                 &relative,
-                request.dests,
+                &fs_dests,
                 recorded_locations,
                 &watch_tier,
                 &roots,
@@ -392,12 +416,11 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                 dests: request.dests.to_vec(),
             });
 
-            // When locate() returns None but the catalog records an object-tier
-            // location, download the object from the object store instead.
+            // When locate() returns None but the catalog records an object-tier or offline
+            // location, reach the copy through that tier's driver instead.
             let cold = match cold {
                 Ok(cold) => cold,
                 Err(err) => {
-                    // Try object-tier download as a fallback
                     if let Some(obj_cold) = restore_from_object_tier(
                         request,
                         &path,
@@ -405,6 +428,13 @@ pub fn restore(request: &RestoreRequest<'_>) -> Result<RestoreOutcome, RestoreEr
                         recorded.as_ref(),
                     )? {
                         obj_cold
+                    } else if let Some(offline_cold) = restore_from_offline_tier(
+                        request,
+                        &path,
+                        recorded_locations,
+                        recorded.as_ref(),
+                    )? {
+                        offline_cold
                     } else {
                         return Err(err);
                     }
@@ -643,6 +673,109 @@ fn restore_from_object_tier(
         // The downloaded file is already verified (download_and_verify checks the
         // digest). We return it as the cold copy; the caller will use restore_from()
         // to move it into place with its own verification step.
+        return Ok(Some(partial));
+    }
+
+    Ok(None)
+}
+
+/// Try to restore a file whose only copy is on an offline volume: read the mounted copy,
+/// decrypt it, verify the plaintext against the recorded digest, and return the path to the
+/// temporary plaintext.
+///
+/// Returns `Ok(None)` when no offline-tier location is found or no offline tier is
+/// configured. A configured offline location that cannot be reached is an **error**, not a
+/// skip: it is the insert prompt (D5), and swallowing it would leave the operator with the
+/// bare ENOENT §3 forbids ("insert drawer-07", never a missing-file error).
+fn restore_from_offline_tier(
+    request: &RestoreRequest<'_>,
+    hot: &Path,
+    recorded_locations: &[LocationRecord],
+    recorded: Option<&blake3::Hash>,
+) -> Result<Option<PathBuf>, RestoreError> {
+    if request.offline_tiers.is_empty() {
+        return Ok(None);
+    }
+
+    for location in recorded_locations {
+        let Some(tier) = request
+            .offline_tiers
+            .iter()
+            .find(|tier| tier.name == location.tier)
+        else {
+            continue;
+        };
+        let Some(config) = tier.offline_config.as_ref() else {
+            continue;
+        };
+        let Some((volume_id, relative)) = crate::offline::parse_storage_key(&location.storage_key)
+        else {
+            return Err(RestoreError::OfflineVolume {
+                path: hot.to_path_buf(),
+                detail: format!(
+                    "the catalog's storage key `{}` does not name a volume \
+                     (`<volume-id>/<path>`)",
+                    location.storage_key
+                ),
+            });
+        };
+
+        let mount = &tier.path;
+        // The catalog is the source of truth for which volume is in the drive (§3): the
+        // filesystem cannot be asked whether a *different* disk is mounted in its place.
+        let mounted = request
+            .catalog
+            .map(|catalog| catalog.mounted_volume_for_tier(&tier.name))
+            .transpose()
+            .map_err(|error| RestoreError::Catalog { error })?
+            .flatten();
+        let mounted_id = mounted.as_ref().map(|row| row.id.as_str());
+        if mounted_id != Some(volume_id.as_str()) || !mount.is_dir() {
+            return Err(RestoreError::OfflineVolume {
+                path: hot.to_path_buf(),
+                detail: crate::offline::insert_prompt(
+                    &tier.name,
+                    mount,
+                    &config.vaults,
+                    &volume_id,
+                    mounted_id,
+                ),
+            });
+        }
+
+        let stored = mount.join(&relative);
+        if !is_regular_file(&stored) {
+            return Err(RestoreError::OfflineVolume {
+                path: hot.to_path_buf(),
+                detail: format!(
+                    "volume `{volume_id}` is mounted at {} but the copy at {} is missing",
+                    mount.display(),
+                    stored.display()
+                ),
+            });
+        }
+
+        let key = config
+            .load_encryption_key()
+            .map_err(|error| RestoreError::OfflineVolume {
+                path: hot.to_path_buf(),
+                detail: format!(
+                    "cannot load the envelope key for tier `{}`: {error}",
+                    tier.name
+                ),
+            })?;
+
+        // Decrypt to a partial sibling of the hot path; `restore_from` then moves it into
+        // place with its own recorded-digest check.
+        let parent = hot.parent().unwrap_or_else(|| Path::new("."));
+        let partial = disk_management::partial_sibling(parent);
+        let _ = fs::remove_file(&partial);
+        crate::offline::read_verify_decrypt(&key, &stored, recorded, &partial).map_err(
+            |error| RestoreError::OfflineVolume {
+                path: hot.to_path_buf(),
+                detail: format!("the copy on volume `{volume_id}` could not be read back: {error}"),
+            },
+        )?;
         return Ok(Some(partial));
     }
 
@@ -1044,6 +1177,7 @@ mod tests {
             catalog: None,
             object_tier_configs: &[],
             encryption_keys: &[],
+            offline_tiers: &[],
         }
     }
 

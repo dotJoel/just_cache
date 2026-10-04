@@ -112,6 +112,7 @@ fn restore_materializes_a_migrated_file_and_keeps_the_cold_copy() {
         catalog: None,
         object_tier_configs: &[],
         encryption_keys: &[],
+        offline_tiers: &[],
     })
     .unwrap();
 

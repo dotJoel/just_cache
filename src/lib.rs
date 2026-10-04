@@ -20,6 +20,9 @@ pub mod gateway;
 pub mod namespace;
 pub mod object_server;
 pub mod object_store;
+// The offline-volume tier driver (#143): export to a volume a person inserts, and the
+// insert prompt a read of an offloaded object uses to name the volume it needs.
+pub mod offline;
 // Test-only, but not `#[cfg(test)]`: integration tests drive the real binary, which is
 // built without test cfg, so the fault seam has to be compiled into production and stay
 // inert there. It is private because nothing outside the crate may set a fault.
@@ -47,7 +50,8 @@ pub use audit::{
 pub use catalog::{
     format_rfc3339, resolve_location_path, Catalog, CatalogError, Difference, DifferenceKind,
     LocationRecord, MalformedRow, ObjectRecord, PinRecord, Pins, Resolution, ResolveReport,
-    RowPathError, ScrubSummary, ScrubTarget, SyncReport, CATALOG_NAME,
+    RowPathError, ScrubSummary, ScrubTarget, SyncReport, VolumeRecord, CATALOG_NAME,
+    VOLUME_MOUNTED, VOLUME_STATES, VOLUME_STATES_LIST,
 };
 pub use digest::{bytes_digest, file_digest};
 pub use disk_management::{
@@ -69,6 +73,10 @@ pub use gateway::{Gateway, GatewayConfig, GatewayError};
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
 pub use observe::{AccessLog, FLUSH_INTERVAL};
+pub use offline::{
+    display_key, export, insert_prompt, parse_storage_key, read_verify_decrypt, storage_key,
+    OfflineError,
+};
 pub use opened::{link_count, Coverage, FileId, Guards, InUse, OpenFiles};
 pub use policy::{
     DownDecision, DownRule, Lifecycle, PolicyError, Rule, RuleSet, UpRule, POLICY_FILE_NAME,
@@ -87,5 +95,6 @@ pub use schedule::{
 pub use scope::{human_bytes, parse_size, Rejected, Scope, ScopeError, ScopeRefusal};
 pub use scrub::{DamageRecord, RateLimiter, RepairRecord, ScrubError, ScrubReport, ScrubRequest};
 pub use tiers::{
-    CacheConfig, PromoteOn, Recall, Tier, TierSet, TiersError, Volatility, TIERS_FILE_NAME,
+    CacheConfig, OfflineTierConfig, PromoteOn, Recall, Tier, TierSet, TiersError, Volatility,
+    TIERS_FILE_NAME,
 };

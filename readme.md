@@ -83,10 +83,12 @@ catalog and integrity commands.
 Today just_cache is a local mover with move recovery and explicit commands to record,
 locate, check, restore and delete copies, plus a FUSE mount and a WebDAV gateway over the
 same catalog. The larger plan — one namespace across local disks, LAN peers, cloud object
-storage and offline volumes — is in progress: the object-store driver landed (#141), and
-the LAN-peer tier followed (#142) — a peer runs `just_cache object-server`, and a `peer`
-tier moves bytes to it over the same S3-compatible wire. The offline-volume driver is
-next. See [Design](#design) for that
+storage and offline volumes — is in progress: the object-store driver landed (#141), the
+LAN-peer tier followed (#142) — a peer runs `just_cache object-server`, and a `peer`
+tier moves bytes to it over the same S3-compatible wire — and the offline-volume driver
+landed (#143): an `offline` tier exports to a volume a person inserts, tracks where each
+volume is in the catalog's `volume` ledger, and refuses a read that cannot reach it with an
+insert prompt instead of a missing-file error. See [Design](#design) for that
 roadmap and its current boundary.
 
 ## Configuration
@@ -137,7 +139,23 @@ volatility = "persistent"
 recall = "s"
 copies = 2
 cost = "$0.02"
+
+[tiers.drawer]
+kind = "offline"
+path = "/mnt/volumes/drawer"          # the mount point, present only while a volume is in the drive
+volatility = "persistent"
+recall = "hours"                       # a human walks to a shelf
+copies = 1
+vaults = ["shelf-a", "shelf-b"]        # where this tier's volumes physically live
+encryption_key = "$JUST_CACHE_KEY"     # the volume leaves the host, so §2 rule 2 applies
 ```
+
+An `offline` tier is a disk that is *not* attached: it may live in a drawer, and its mount
+point is absent whenever the volume is. Because of that, a `--dest` that is a configured
+offline tier is not required to exist — the sweep runs and refuses each file with the insert
+prompt (below) rather than the command refusing the whole run. `vaults` is required and
+non-empty, and the wire fields (`endpoint`, `bucket`, `region`, `credential_source`) are
+refused *by name*: an offline volume has no endpoint.
 
 `locate` and `audit` then speak in those names, and `locate` states a copy's `recall`
 class. `recall` decides whether a read through the mount may pull the bytes up inline: `ms`
@@ -978,6 +996,41 @@ Listen on loopback by default; `--insecure` allows plain HTTP for loopback testi
 on a non-loopback bind it prints a warning — TLS is not yet implemented (that is the
 follow-up work).
 
+## Offline volumes: a disk you insert
+
+An `offline` tier is the S3 analogy's last step: the durable copy is a disk the operator
+unplugs and puts in a drawer, so the filesystem cannot be asked where the bytes are — the
+catalog answers instead (#143). Record which volume is in a tier's drive with the `volume`
+subcommand:
+
+```sh
+# The catalog's vault ledger: which physical volume is where.
+just_cache volume set drawer-07 mounted --tier drawer --note "in the drive"
+just_cache volume set drawer-07 in_vault            # it left the drive; the tier is unbound
+just_cache volume list --json
+```
+
+At most one volume may be recorded `mounted` per tier. Then a sweep exports each cold file
+to the mounted volume, through the same encrypted envelope that guards every tier leaving
+the host, reads it back and verifies it before retiring the source:
+
+```sh
+just_cache sweep --watch /srv/media --dest /mnt/volumes/drawer --tiers tiers.toml --once
+```
+
+A read that cannot reach the volume is not a missing file — it is the insert prompt:
+
+```
+cannot restore shows/movie.mkv from an offline volume: insert volume `drawer-07` and mount
+it at /mnt/volumes/drawer; tier `drawer` has no volume recorded mounted (volumes for this
+tier live in: shelf-a, shelf-b)
+```
+
+There is no marker file in a volume: the catalog is the only record of where a disk is, and
+`just_cache volume list` is how an operator reads it. Files are stored under the volume at
+their path relative to the watched tree, and a location's storage key is
+`<volume-id>/<path>` so recall knows which disk to ask for.
+
 ## Scheduling the maintenance passes
 
 `scrub` and `reconcile` are on-demand commands, and a small `schedule.toml` lets them run
@@ -1145,13 +1198,15 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/namespace.rs`](src/namespace.rs) | The catalog's names resolved into a directory tree, with a proven filesystem path to each object's tier of record — the testable half of `mount`. |
 | [`src/fuse.rs`](src/fuse.rs) | The FUSE adapter over the namespace: inode↔path, read/write through to the tier of record, and the fail-closed refusals. Unix-only; nothing else links `fuser`. |
 || [`src/object_server.rs`](src/object_server.rs) | The S3-compatible object server for LAN-peer tiers (#142): PUT/GET/HEAD/DELETE with SigV4 auth, path-containment, and atomic writes via `.partial` temp. |
-|| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule`, `mount`, `gateway` and `object-server` subcommands) and the sweep loop. |
+|| [`src/offline.rs`](src/offline.rs) | The offline-volume tier driver (#143): export to a volume through the envelope, the `<volume-id>/<path>` storage key, and the insert prompt that names a volume a read needs. |
+|| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule`, `mount`, `gateway`, `object-server` and `volume` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
 | [`tests/audit.rs`](tests/audit.rs) | Audit classifications, repair, and the CLI exit-code contract. |
 | [`tests/explain.rs`](tests/explain.rs) | `explain`'s ordering guarantee, exit codes and `--json`, through the binary. |
 | [`tests/restore.rs`](tests/restore.rs) | Restore through the binary: round trip, idempotence, broken-link repair, mismatch refusal, `--remove-copy`, and a cross-device restore. |
+| [`tests/offline_tier_e2e.rs`](tests/offline_tier_e2e.rs) | The offline-volume tier through the binary: export and verified restore, the insert prompt when the volume is out of the drive, a per-file refusal with no mounted volume, an absent mount that is not a usage error, and the `volume` ledger CLI. |
 | [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
 | [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
 | [`tests/schedule.rs`](tests/schedule.rs) | The schedule through the binary: nothing-configured runs nothing, the visible next-run, the configured rate pacing a read, a floor holding a pass back, and find-or-quiet. |
@@ -1166,12 +1221,13 @@ that serves the catalog's namespace as a real filesystem, and a WebDAV gateway f
 that cannot mount. A `[[cache]]` overlay can sit in front of a durable tier, and a file read
 through the mount is judged by observed access rather than by atime. Remote tiers exist for
 cloud object storage (#141) and a LAN peer (#142) — both over the same S3-compatible wire,
-sealed by the envelope — and there is no offline-volume tier yet.
+sealed by the envelope — and an offline volume (#143), whose bytes live on a disk the
+operator inserts and whose whereabouts the catalog's `volume` ledger records.
 
 The design in [`docs/design.md`](docs/design.md) describes the intended extension: one
 catalog and namespace across local disks, LAN peers, cloud object storage and removable
 offline volumes, with recall latency and restore requirements made explicit. The offline
-tier would keep files discoverable in the catalog while naming the physical volume needed
+tier keeps files discoverable in the catalog while naming the physical volume needed
 to retrieve them. Those providers, the FUSE namespace and automated lifecycle policy are
 planned work, not features in the current binary.
 
