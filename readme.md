@@ -53,6 +53,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🔁 [Reconciling a re-added disk](#reconciling-a-re-added-disk)
 - 🗂️ [Mounting the namespace](#mounting-the-namespace)
 - 🌐 [Serving it over WebDAV](#serving-it-over-webdav)
+- 🤖 [Asking it from an agent (MCP)](#asking-it-from-an-agent-mcp)
 - ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
 - 🔨 [Building and testing](#building-and-testing)
 - 👷 [How this codebase is built](#how-this-codebase-is-built)
@@ -1071,6 +1072,42 @@ There is no marker file in a volume: the catalog is the only record of where a d
 `just_cache volume list` is how an operator reads it. Files are stored under the volume at
 their path relative to the watched tree, and a location's storage key is
 `<volume-id>/<path>` so recall knows which disk to ask for.
+
+## Asking it from an agent (MCP)
+
+`just_cache mcp` serves the read-only, catalog-backed commands to a coding agent over the
+Model Context Protocol on stdio (#137). It is a client-driven adapter, not a daemon: it
+starts with its client, answers requests, and exits with it — no timer, no scheduled pass,
+and no tool that moves, repairs or deletes anything.
+
+```sh
+just_cache mcp --catalog /srv/media/.just_cache-catalog.sqlite   # locate, scrub
+just_cache mcp --watch /srv/media --dest /mnt/disk-slow/media    # + explain, audit
+just_cache mcp --watch /srv/media --dest /mnt/disk-slow/media \
+               --catalog /srv/media/.just_cache-catalog.sqlite --allow-restore
+```
+
+The roots are chosen once, here — a tool call names a *query*, never a path, so an agent
+cannot widen its own scope. A tool is offered only when its roots were given, so the list an
+agent sees is exactly what that invocation can answer:
+
+- `locate` — where an object lives, every copy and its tier; answers from the catalog even
+  when the tier holding the bytes is not mounted (needs `--catalog`)
+- `explain` — why one path is where it is, and what a sweep would do with it next (needs
+  `--watch` and `--dest`)
+- `audit` — consistency between the tree and its tiers, plus scrub state; read-only, never a
+  repair (needs `--watch` and `--dest`)
+- `scrub` — reads every stored copy back and checks it against the recorded checksum,
+  **always a dry run**: this surface reports rot, it never repairs (needs `--catalog`)
+- `restore` — brings an offloaded file back, verified; writes, so it is exposed only under
+  `--allow-restore` (needs `--watch` and `--dest`)
+
+There is no `sweep`, no `catalog delete`, no `gc --apply`, no `reconcile` and no `pin` on
+this surface: the tool list is the policy. Each tool runs `just_cache` itself and relays what
+the command printed, so an answer given to an agent is byte-identical to the answer given to
+a shell — including the CLI's exit code, which is an answer here and not a failure (`audit`
+exits 1 to say "look at this"; `isError` is set only when a command produced no output at
+all).
 
 ## Scheduling the maintenance passes
 

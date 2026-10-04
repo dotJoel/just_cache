@@ -296,6 +296,7 @@
     <div class="feat"><div class="name">pin</div><p>Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
     <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
     <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
+    <div class="feat"><div class="name">mcp</div><p>Serves the read-only questions — locate, explain, audit, a dry-run scrub — to a coding agent over MCP on stdio. Starts with its client and exits with it, and no tool moves, repairs or deletes anything; <code class="inline">restore</code> appears only when the operator opts in.</p></div>
     <div class="feat"><div class="name">cache</div><p>A RAM or SSD overlay in front of a durable tier: promotion copies bytes, eviction is LRU against a size cap, and residency is never data of record.</p></div>
     <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
     <div class="feat"><div class="name">gc</div><p>Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
@@ -311,8 +312,9 @@
     use, in the spirit of S3 storage classes. Local tiers are what this repo does today: the mover
     is the hot→cold driver and the symlink namespace provider, and the catalog's namespace is also
     served by a FUSE mount and a WebDAV gateway. The cache overlay and mount-observed use are
-    implemented; LAN, cloud-object and offline tiers are implemented, and delete and garbage
-    collection reach a tier that is not mounted.
+    implemented; LAN, cloud-object and offline tiers are implemented, delete and garbage
+    collection reach a tier that is not mounted, and an MCP adapter exposes the read-only
+    commands to a coding agent.
     <a href="design.md">The full design sketch is in design.md.</a>
   </p>
 </section>
