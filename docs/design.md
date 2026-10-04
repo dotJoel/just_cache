@@ -1492,8 +1492,8 @@ recovery step removed; a second fault test proves a rewritten file survives reco
 and overlay. **Still open, and named**: those do not cross the kernel — this host has no
 `/dev/fuse` — so the real round-trip is only in the `JUST_CACHE_TEST_FUSE=1` mount test,
 which CI does not run either; empty directories a delete leaves on a cold tier are not
-pruned; deleting from a tier that is not mounted (the vault model) and a garbage collector
-for bytes no delete reaches remain out of scope (P3).
+pruned by the delete itself; deleting from a tier that is not mounted, and a garbage collector
+for bytes no delete reaches, are closed by #144 (below).
 
 Closed by #44: a read of an offloaded object recalls it inline. `src/recall.rs`
 (`Recaller`) is the provider-agnostic half; the FUSE `open` calls it for a read-only open of
@@ -1705,6 +1705,68 @@ What #143 records honestly rather than hides:
   `--dest` that is a configured offline tier is skipped by the destination-existence check
   (its mount may legitimately be absent); every other command's handling of an offline root
   is unchanged.
+
+Closed by #144: deleting and garbage-collecting bytes on tiers that are not mounted. This is
+the P3 gap §9 named in the paragraph closed by #128. **D1 — the choice, and why:** a delete
+whose copy sits on an absent tier is **deferred, not refused**. The transition commits and
+records the released location as `(tier, storage_key)` in `pending_removal` (two new nullable
+columns, added by the same `pragma_table_info` migration the other columns use); the next
+`catalog sync`, `resolve --apply`, `delete` or `gc --apply` finishes it through one resolver.
+An `fs` row resolves to its path under the recorded root — exact even while the root's
+directory is absent, which is what lets the completion wait — and is unlinked when the root
+returns; an `offline` row resolves to `<mount>/<rel>` **only** when the `volume` ledger says
+the volume the key names is the one mounted in that tier, and only when a `tiers.toml` beside
+the catalog describes the mount. A *different* mounted volume, or none, keeps the intent and
+names it. Refusal stays only for a row that cannot be resolution-checked at all (a tier that
+is not a recorded root and is not a volume key, a key that escapes its root). An offline copy
+is unlinked without a plaintext re-hash: the bytes on the volume are the sealed envelope, so
+the recorded plaintext size and digest cannot be checked against them, and the ledger already
+vouched for the volume. **D2 — `just_cache gc`:** `gc --catalog FILE [--tier NAME] [--apply]
+[--json] [--quiet] [--tiers FILE]` reports bytes no catalog row references, per configured
+tier, and removes them **only** under `--apply`; never on a read, never as part of a sweep. The
+report-only default exits `1` (a finding to act on) and prints every unreferenced regular file,
+`.just_cache-partial-*` file and empty directory with its byte count. **D3 — resolution is
+shared:** the GC's reference set is built from `location` rows resolved the same way D1
+completes them, so a copy unreferenced *by path* but claimed by a row is kept — including a row
+whose copy is *unverified* (unknown is not none) — and a row the GC cannot resolve is a
+finding, never silently "no row". **D4 — crash safety:** before each unlink the GC journals its
+intent in `.just_cache-gc-journal` beside the catalog; a *distinct* file from the mover's
+journal (whose recovery reads every record as a move, so a GC record in it would be
+misrecovered), but the same `Journal` type and grammar. `JUST_CACHE_FAULT=gc-after-delete=N`
+aborts right after the Nth successful unlink; a stale record for a file that is already gone is
+dropped on the next `--apply` pass, and the GC never writes a catalog row. The pass touches
+nothing outside a configured root: it walks the recorded roots (plus a mounted `offline` tier's
+mount when a `tiers.toml` describes it), never follows a symlink, never crosses a device
+boundary, never removes the catalog, a journal or a config file, and removes empty directories
+deepest-first. Test #4's "a path outside every configured root" is the GC's finding for a row
+whose tier is not a root: reported by name, never touched.
+
+Tests: `tests/gc.rs` (6) — a report-only pass names the bytes and removes nothing (bytes and
+rows unchanged); a copy claimed only by a row, and one claimed by an *unverified* row, are
+kept; a row outside every root is a finding, not a licence; `--apply` removes exactly what was
+reported and a second pass finds nothing; an interrupted pass (`gc-after-delete=1`) adopts no
+row and its stale journal entry is dropped on the next pass; `gc --json`'s shape and the exit
+codes, plus a bad invocation is exit `2`. `tests/catalog_delete.rs` gains
+`deleting_a_copy_on_an_absent_tier_defers_and_completes_when_it_returns` (the release commits,
+the bytes survive, the deferred location is named, and the next sync finishes it).
+`tests/offline_gc_e2e.rs` drives the real binary for the offline case: a released location
+whose volume is not the mounted one stays pending and is reported; with the right volume
+mounted the next sync unlinks the envelope.
+
+What #144 records honestly rather than hides:
+
+- **An offline tier is unreachable without a `tiers.toml`.** The mount is configuration, not a
+  catalog fact; with no config the offline copy is neither scanned nor completed — the pending
+  intent is kept and reported, never guessed at. The config an invocation loaded (`--tiers`, or
+  `tiers.toml` beside the catalog by default) is used for both the scan and for completion, so
+  naming it once is enough.
+- **The GC does not lock against a running sweep.** A `.just_cache-partial-*` file is garbage
+  by definition (no row references it) and a move in flight at the same moment could lose its
+  partial; the move retries, so no data is lost, but the collision is not prevented.
+- **A directory the GC empties is pruned by the GC, not by the delete that emptied it.**
+- **Retention beyond "no row references" — age- or cost-based expiry — remains P4.**
+- **Scrub and reconcile still do not read offline volumes** (unchanged from #143): a scrub
+  cannot verify an offline copy until a driver-aware scrub exists.
 
 ## 10. Non-goals
 

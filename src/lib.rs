@@ -28,6 +28,9 @@ pub mod offline;
 // inert there. It is private because nothing outside the crate may set a fault.
 mod faults;
 pub mod file_movement;
+// Garbage collection for tier bytes no catalog row references (#144): report first,
+// remove only under `--apply`.
+pub mod gc;
 pub mod journal;
 pub mod locate;
 pub mod observe;
@@ -70,6 +73,9 @@ pub use file_movement::{
 #[cfg(unix)]
 pub use fuse::{serve as mount_serve, MountError, MountRequest};
 pub use gateway::{Gateway, GatewayConfig, GatewayError};
+pub use gc::{
+    gc, Garbage, GarbageKind, GcError, GcFinding, GcReport, GcRequest, TierGarbage, GC_JOURNAL_NAME,
+};
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
 pub use observe::{AccessLog, FLUSH_INTERVAL};
