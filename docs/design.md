@@ -92,11 +92,20 @@ Hard rules:
 
 **As implemented (#146).** `kind` is a parsed value, not free text: the four kinds named
 above are recognised, and a kind no transport driver serves is refused with its line rather
-than accepted and then treated as a filesystem. **As implemented (#141, #142):** `fs`,
-`object` and `peer` have drivers; `offline` is still refused by name. **As implemented
+than accepted and then treated as a filesystem. **As implemented (#141, #142, #143):** all
+four kinds have drivers — `fs`, `object`, `peer` and `offline`. **As implemented
 (#155 + #142 — the LAN-peer tier):** a `peer` tier speaks the same S3-compatible subset the
 object-store client speaks — a peer runs `just_cache object-server` (the server half, #155),
-and the `peer` driver (the client half, #142) connects to it. The boundary rule (rule 2) is the type's own answer,
+and the `peer` driver (the client half, #142) connects to it. **As implemented (#143 — the
+offline-volume tier):** an `offline` tier has a `path` (the volume's mount point, present
+only while a disk is in the drive) and a required non-empty `vaults` list (the shelves its
+volumes live on), and requires `encryption_key` like the wire tiers because the volume
+leaves the host. A sweep exports each file to `<mount>/<path>` through the envelope, reads
+it back and verifies it before retiring the source, and records an
+`<volume-id>/<path>` location whose `volume-id` is the volume the catalog says is mounted in
+the tier. There is no marker file in the volume: the catalog's `volume` ledger is the only
+record of where a disk is (§3). A read that cannot reach the volume is refused with the
+insert prompt — "insert `drawer-07`" — never a bare ENOENT. The boundary rule (rule 2) is the type's own answer,
 `TierKind::crosses_machine_boundary()`: `object` and `peer` cross because the bytes leave the
 host, `offline` because the volume does.
 
@@ -199,9 +208,19 @@ CREATE TABLE lifecycle (
 CREATE TABLE volume (                  -- offline tier only
     id          TEXT PRIMARY KEY,      -- 'drawer-07'
     state       TEXT NOT NULL,         -- 'in_vault' | 'mounted' | 'loaned' | 'lost'
+    tier        TEXT,                  -- the tier whose drive holds it while mounted; NULL otherwise
     note        TEXT
 );
 ```
+
+The `volume` ledger is the *only* record of a disk's whereabouts (#143): the tool never
+writes a marker file into a volume, because the volume is exactly the thing that can leave
+and whose filesystem cannot be asked. At most one volume may be recorded `mounted` per
+tier, and a location's `storage_key` is `<volume-id>/<path>` so the recall path can prove
+which disk a copy needs before it asks a person to insert it. `just_cache volume
+list`/`set` is the operator's interface to the ledger; a `mounted` volume's bytes are
+reachable at the tier's configured root, and a state other than `mounted` clears the
+tier binding.
 
 Why content-addressed ids: dedup comes free, a scrub can re-verify any copy from any
 other copy, and restore-after-loss has a stable identity that survives path moves.
@@ -441,7 +460,8 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   unsupported `kind` is refused (#146), then the encrypted envelope every boundary-crossing
   driver must go through (#140), the object-store driver (#141), the LAN-peer driver (#142 —
   *done*, see §9),
-  the offline-volume driver with vault tracking and the insert prompt (#143), and delete plus
+  the offline-volume driver with vault tracking and the insert prompt (#143 — *done*, see
+  §9), and delete plus
   garbage collection on tiers that are not mounted (#144). The envelope follows the seam
   rather than leading it because the seam is what decides what "crosses the boundary" means;
   rule 2 then makes encryption the seam's requirement, not a wrap applied later.)*
@@ -1634,6 +1654,57 @@ content, an unreachable peer, a refused credential, a transfer interrupted and r
 >8 MiB file over the single-PUT path, and a `hours`-class peer tier parsing as a valid
 destination — plus the tier-parser tests in `tests/tier_kind.rs`. Server-side TLS remains
 the follow-up wiring work.
+
+Closed by #143: the `offline` tier driver — export a file to a volume a person inserts, and
+refuse a read that cannot reach it with the insert prompt. **The decisions the issue asked to
+record:** (D1) the vault list is where the tier's volumes physically live; `vaults` is a
+required non-empty list on an `offline` tier and the wire fields (`endpoint`, `bucket`,
+`region`, `credential_source`) are refused *by name* rather than ignored, because a config
+that says `endpoint` on an offline tier means something the tool did not understand. (D2) the
+catalog's `volume` table is the only record of a volume's whereabouts — no marker file is
+ever written into a volume — and it gains a `tier` column naming the tier whose drive holds a
+volume while it is `mounted` (`just_cache volume list`/`set`); at most one volume may be
+recorded mounted per tier, and a non-mounted state clears the binding. (D3) a location's
+`storage_key` is `<volume-id>/<path>`, so recall can name the disk a copy needs before asking
+for it. (D4) `sweep` exports through the envelope (§2 rule 2), reads the copy back, decrypts
+and hashes it against the source digest, records the location (marked primary — the volume
+copy is the tier of record) and only then retires the source; an absent mount or an
+unrecorded/unmounted volume is a *per-file* refusal that never stops the sweep. (D5) a read
+that cannot reach the volume is refused with the insert prompt — the tier, the volume id and
+the mount point, plus the vaults — never a bare ENOENT, through the same `restore` the
+slow-tier recall path already uses. (D6) `TierKind::offline` is now served and still
+`crosses_machine_boundary()`; the parser tests pin the new fact.
+
+Tests: 5 end-to-end tests in `tests/offline_tier_e2e.rs` drive the real binary — a sweep
+exports to a mounted volume (ciphertext on disk, plaintext restored), a restore with the
+volume out of the drive names the tier, volume and mount, a sweep with no mounted volume
+refuses per file, an absent offline mount is not a usage error, and the `volume` ledger
+round-trips through the CLI (`--json` included) and refuses a bad state and a second mounted
+volume — plus the catalog ledger unit tests and the `tests/tier_kind.rs` additions.
+
+What #143 records honestly rather than hides:
+
+- **One copy per volume, no cross-volume dedup, no delete/GC.** The driver exports one
+  encrypted copy to the mounted volume; it does not spread copies across volumes, and it
+  never deletes from a volume. Deleting and garbage-collecting on tiers whose disk may not be
+  mounted is exactly #144, and the vault model is what makes it a separate problem.
+- **`restore --remove-copy` on an offline tier is refused, not obeyed.** The restored
+  plaintext is a temporary sibling of the hot path, which is not under a trusted cold root,
+  so the remove is refused — reclaiming the volume's bytes is #144's job, and leaving them
+  costs nothing but space.
+- **Scrub, reconcile and audit do not read offline volumes.** Their bytes live at
+  `<mount>/<path>` while the recorded `storage_key` is `<volume-id>/<path>`, so the
+  filesystem-based verification passes do not resolve the copy (and the volume is usually not
+  mounted anyway). A catalog-only view is still correct — the location row is the record —
+  but a scrub cannot verify an offline copy until a driver-aware scrub exists.
+- **The ledger is operator-asserted.** `volume set <id> mounted` records that the named
+  volume is in the drive; nothing verifies it against a marker in the volume (there is none),
+  so a mislabelled disk is an operator error the catalog cannot catch. The one-mounted rule
+  is what keeps the tier binding unambiguous.
+- **`locate`/`catalog sync` treat an offline root specially only for existence.** A
+  `--dest` that is a configured offline tier is skipped by the destination-existence check
+  (its mount may legitimately be absent); every other command's handling of an offline root
+  is unchanged.
 
 ## 10. Non-goals
 

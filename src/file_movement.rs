@@ -1434,6 +1434,334 @@ fn record_object_in_catalog(
         })
 }
 
+/// Move a single file to an offline-volume tier (#143), then read it back, decrypt and
+/// verify before the source is retired.
+///
+/// `volume` is the volume the catalog currently records mounted in this tier, and the
+/// tier's `path` is the mount point (present only while the disk is in the drive). The
+/// caller resolves both. This function refuses — per file, never by aborting the sweep —
+/// when either is missing, and the refusal is the insert prompt that names the tier, the
+/// volume and its mount point (D5, docs/design.md §3). Nothing is recorded until the copy
+/// has been read back and hashed to the recorded digest (invariant 6).
+///
+/// The one-copy-per-volume shape is a later issue (#144); this driver exports, verifies
+/// and records, exactly as the object driver does, and names what it does not do in §9.
+/// Mirror of `migrate_to_object` for offline tiers: one more argument (`volume`), because
+/// unlike a wire tier an offline tier's usable root is a disk that may be in a drawer.
+#[allow(clippy::too_many_arguments)]
+pub fn migrate_to_offline(
+    entries: &[FileEntry],
+    tracker: &UsageTracker,
+    context: &mut MoveContext<'_>,
+    now: SystemTime,
+    tier: &crate::tiers::Tier,
+    key: &crate::envelope::Key,
+    catalog_path: Option<&Path>,
+    volume: Option<&crate::catalog::VolumeRecord>,
+) -> MigrationReport {
+    let (candidates, skipped) = select_candidates(entries, tracker, context, now);
+    let (policy, scope, guards) = (context.policy, context.scope, context.guards);
+    let pins = context.pins;
+    let journal: &mut Journal = context.journal;
+    let tier_name = &tier.name;
+    let mount = &tier.path;
+    let vaults = tier.vaults();
+    let mut report = MigrationReport::default();
+
+    for (entry, reason) in skipped {
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: None,
+            outcome: FileOutcome::Skipped(reason),
+            size: entry.size,
+            rule: None,
+        });
+    }
+
+    for candidate in candidates {
+        let entry = candidate.entry;
+        // Same belt-and-braces re-check as the other driver paths.
+        if let Err(rejected) = scope.allows(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(rejected)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Err(in_use) = guards.recheck(entry) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::from(in_use)),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+        if let Some(until) = live_pin(pins, &entry.relative, now) {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Skipped(SkipReason::PinnedUntil { until }),
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        if policy.dry_run {
+            report.records.push(MigrationRecord {
+                path: entry.path.clone(),
+                destination: None,
+                outcome: FileOutcome::Planned,
+                size: entry.size,
+                rule: candidate.rule.clone(),
+            });
+            continue;
+        }
+
+        // Where the copy will live once the volume is mounted. Used for the journal and for
+        // the report's destination; the real path only exists while the disk is in the drive.
+        let virtual_dest = mount.join(&entry.relative);
+
+        let outcome = match offline_readiness(catalog_path, mount, volume, tier_name, vaults) {
+            Err(refusal) => FileOutcome::Failed(refusal),
+            Ok(volume) => {
+                // Journal the intent before any bytes move (invariant 5). The journal records
+                // the path the copy will have in the volume; a crash mid-export leaves the
+                // source in place and the next sweep retries.
+                let journalled = journal
+                    .intent(&entry.relative, &virtual_dest, entry.size)
+                    .is_ok();
+
+                let result = move_to_offline_tier(entry, tier, key, volume);
+
+                let outcome = match result {
+                    Ok((storage_key, digest)) => {
+                        // The copy is on the volume and verified; record the catalog location
+                        // before removing the source, exactly as the object driver does (§3,
+                        // invariant 6). Crash windows mirror that driver's:
+                        //   A. exported-but-not-recorded: the source is still on disk, so no
+                        //      data is lost; the next sweep re-exports (idempotently — the same
+                        //      file with the same key) and records it.
+                        //   B. recorded-but-source-not-retired: the next sweep finds the
+                        //      catalog row, re-verifies the volume copy, and removes the source.
+                        let recorded = match catalog_path {
+                            Some(cat_path) => record_offline_in_catalog(
+                                cat_path,
+                                &digest,
+                                entry.size,
+                                tier_name,
+                                &storage_key,
+                            ),
+                            None => Err("no catalog was given for this sweep".to_string()),
+                        };
+
+                        if let Err(record_failed) = recorded {
+                            // The copy is on the volume but the catalog does not know it.
+                            // Retiring the source now would be an unrecorded copy — data loss
+                            // the tool caused (§3). Keep the source; the next sweep retries.
+                            FileOutcome::Failed(format!(
+                                "volume export verified on `{}` but could not record the \
+                                 offline copy in the catalog: {record_failed} — the source is \
+                                 kept; run the sweep again to retry",
+                                volume.id
+                            ))
+                        } else {
+                            match std::fs::remove_file(&entry.path) {
+                                Ok(()) => {
+                                    if journalled {
+                                        journal.forget(&entry.relative);
+                                    }
+                                    report.records.push(MigrationRecord {
+                                        path: entry.path.clone(),
+                                        destination: Some(PathBuf::from(
+                                            crate::offline::display_key(
+                                                &volume.id,
+                                                &entry.relative,
+                                            ),
+                                        )),
+                                        outcome: FileOutcome::Moved,
+                                        size: entry.size,
+                                        rule: candidate.rule.clone(),
+                                    });
+                                    continue;
+                                }
+                                Err(e) => FileOutcome::Failed(format!(
+                                    "volume export verified and catalog recorded, but cannot \
+                                     remove source {}: {e} — the catalog knows the offline copy; \
+                                     run the sweep again to retry source removal",
+                                    entry.path.display()
+                                )),
+                            }
+                        }
+                    }
+                    Err(err) => FileOutcome::Failed(err),
+                };
+
+                if !journalled {
+                    eprintln!(
+                        "just_cache: cannot record the offline move of {} in the journal; a \
+                         crash during this move would not be recoverable",
+                        entry.path.display()
+                    );
+                }
+                outcome
+            }
+        };
+
+        report.records.push(MigrationRecord {
+            path: entry.path.clone(),
+            destination: Some(virtual_dest),
+            outcome,
+            size: entry.size,
+            rule: candidate.rule.clone(),
+        });
+    }
+
+    report
+}
+
+/// Whether an offline move can proceed, and on which volume. The refusal is the insert
+/// prompt (D5): it names the tier, the volume the bytes are on and the mount point, plus
+/// where the volume lives. A catalog is required because the location row is the only
+/// record that the copy exists at all (§3) — an offline tier is exactly where the
+/// filesystem cannot be asked.
+fn offline_readiness<'a>(
+    catalog_path: Option<&Path>,
+    mount: &Path,
+    volume: Option<&'a crate::catalog::VolumeRecord>,
+    tier_name: &str,
+    vaults: &[String],
+) -> Result<&'a crate::catalog::VolumeRecord, String> {
+    if catalog_path.is_none() {
+        return Err(
+            "an offline move needs a catalog: the location row is the only record that the \
+             bytes exist (docs/design.md §3) — run `just_cache catalog sync` first"
+                .to_string(),
+        );
+    }
+    let Some(volume) = volume else {
+        let vaults = if vaults.is_empty() {
+            "the tier's vault".to_string()
+        } else {
+            vaults.join(", ")
+        };
+        return Err(format!(
+            "tier `{tier_name}` has no volume recorded mounted; mount a volume and record it \
+             with `just_cache volume set <id> mounted --tier {tier_name}`, then mount it at {} \
+             (volumes for this tier live in: {vaults})",
+            mount.display()
+        ));
+    };
+    if !mount.is_dir() {
+        // The catalog says this volume is in the drive, but its mount point is not there:
+        // the disk is out, or was not mounted. Name the volume and where to find it.
+        return Err(crate::offline::insert_prompt(
+            tier_name, mount, vaults, &volume.id, None,
+        ));
+    }
+    Ok(volume)
+}
+
+/// Export one file to the volume and read it back, decrypt and hash it before returning.
+/// On success the copy is verified and the source may be retired.
+fn move_to_offline_tier(
+    entry: &FileEntry,
+    tier: &crate::tiers::Tier,
+    key: &crate::envelope::Key,
+    volume: &crate::catalog::VolumeRecord,
+) -> Result<(String, blake3::Hash), String> {
+    let digest = crate::digest::file_digest(&entry.path).map_err(|e| {
+        format!(
+            "cannot read {} to compute its digest: {e}",
+            entry.path.display()
+        )
+    })?;
+
+    let dest = tier.path.join(&entry.relative);
+    crate::offline::export(key, &entry.path, &dest).map_err(|e| {
+        format!(
+            "exporting {} to volume `{}` failed: {e}",
+            entry.path.display(),
+            volume.id
+        )
+    })?;
+
+    // Read back the copy, decrypt it, and hash the plaintext against the digest computed
+    // from the source. This is the verify-before-delete rule (invariant 6); the verify file
+    // is a `.just_cache-partial-*` sibling the walk skips, and is removed when done.
+    let verify_dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let verify_path = crate::disk_management::partial_sibling(verify_dir);
+    let _ = std::fs::remove_file(&verify_path);
+    crate::offline::read_verify_decrypt(key, &dest, Some(&digest), &verify_path).map_err(|e| {
+        format!(
+            "reading volume `{}` copy of {} back failed: {e}",
+            volume.id,
+            entry.path.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&verify_path);
+
+    Ok((
+        crate::offline::storage_key(&volume.id, &entry.relative),
+        digest,
+    ))
+}
+
+/// Record the object and its offline-tier location in the catalog, and mark that location
+/// primary: an offline copy has no local representation, so the volume copy *is* the tier
+/// of record (§3, §4).
+///
+/// The object row may not exist yet (a sweep can run before `catalog sync`), so this ensures
+/// it is present; the state is set to `offloaded` because the source is removed after this
+/// call. Any step failing means the caller keeps the source.
+fn record_offline_in_catalog(
+    catalog_path: &Path,
+    digest: &blake3::Hash,
+    size: u64,
+    tier_name: &str,
+    storage_key: &str,
+) -> Result<(), String> {
+    let catalog = crate::catalog::Catalog::open(catalog_path)
+        .map_err(|e| format!("cannot open the catalog: {e}"))?;
+    let digest_bytes = digest.as_bytes();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    catalog
+        .ensure_object(digest_bytes, size as i64, digest_bytes, "offloaded", now)
+        .map_err(|e| format!("catalog ensure_object: {e}"))
+        .and_then(|_| {
+            catalog
+                .set_object_state(digest_bytes, "offloaded")
+                .map_err(|e| format!("catalog set_object_state: {e}"))
+        })
+        .and_then(|_| {
+            catalog
+                .record_replica(
+                    digest_bytes,
+                    tier_name,
+                    storage_key,
+                    true,               // read-back decrypt + hash already passed
+                    Some(digest_bytes), // checksum: the plaintext digest
+                )
+                .map(|_| ())
+                .map_err(|e| format!("catalog record_replica: {e}"))
+        })
+        .and_then(|_| {
+            catalog
+                .promote_location_primary(digest_bytes, tier_name, storage_key)
+                .map(|_| ())
+                .map_err(|e| format!("catalog promote_location_primary: {e}"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

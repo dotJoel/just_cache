@@ -520,6 +520,7 @@ impl Gateway {
             catalog: Some(&catalog),
             object_tier_configs: &[],
             encryption_keys: &[],
+            offline_tiers: &[],
         };
         match restore::restore(&request) {
             // Both outcomes are success; `AlreadyPresent` makes a repeated restore

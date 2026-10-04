@@ -113,6 +113,10 @@ enum Command {
     /// tiers (§4). Accepts PUT/GET/HEAD/DELETE for object keys, with SigV4 auth
     /// verification (issue #142).
     ObjectServer(ObjectServerArgs),
+    /// Inspect and record the vault ledger for offline-volume tiers: which physical volume
+    /// is in a tier's drive, and where the others are. The catalog is the source of truth
+    /// for a volume's whereabouts — no marker file is ever written into the volume (#143).
+    Volume(VolumeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -857,6 +861,67 @@ struct ObjectServerArgs {
     credential_source: String,
 }
 
+/// The `volume` subcommand (#143): the vault ledger for offline tiers.
+#[derive(Debug, Args)]
+struct VolumeArgs {
+    #[command(subcommand)]
+    command: VolumeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum VolumeCommand {
+    /// List every volume the ledger knows and the state each is recorded in.
+    List(VolumeListArgs),
+    /// Record a volume's state, and — when it is `mounted` — the tier whose drive holds it.
+    /// At most one volume may be mounted per tier; a second is refused by name.
+    Set(VolumeSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct VolumeListArgs {
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// It must already exist; `volume list` never creates one.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// The watch root the default catalog is found beside.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    watch: PathBuf,
+
+    /// Print the ledger as JSON rather than one line per volume.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct VolumeSetArgs {
+    /// The volume id (`drawer-07`).
+    #[arg(value_name = "ID")]
+    id: String,
+
+    /// The state to record: `in_vault`, `mounted`, `loaned` or `lost`.
+    #[arg(value_name = "STATE")]
+    state: String,
+
+    /// The tier whose drive holds the volume. Required in spirit for `mounted` (a volume
+    /// with no tier bound is readable by nobody), and cleared by every other state.
+    #[arg(long, value_name = "TIER")]
+    tier: Option<String>,
+
+    /// A free-text note to carry with the row (`where it went`, `replaced`, …).
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// It must already exist; `volume set` never creates one.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// The watch root the default catalog is found beside.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    watch: PathBuf,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -876,6 +941,7 @@ fn main() -> ExitCode {
         Some(Command::Cache(args)) => run_cache(args),
         Some(Command::Gateway(args)) => run_gateway(args),
         Some(Command::ObjectServer(args)) => run_object_server(args),
+        Some(Command::Volume(args)) => run_volume(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -916,13 +982,10 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
-    if let Err(message) = validate_sweep(&watch, &args) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::FAILURE;
-    }
     // Tiers are loaded (and checked) before anything moves. A volatile tier in `--dest`
     // is a usage error, not a warning: §2.1 forbids a cache being a home, and the error
-    // names the tier so the fix is obvious.
+    // names the tier so the fix is obvious. The config is needed by `validate_sweep` too,
+    // so it lands before the path check: an offline tier's root may legitimately be absent.
     let tiers = match load_tiers(args.tiers.as_deref(), &watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -930,6 +993,10 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_sweep(&watch, &args, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::FAILURE;
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -1081,10 +1148,6 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -1092,6 +1155,10 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -1243,10 +1310,6 @@ fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -1254,6 +1317,10 @@ fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -1305,12 +1372,6 @@ fn run_audit(args: AuditArgs) -> ExitCode {
     // other mode runs first — the watch tree exists, each `--dest` is a mounted directory —
     // are exactly the accesses it must not make. `--watch`/`--dest` still have to parse (the
     // invocation is what it is) but they are labels: the answer comes from the catalog rows.
-    if !args.no_filesystem {
-        if let Err(message) = validate_paths(&args.watch, &args.dest) {
-            eprintln!("just_cache: {message}");
-            return ExitCode::from(EXIT_USAGE);
-        }
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -1318,6 +1379,12 @@ fn run_audit(args: AuditArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if !args.no_filesystem {
+        if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    }
     if !args.no_filesystem {
         if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
             eprintln!("just_cache: {message}");
@@ -1524,10 +1591,6 @@ fn run_audit(args: AuditArgs) -> ExitCode {
 /// `0` when the engine manages the path, `1` when it would not be moved, `2` on a bad
 /// invocation — so `explain` composes in a shell.
 fn run_explain(args: ExplainArgs) -> ExitCode {
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -1535,6 +1598,10 @@ fn run_explain(args: ExplainArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -1689,10 +1756,6 @@ fn run_locate(args: LocateArgs) -> ExitCode {
 }
 
 fn run_restore(args: RestoreArgs) -> ExitCode {
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -1700,6 +1763,10 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -1754,6 +1821,19 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         .filter_map(|cfg| cfg.load_encryption_key().ok())
         .collect();
 
+    // Offline tiers travel whole: the driver needs the mount point, the vaults for the
+    // insert prompt, and the envelope key from each tier's own config.
+    let offline_tiers: Vec<just_cache::tiers::Tier> = tiers
+        .as_ref()
+        .map(|set| {
+            set.tiers()
+                .iter()
+                .filter(|tier| tier.kind == just_cache::tiers::TierKind::Offline)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     let request = RestoreRequest {
         path: &args.path,
         watch: &args.watch,
@@ -1762,6 +1842,7 @@ fn run_restore(args: RestoreArgs) -> ExitCode {
         catalog: catalog.as_ref(),
         object_tier_configs: &object_configs,
         encryption_keys: &encryption_keys,
+        offline_tiers: &offline_tiers,
     };
     match restore::restore(&request) {
         Ok(outcome) => {
@@ -2302,8 +2383,8 @@ fn report_schedule(
     }
 }
 
-fn validate_sweep(watch: &Path, args: &SweepArgs) -> Result<(), String> {
-    validate_paths(watch, &args.dest)?;
+fn validate_sweep(watch: &Path, args: &SweepArgs, tiers: Option<&TierSet>) -> Result<(), String> {
+    validate_paths(watch, &args.dest, tiers)?;
     min_idle_duration(args.min_idle_days)?;
     if args.interval == 0 && !args.once {
         return Err("--interval must be at least 1 second".to_string());
@@ -2476,12 +2557,28 @@ fn refuse_volatile_dests(tiers: Option<&TierSet>, dests: &[PathBuf]) -> Result<(
 /// previous pass's output. The reverse nesting (`--watch` under a `--dest` root) is the same
 /// hazard seen from the other side, so both directions are refused. `Path::starts_with`
 /// compares whole components, so `/data` matches `/data/cold` but not `/database`.
-fn validate_paths(watch: &Path, dests: &[PathBuf]) -> Result<(), String> {
+/// True when `dest` is the configured root of an `offline` tier (#143). An offline tier's
+/// root is a mount point that exists only while the volume is in the drive; a helper so
+/// every command treats that absence the same way.
+fn is_offline_tier(tiers: Option<&TierSet>, dest: &Path) -> bool {
+    tiers
+        .and_then(|tiers| tiers.tier_for_root(dest))
+        .is_some_and(|tier| tier.kind == just_cache::tiers::TierKind::Offline)
+}
+
+fn validate_paths(watch: &Path, dests: &[PathBuf], tiers: Option<&TierSet>) -> Result<(), String> {
     if !watch.is_dir() {
         return Err(format!("--watch {} is not a directory", watch.display()));
     }
     let watched = watch.canonicalize().ok();
     for dest in dests {
+        // An offline tier's root is a volume's mount point, present only while the disk is
+        // in the drive. Its absence is the normal state, not a bad `--dest`: the offline
+        // driver refuses per file with the insert prompt (§3, D5), so a sweep of a drawer
+        // whose volume is out reports every candidate rather than refusing the whole run.
+        if is_offline_tier(tiers, dest) {
+            continue;
+        }
         if !dest.is_dir() {
             return Err(format!(
                 "--dest {} is not an existing directory (mount it first; just_cache will \
@@ -2673,11 +2770,14 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
         report.replication.extend(by_rules.replication);
         pending.clear();
     } else {
-        // Split destinations into FS tiers and remote tiers. FS tiers go through the
-        // existing local-copy path; remote tiers (`object` and `peer`) go through the
-        // object-store driver — a peer runs the object-server, so it is the same
-        // S3-compatible wire path.
-        let (remote_dests, fs_dests): (Vec<_>, Vec<_>) = dests.iter().partition(|dest| {
+        // Split destinations into FS tiers, wire tiers and offline tiers. FS tiers go
+        // through the existing local-copy path; wire tiers (`object` and `peer`) go through
+        // the object-store driver — a peer runs the object-server, so it is the same
+        // S3-compatible wire path; offline tiers (`offline`) export to a mounted volume.
+        let (offline_dests, wire_dests): (Vec<_>, Vec<_>) = dests
+            .iter()
+            .partition(|dest| is_offline_tier(state.tiers, dest));
+        let (remote_dests, fs_dests): (Vec<_>, Vec<_>) = wire_dests.into_iter().partition(|dest| {
             state
                 .tiers
                 .and_then(|t| t.tier_for_root(dest))
@@ -2796,6 +2896,84 @@ fn sweep(state: &mut Sweep<'_>, pass: u64) -> MigrationReport {
                 &key,
                 catalog_opt,
                 scratch_root,
+            );
+
+            let handled: HashSet<PathBuf> = tier_report.migrated_paths().into_iter().collect();
+            pending.retain(|entry| !handled.contains(&entry.path));
+            report.records.extend(tier_report.records);
+            report.replication.extend(tier_report.replication);
+
+            if policy.dry_run {
+                break;
+            }
+        }
+
+        // --- Offline-volume destinations: export + read-back verify + retire -----------
+        for dest in &offline_dests {
+            let Some(full_tier) = state.tiers.and_then(|t| t.tier_for_root(dest)) else {
+                continue;
+            };
+            let Some(offline) = full_tier.offline_config.as_ref() else {
+                continue;
+            };
+
+            // Load the envelope key. Errors name the tier and source, never the key value.
+            let key = match offline.load_encryption_key() {
+                Ok(key) => key,
+                Err(err) => {
+                    eprintln!(
+                        "just_cache: cannot load encryption key for tier `{}` (offline \
+                         volume): {err}",
+                        full_tier.name
+                    );
+                    continue;
+                }
+            };
+
+            // A catalog is required for an offline move: the `volume` ledger and the
+            // location row live there (§3). With no catalog the driver refuses per file,
+            // naming `catalog sync` — a sweep must not create one (invariant 9). The
+            // mounted volume the ledger names is the only one this sweep may write to.
+            let catalog_path = catalog::Catalog::default_path(state.watch);
+            let (catalog_opt, volume) = if catalog_path.is_file() {
+                match catalog::Catalog::open(&catalog_path) {
+                    Ok(catalog) => match catalog.mounted_volume_for_tier(&full_tier.name) {
+                        Ok(volume) => (Some(catalog_path.as_path()), volume),
+                        Err(err) => {
+                            eprintln!("just_cache: cannot read the volume ledger: {err}");
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!(
+                            "just_cache: cannot open the catalog for offline tier `{}`: {err}",
+                            full_tier.name
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            let mut context = file_movement::MoveContext {
+                policy,
+                scope,
+                guards: &guards,
+                journal,
+                lifecycle: None,
+                dest_tiers,
+                pins: pins.as_ref(),
+            };
+            let tier_report = file_movement::migrate_to_offline(
+                &pending,
+                tracker,
+                &mut context,
+                now,
+                full_tier,
+                &key,
+                catalog_opt,
+                volume.as_ref(),
             );
 
             let handled: HashSet<PathBuf> = tier_report.migrated_paths().into_iter().collect();
@@ -2979,10 +3157,6 @@ fn record_replicas(catalog: &catalog::Catalog, details: &[file_movement::Replica
 /// when the FUSE session itself could not be established or run.
 #[cfg(unix)]
 fn run_mount(args: MountArgs) -> ExitCode {
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -2990,6 +3164,10 @@ fn run_mount(args: MountArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -3111,10 +3289,6 @@ fn run_cache(args: CacheArgs) -> ExitCode {
 /// Exit `2` for a bad invocation (missing catalog, no token, unusable root); `1` if the
 /// listener fails while serving.
 fn run_gateway(args: GatewayArgs) -> ExitCode {
-    if let Err(message) = validate_paths(&args.watch, &args.dest) {
-        eprintln!("just_cache: {message}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     let tiers = match load_tiers(args.tiers.as_deref(), &args.watch) {
         Ok(tiers) => tiers,
         Err(message) => {
@@ -3122,6 +3296,10 @@ fn run_gateway(args: GatewayArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if let Err(message) = validate_paths(&args.watch, &args.dest, tiers.as_ref()) {
+        eprintln!("just_cache: {message}");
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Err(message) = refuse_volatile_dests(tiers.as_ref(), &args.dest) {
         eprintln!("just_cache: {message}");
         return ExitCode::from(EXIT_USAGE);
@@ -3175,6 +3353,148 @@ fn run_gateway(args: GatewayArgs) -> ExitCode {
             eprintln!("just_cache: gateway failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The `volume` subcommand (#143): the vault ledger for offline tiers.
+fn run_volume(args: VolumeArgs) -> ExitCode {
+    match args.command {
+        VolumeCommand::List(list) => run_volume_list(list),
+        VolumeCommand::Set(set) => run_volume_set(set),
+    }
+}
+
+/// The catalog path a `volume` command reads, refusing (never creating) one that is not
+/// there: the ledger is bookkeeping about an existing catalog, and conjuring an empty one
+/// would answer "no volumes" for a tree that was simply never synced (invariant 9).
+fn volume_catalog_path(named: Option<&PathBuf>, watch: &Path) -> PathBuf {
+    named
+        .cloned()
+        .unwrap_or_else(|| catalog::Catalog::default_path(watch))
+}
+
+fn run_volume_list(args: VolumeListArgs) -> ExitCode {
+    let catalog_path = volume_catalog_path(args.catalog.as_ref(), &args.watch);
+    let catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let volumes = match catalog.volumes() {
+        Ok(volumes) => volumes,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.json {
+        println!("{}", volumes_json(&volumes));
+    } else if volumes.is_empty() {
+        println!("no volumes recorded");
+    } else {
+        for volume in &volumes {
+            println!("{}", describe_volume(volume));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_volume_set(args: VolumeSetArgs) -> ExitCode {
+    let catalog_path = volume_catalog_path(args.catalog.as_ref(), &args.watch);
+    let catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match catalog.set_volume(
+        &args.id,
+        &args.state,
+        args.tier.as_deref(),
+        args.note.as_deref(),
+    ) {
+        Ok(volume) => {
+            println!("{}", describe_volume(&volume));
+            ExitCode::SUCCESS
+        }
+        // A bad state, an empty id or a second volume for one tier is a bad invocation: the
+        // operator can fix the argument, so exit usage rather than a bare failure.
+        Err(err @ catalog::CatalogError::InvalidVolumeState { .. })
+        | Err(err @ catalog::CatalogError::EmptyVolumeId)
+        | Err(err @ catalog::CatalogError::VolumeTierOccupied { .. }) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// One line per volume: `drawer-07 state=mounted tier=drawer note=…`.
+fn describe_volume(volume: &catalog::VolumeRecord) -> String {
+    let mut line = format!("{} state={}", volume.id, volume.state);
+    if let Some(tier) = &volume.tier {
+        line.push_str(&format!(" tier={tier}"));
+    }
+    if let Some(note) = &volume.note {
+        line.push_str(&format!(" note={note}"));
+    }
+    line
+}
+
+/// The vault ledger as JSON. Hand-rolled, like every other `--json` in this tool: the
+/// fields are flat strings and nullable strings, and a serde_json dependency for six
+/// columns is not worth the build.
+fn volumes_json(volumes: &[catalog::VolumeRecord]) -> String {
+    let mut out = String::from("[");
+    for (index, volume) in volumes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"id\":");
+        out.push_str(&json_string(&volume.id));
+        out.push_str(",\"state\":");
+        out.push_str(&json_string(&volume.state));
+        out.push_str(",\"tier\":");
+        out.push_str(&json_optional(&volume.tier));
+        out.push_str(",\"note\":");
+        out.push_str(&json_optional(&volume.note));
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+/// A JSON string literal: quotes, backslashes and control characters escaped, everything
+/// else passed through. Ids and notes are operator-supplied, so they are not trusted to be
+/// JSON-safe.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_optional(value: &Option<String>) -> String {
+    match value {
+        Some(text) => json_string(text),
+        None => "null".to_string(),
     }
 }
 
