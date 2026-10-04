@@ -472,7 +472,7 @@ part nothing else does.
 
 **Where the MCP server lands.** Exposing the catalog-backed commands to agents (#137) is
 deliberately not a phase: nothing in P3 or P4 waits on it, so a phase slot would imply a
-gate that does not exist. It is scheduled for **after P3**, because P3 is both what makes
+gate that does not exist. It was scheduled for **after P3**, because P3 is both what makes
 it worth having and what settles its interface. Once a remote tier exists, "where does
 this file live" is a question the filesystem cannot answer at all, and a recall is
 something that can cost egress, a wait, or a human inserting a volume — exactly the
@@ -481,8 +481,9 @@ the tool surface has to express, and they do not exist yet: tool names and schem
 much a public API as the CLI is, and agents get pinned by the prompts they are written
 into, so designing them ahead of the drivers buys a rewrite rather than a head start.
 Waiting costs nothing in rework — the CLI's `--json` output is already the contract an
-adapter would wrap. If a concrete need to drive the tool from an agent appears, that is the
-evidence to start it; speculation is not.
+adapter would wrap. **Landed as `just_cache mcp` (#137), the first work after P3 closed**,
+with the read-only tools as the default surface and `restore` behind `--allow-restore`;
+§9 records what it decides and what it leaves open.
 
 ## 9. Known gaps (tracked, not hidden)
 
@@ -1765,6 +1766,57 @@ What #144 records honestly rather than hides:
 - **Retention beyond "no row references" — age- or cost-based expiry — remains P4.**
 - **Scrub and reconcile still do not read offline volumes** (unchanged from #143): a scrub
   cannot verify an offline copy until a driver-aware scrub exists.
+
+**Closed by #137 (the MCP adapter).** `just_cache mcp` serves the catalog-backed commands to
+an agent as JSON-RPC on stdio. What it decides:
+
+- **The adapter relays the CLI rather than reimplementing it.** Each tool re-executes this
+  same binary as a subcommand and returns what it printed, so an answer given to an agent is
+  byte-identical to the answer given to a shell and there is no second code path to drift.
+  The alternative — calling the library functions directly — would mean re-deriving each
+  command's output and exit-code rules inside a module with no business knowing them.
+- **`serde_json` is added, for parsing only.** Every `--json` writer in this repo stays
+  hand-rolled as it was; the request bodies are written by the client, so a malformed or
+  hostile document reaches the parser, and a hand-rolled *reader* is where a wrong answer
+  becomes a security answer. The dependency is confined to `src/mcp.rs`.
+- **The tool list is the policy.** The surface is `locate`, `explain`, `audit` and a
+  `scrub` pinned to `--dry-run`; there is no `sweep`, `catalog delete`, `gc --apply`,
+  `reconcile` or `pin`. A tool is offered only when the invocation was given the roots it
+  needs, so the list states what the server can actually answer rather than offering a call
+  that will fail for a reason a model cannot fix. Each call names a *query*, never a path:
+  the roots are chosen once, at startup.
+- **`restore` is opt-in, once.** It moves bytes and writes, so it is exposed only under
+  `--allow-restore` — the operator's decision at startup, not an agent's per call. §10's
+  non-goal (no autonomous mutation) is unchanged by this: the tool still waits to be asked.
+- **A nonzero exit is an answer, not a failure.** `audit` exits 1 to say "findings exist"
+  and `explain` exits nonzero for "not this sweep". `isError` is therefore set only when a
+  command produced no output at all and failed; the exit code is stated in the text either
+  way. Reporting these as tool failures would tell an agent to ignore the answer it asked
+  for.
+
+What #137 records honestly rather than hides:
+
+- **`scrub` and `restore` relay text, not JSON, because neither has a `--json` writer.**
+  #137 sets the rule "reuse the existing `--json` output rather than inventing a second
+  response format"; where none exists, the command's own text is the answer and no second
+  format was invented for it. A future `--json` on those commands would need no adapter
+  change beyond passing the flag.
+- **`call_tool` re-checks availability after the name is matched.** The list is filtered by
+  configuration and the call path is filtered again, so a call cannot succeed by naming a
+  tool whose roots the server was never given; the two filters are separate on purpose
+  rather than one guarding the other.
+- **The surface is read-only by construction, not by convention.** Nothing in the adapter
+  can move, repair or delete a byte: it can only run the four read-only commands (plus
+  opt-in `restore`), and it has no code path that writes to the catalog. A future tool that
+  mutates would be a change to *that* list — which the tests name explicitly, so adding one
+  means deleting a line that says it must not exist.
+- **There is no progress or cancellation support.** A tool call runs the command to
+  completion; the notifications a long `scrub` could emit are not implemented, so a client
+  sees one reply per call. `scrub` is the only slow one, and it is bounded by the same
+  `--read-budget`/rate limits the CLI has.
+- **Protocol revision is pinned, not negotiated.** The server states one revision
+  (`2025-06-18`); it does not read the client's requested version and pick a compatible one,
+  because the tool surface has nothing version-dependent in it yet.
 
 ## 10. Non-goals
 

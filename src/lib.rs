@@ -33,6 +33,11 @@ pub mod file_movement;
 pub mod gc;
 pub mod journal;
 pub mod locate;
+// The MCP adapter (#137): a client-driven, read-only surface over the catalog-backed
+// commands, spoken as JSON-RPC on stdio. It runs this same binary as a subcommand and
+// relays the output, so the CLI stays the single contract; only the `mcp` subcommand
+// reaches it.
+pub mod mcp;
 pub mod observe;
 pub mod opened;
 pub mod policy;

@@ -23,6 +23,7 @@ use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, Usag
 use just_cache::gc::{self, GcRequest};
 use just_cache::journal::{self, Journal};
 use just_cache::locate::{self, LocateRequest};
+use just_cache::mcp::{self, McpConfig};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::policy::{Lifecycle, RuleSet};
 use just_cache::reconcile;
@@ -107,6 +108,10 @@ enum Command {
     /// Report bytes no catalog row references, per configured tier, and remove them only
     /// under `--apply` (issue #144). Never on a read, never as part of a sweep.
     Gc(GcArgs),
+    /// Serve the read-only, catalog-backed commands to an agent over MCP (issue #137).
+    /// Client-driven: it starts with its client, answers requests, and exits with it. No
+    /// timer, no scheduled pass, and no tool that moves, repairs or deletes anything.
+    Mcp(McpArgs),
     /// Inspect cache overlays (§2.1). Residency is ephemeral: it is never data of record.
     Cache(CacheArgs),
     /// Serve the catalog's namespace over an authenticated WebDAV endpoint (listing,
@@ -753,6 +758,42 @@ struct GcArgs {
     quiet: bool,
 }
 
+/// Everything `mcp` needs: the roots the server is allowed to read, chosen once here rather
+/// than per tool call (issue #137).
+///
+/// A tool is offered only when its roots were given — `locate`/`scrub` need a catalog,
+/// `explain`/`audit`/`restore` need `--watch` and `--dest` — so the tool list an agent sees
+/// is exactly what this invocation can answer. An agent cannot widen that scope: it names a
+/// query, never a path.
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// The catalog file. Enables the tools that answer from the catalog alone.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// Directory to watch. With `--dest`, enables the tools that compare the tree to its tiers.
+    #[arg(long, value_name = "DIR")]
+    watch: Option<PathBuf>,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk.
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`), passed through to the commands that accept it.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// Lifecycle policy (`policy.toml`), passed through to `explain`.
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
+
+    /// Expose the `restore` tool. Off by default: restore writes bytes back into the watched
+    /// tree, so the operator opts in once, when the server starts, rather than an agent
+    /// choosing to move bytes per call.
+    #[arg(long)]
+    allow_restore: bool,
+}
+
 /// Everything `schedule` needs. Like `scrub` and `reconcile` it names no `--watch`/`--dest`:
 /// the catalog already holds every tier root, and the schedule config and its state default
 /// to sitting beside it.
@@ -986,6 +1027,7 @@ fn main() -> ExitCode {
         Some(Command::Schedule(args)) => run_schedule(args),
         Some(Command::Mount(args)) => run_mount(args),
         Some(Command::Gc(args)) => run_gc(args),
+        Some(Command::Mcp(args)) => run_mcp(args),
         Some(Command::Cache(args)) => run_cache(args),
         Some(Command::Gateway(args)) => run_gateway(args),
         Some(Command::ObjectServer(args)) => run_object_server(args),
@@ -2214,6 +2256,46 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
         ExitCode::from(EXIT_FINDINGS)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Serve the read-only, catalog-backed commands to an agent over MCP (issue #137).
+///
+/// Exit contract: `0` when the client closed the stream — for a client-driven adapter that
+/// is the normal end, not a failure — and `2` on a bad invocation (no roots to answer
+/// from, or a binary that cannot be found to re-execute). A failure to read or write the
+/// stream exits nonzero too: the session is over and the client should know why.
+fn run_mcp(args: McpArgs) -> ExitCode {
+    if args.catalog.is_none() && (args.watch.is_none() || args.dest.is_empty()) {
+        eprintln!(
+            "just_cache: mcp needs somewhere to answer from: --catalog, or --watch with --dest"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("just_cache: mcp cannot find its own binary to run the commands: {error}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let config = McpConfig {
+        catalog: args.catalog,
+        watch: args.watch,
+        dest: args.dest,
+        tiers: args.tiers,
+        policy: args.policy,
+        allow_restore: args.allow_restore,
+        program,
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    match mcp::serve(&config, stdin.lock(), stdout.lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("just_cache: mcp: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
