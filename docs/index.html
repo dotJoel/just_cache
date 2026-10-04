@@ -197,10 +197,12 @@
     These catalog and scrub operations are explicit commands.
   </p>
   <p>
-    The longer-term design extends this catalog and namespace to LAN, cloud-object and offline
-    volume tiers, with recall latency and cost declared per tier. The object-store provider (#141) is implemented; LAN and offline are not yet.
-    yet — they are the phase in progress (P3). The namespace today is served locally by the symlink tree,
-    a FUSE mount and a WebDAV gateway. <a href="design.md">See the design and roadmap.</a>
+    The catalog and namespace also cover remote tiers — cloud object storage, a LAN peer, and an
+    offline disk in a drawer — with recall latency and cost declared per tier. All three drivers
+    are implemented (#141, #142, #143), bytes that cross the machine boundary are sealed with a
+    keyed envelope (#140), and a delete or a garbage collection reaches bytes on a tier that is
+    not mounted (#144). The namespace today is served locally by the symlink tree, a FUSE mount
+    and a WebDAV gateway. <a href="design.md">See the design and roadmap.</a>
   </p>
 </section>
 
@@ -295,7 +297,8 @@
     <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
     <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
     <div class="feat"><div class="name">cache</div><p>A RAM or SSD overlay in front of a durable tier: promotion copies bytes, eviction is LRU against a size cap, and residency is never data of record.</p></div>
-    <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin, a damaged copy or an unmounted tier makes the delete unsafe.</p></div>
+    <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
+    <div class="feat"><div class="name">gc</div><p>Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
   </div>
 </section>
 
@@ -308,7 +311,8 @@
     use, in the spirit of S3 storage classes. Local tiers are what this repo does today: the mover
     is the hot→cold driver and the symlink namespace provider, and the catalog's namespace is also
     served by a FUSE mount and a WebDAV gateway. The cache overlay and mount-observed use are
-    implemented; LAN, cloud-object and offline tiers are planned.
+    implemented; LAN, cloud-object and offline tiers are implemented, and delete and garbage
+    collection reach a tier that is not mounted.
     <a href="design.md">The full design sketch is in design.md.</a>
   </p>
 </section>

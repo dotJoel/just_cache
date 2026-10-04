@@ -49,6 +49,11 @@
 //!   after its transition commits and before any released byte is unlinked: the crash
 //!   window `pending_removal` exists to make recoverable. `N` is ignored (one delete per
 //!   process); write `1`.
+//! * `gc-after-delete=N` — a `just_cache gc --apply` (issue #144) aborts the process
+//!   right after the `N`th successful unlink and before the pass finishes. The crash
+//!   window the GC journal exists to make recoverable: the deleted file is gone, its
+//!   journal entry is not, and the next pass must drop the stale entry and report
+//!   nothing. `N` is the 1-based unlink ordinal.
 //! * `relatime=N` — every read-only open the tool makes for its own hashing
 //!   (`digest::open_for_hashing`) that did *not* get `O_NOATIME` stamps the file's atime to
 //!   now, as a `relatime` mount would on that first read. This makes "the tool never marks
@@ -74,6 +79,7 @@ pub(crate) enum FaultMode {
     ReplaceVerifiedDest,
     Relatime,
     DeleteAfterCommit,
+    GcAfterDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +106,7 @@ impl Fault {
             "replace-verified-dest" => FaultMode::ReplaceVerifiedDest,
             "relatime" => FaultMode::Relatime,
             "delete-after-commit" => FaultMode::DeleteAfterCommit,
+            "gc-after-delete" => FaultMode::GcAfterDelete,
             other => panic!("JUST_CACHE_FAULT `{other}`: unknown mechanism"),
         };
         let at = ordinal

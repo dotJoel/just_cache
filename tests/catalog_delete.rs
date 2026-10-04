@@ -241,20 +241,58 @@ fn a_delete_that_cannot_complete_is_refused_whole() {
         text(&output)
     );
     assert_refused_cleanly(&tree);
+}
 
-    // The copy's tier is not mounted.
+/// A delete whose only copy sits on a tier that is not mounted now is no longer refused:
+/// the release commits and is recorded as `(tier, storage_key)`, the bytes survive, and the
+/// completion runs when the tier returns (issue #144). Silence is the only wrong answer, so
+/// the names the deferred location on the way past.
+#[test]
+fn deleting_a_copy_on_an_absent_tier_defers_and_completes_when_it_returns() {
     let tree = Tree::build();
     let away = tree.cold.with_file_name("cold-unmounted");
     fs::rename(&tree.cold, &away).unwrap();
+
     let output = tree.delete("shows/moved.mkv");
     fs::rename(&away, &tree.cold).unwrap();
+
+    // Committed, named, and not one byte removed: the copy is on the disk that is out.
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not mounted"),
-        "{}",
+        printed.contains("deferred"),
+        "the deferred location must be named: {}",
         text(&output)
     );
-    assert_refused_cleanly(&tree);
+    assert_eq!(tree.counts(), (1, 2, 2), "the transition did not commit");
+    assert!(
+        !exists(&tree.hot.join("shows/moved.mkv")),
+        "the name's symlink is released"
+    );
+    assert_eq!(
+        fs::read(tree.cold.join("shows/moved.mkv")).unwrap(),
+        b"movie bytes",
+        "the absent tier's bytes survive"
+    );
+    assert_eq!(
+        tree.open().pending_removals().unwrap().len(),
+        1,
+        "the release is recorded, not silently forgotten"
+    );
+
+    // The tier returns, and the next sync finishes what the delete recorded.
+    let sync = tree.sync();
+    assert_eq!(sync.status.code(), Some(0), "{}", text(&sync));
+    assert!(
+        !exists(&tree.cold.join("shows/moved.mkv")),
+        "the deferred copy is removed once the tier is back"
+    );
+    assert!(tree.open().pending_removals().unwrap().is_empty());
+    assert_eq!(
+        tree.counts(),
+        (1, 2, 2),
+        "the sync re-ingested released bytes"
+    );
 }
 
 fn assert_refused_cleanly(tree: &Tree) {

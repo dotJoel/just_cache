@@ -20,6 +20,7 @@ use just_cache::catalog;
 use just_cache::disk_management;
 use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
+use just_cache::gc::{self, GcRequest};
 use just_cache::journal::{self, Journal};
 use just_cache::locate::{self, LocateRequest};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
@@ -103,6 +104,9 @@ enum Command {
     /// Mount the catalog's namespace as a FUSE filesystem, so a consumer that does not
     /// follow symlinks sees real bytes for an offloaded file (issue #42).
     Mount(MountArgs),
+    /// Report bytes no catalog row references, per configured tier, and remove them only
+    /// under `--apply` (issue #144). Never on a read, never as part of a sweep.
+    Gc(GcArgs),
     /// Inspect cache overlays (§2.1). Residency is ephemeral: it is never data of record.
     Cache(CacheArgs),
     /// Serve the catalog's namespace over an authenticated WebDAV endpoint (listing,
@@ -351,7 +355,9 @@ enum CatalogCommand {
     /// Delete a name. The name row — and, when it was the object's last name, every
     /// location row — is released in one committed transition before any byte is
     /// unlinked. An object with another name keeps its copies. Refuses, changing
-    /// nothing, when the object is pinned, a copy is damaged, or a tier is not mounted.
+    /// nothing, when the object is pinned or a copy is damaged; a copy on a tier that is
+    /// not mounted now is *deferred* — recorded in `pending_removal` and finished when
+    /// the tier returns (#144).
     Delete(CatalogDeleteArgs),
 }
 
@@ -372,6 +378,12 @@ struct CatalogDeleteArgs {
     /// It must already exist; `delete` never creates one.
     #[arg(long, value_name = "FILE")]
     catalog: Option<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`). Defaults to beside the catalog, consulted only
+    /// when it is already there — never created. Needed only to finish a released copy on
+    /// an `offline` tier, to locate its mount (#144).
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -706,6 +718,41 @@ impl ReconcileArgs {
     }
 }
 
+/// Everything `gc` needs. Like `scrub` and `reconcile` it names no `--watch`/`--dest`: the
+/// catalog already holds every tier root, and the walk is the catalog's own. `--tiers` is
+/// optional and consulted only when it is already there, to reach an `offline` tier's
+/// mount; a filesystem tier is described by the catalog's roots alone.
+#[derive(Debug, Args)]
+struct GcArgs {
+    /// The catalog to collect against. It must already exist: the rows are what say which
+    /// bytes are still referenced, and a catalog conjured empty would call every byte
+    /// garbage.
+    #[arg(long, value_name = "FILE")]
+    catalog: PathBuf,
+
+    /// Restrict the pass to one configured tier, by name (`[tiers.cold]`) or by root path.
+    #[arg(long, value_name = "NAME")]
+    tier: Option<String>,
+
+    /// Remove the bytes the pass found. Without it, `gc` reports and changes no byte.
+    #[arg(long)]
+    apply: bool,
+
+    /// Tier configuration (`tiers.toml`). Defaults to `tiers.toml` beside the catalog,
+    /// consulted only when it is already there — never created. Needed only to reach an
+    /// `offline` tier's mount.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// Print only problems and the bytes that would be removed.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 /// Everything `schedule` needs. Like `scrub` and `reconcile` it names no `--watch`/`--dest`:
 /// the catalog already holds every tier root, and the schedule config and its state default
 /// to sitting beside it.
@@ -938,6 +985,7 @@ fn main() -> ExitCode {
         Some(Command::Reconcile(args)) => run_reconcile(args),
         Some(Command::Schedule(args)) => run_schedule(args),
         Some(Command::Mount(args)) => run_mount(args),
+        Some(Command::Gc(args)) => run_gc(args),
         Some(Command::Cache(args)) => run_cache(args),
         Some(Command::Gateway(args)) => run_gateway(args),
         Some(Command::ObjectServer(args)) => run_object_server(args),
@@ -1176,6 +1224,9 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
         }
     };
     catalog.set_force_rehash(args.force_rehash);
+    // The tier config this invocation loaded, so a pending offline removal finishes with
+    // the mount it names rather than only a config beside the catalog (#144).
+    catalog.set_pending_tiers(tiers.clone());
 
     // The copy floor is a per-tier property (#20), and a configured tier now carries its
     // own: `copies` in `tiers.toml` is the floor for that disk. Recorded once per tier,
@@ -1230,8 +1281,9 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
 /// Delete one name through the catalog (issue #128).
 ///
 /// Exit contract: `0` when the transition committed and every released file was removed
-/// (or was already gone), `1` when it was refused (nothing changed) or committed but a
-/// released file was kept or could not be unlinked, `2` on a bad invocation.
+/// (or was already gone), `1` when it was refused (nothing changed), or committed but a
+/// released file was kept, could not be unlinked, or is on a tier that is not mounted now
+/// (and so is deferred, #144), `2` on a bad invocation.
 fn run_catalog_delete(args: CatalogDeleteArgs) -> ExitCode {
     use catalog::RemovalOutcome;
     if !args.watch.is_dir() {
@@ -1259,6 +1311,21 @@ fn run_catalog_delete(args: CatalogDeleteArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A released copy on an `offline` tier can only be finished if the tier's mount is
+    // known; the config defaults to beside the catalog, consulted open-if-present. An
+    // explicitly named file that is missing is a usage error, like everywhere else.
+    let beside = catalog_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tiers = match load_tiers(args.tiers.as_deref(), beside) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    catalog.set_pending_tiers(tiers);
     let outcome = match catalog.delete_name(&args.watch, &args.path) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1290,6 +1357,14 @@ fn run_catalog_delete(args: CatalogDeleteArgs) -> ExitCode {
                 clean = false;
                 eprintln!(
                     "  could not remove {}: {reason} (retried by the next delete or sync)",
+                    path.display()
+                );
+            }
+            RemovalOutcome::Deferred { path, reason } => {
+                clean = false;
+                println!(
+                    "  deferred {}: {reason} (kept in pending_removal; finished when the \
+                     tier returns)",
                     path.display()
                 );
             }
@@ -1347,6 +1422,7 @@ fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    catalog.set_pending_tiers(tiers.clone());
 
     let report = match catalog.resolve(&args.watch, &args.dest, args.apply) {
         Ok(report) => report,
@@ -2130,6 +2206,92 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
         }
     } else {
         for line in report.summary_lines() {
+            println!("{line}");
+        }
+    }
+
+    if report.has_findings() {
+        ExitCode::from(EXIT_FINDINGS)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Report — and, under `--apply`, remove — bytes no catalog row references (issue #144).
+///
+/// Exit contract: `0` when there is nothing left to act on (no garbage, or every byte
+/// named was removed), `1` when anything was reported but not removed or a removal
+/// failed, `2` on a bad invocation — a missing catalog, a `--tier` that names nothing, or
+/// a catalog with no recorded roots. The report-only default is the whole safety story
+/// (§9): the pass never removes a byte a read or a sweep would, and it never removes one
+/// the operator did not ask it to.
+fn run_gc(args: GcArgs) -> ExitCode {
+    if !args.catalog.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            args.catalog.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let mut catalog = match catalog::Catalog::open(&args.catalog) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `tiers.toml` is looked for beside the catalog, open-if-present — the placement the
+    // catalog already gives it, and never created. An explicitly named file that is
+    // missing or malformed is a usage error, like every other config.
+    let beside = args
+        .catalog
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tiers = match load_tiers(args.tiers.as_deref(), beside) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    // The GC's own pending-removal completion reads the same config, so it is recorded on
+    // the catalog before the pass borrows it (#144).
+    catalog.set_pending_tiers(tiers.clone());
+    let request = GcRequest {
+        catalog: &mut catalog,
+        tiers: tiers.as_ref(),
+        tier: args.tier.clone(),
+        apply: args.apply,
+    };
+    let report = match gc::gc(request) {
+        Ok(report) => report,
+        Err(err) => {
+            let usage = matches!(
+                err,
+                gc::GcError::NoRoots | gc::GcError::UnknownTier { .. } | gc::GcError::Catalog(_)
+            );
+            eprintln!("just_cache: {err}");
+            return if usage {
+                ExitCode::from(EXIT_USAGE)
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+    };
+
+    if args.json {
+        println!("{}", report.to_json());
+    } else if args.quiet {
+        for line in report.finding_lines() {
+            println!("{line}");
+        }
+    } else {
+        for line in report.summary_lines() {
+            println!("{line}");
+        }
+        for line in report.finding_lines() {
             println!("{line}");
         }
     }
