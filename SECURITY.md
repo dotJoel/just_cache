@@ -2,13 +2,14 @@
 
 ## Supported versions
 
-The current release is [`v0.3.0-rc.1`][rc1] — a preview of the standalone symlink mover,
-published as a prerelease. Only the current `main` is supported: a fix lands there, and
-the tag is superseded rather than patched in place — there is no maintenance branch. A
-fix on `main` is not in a published tag until the next one, so running the release means
-running fixed-on-main, tagged-sometimes.
+The current release is [`v0.4.0`][current] — the standalone symlink mover with the
+catalog, the namespace provider, the lifecycle engine and the remote tiers, published as
+a normal release. Only the current `main` is supported: a fix lands there, and the tag is
+superseded rather than patched in place — there is no maintenance branch. A fix on `main`
+is not in a published tag until the next one, so running the release means running
+fixed-on-main, tagged-sometimes.
 
-[rc1]: https://github.com/dotJoel/just_cache/releases/tag/v0.3.0-rc.1
+[current]: https://github.com/dotJoel/just_cache/releases/tag/v0.4.0
 
 ## Reporting a vulnerability
 
@@ -45,5 +46,6 @@ touch files the operator did not point it at. In scope:
 
 Out of scope: the filesystem's own behaviour; the tool run as root against a tree someone
 else can write to (the operator chooses both the privileges and the tree); and bugs in a
-dependency that `just_cache` does not expose. Report those upstream — this repository
-carries no Dependabot configuration, so nothing here files them for you.
+dependency that `just_cache` does not expose. Report those upstream — Dependabot watches
+the lockfile here and opens a weekly update PR, but that is the only thing that files
+them; it is not a report of what affects this tool.
