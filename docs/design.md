@@ -485,6 +485,24 @@ adapter would wrap. **Landed as `just_cache mcp` (#137), the first work after P3
 with the read-only tools as the default surface and `restore` behind `--allow-restore`;
 §9 records what it decides and what it leaves open.
 
+**Where the web dashboard lands.** A web front end over the same surfaces — a `just_cache
+ui` server (#169–#172) — is, like the MCP server, deliberately not a phase: nothing in P4
+waits on it. Its decisions are recorded here because they are policy, not presentation.
+The trust model is `gateway`'s: a token from a file or the environment, never the command
+line, loopback by default, plain HTTP behind a TLS terminator before it is exposed. The
+exposed surface is the policy — the rule the MCP server set, applied to a browser:
+read-only views by default, and a mutating action (a restore, a pin, a triggered pass)
+exists only when the invocation named its `--allow-*` flag (#172). Live activity is not
+invented: every maintenance pass appends the JSON report it printed to an events file
+under the `.just_cache` prefix (#169), and the server streams that file over SSE — the
+event a viewer sees is the report the CLI printed, never a second record of what
+happened. The views are thin over the read-only commands' `--json` documents (audit,
+explain, locate, the pin list, the volume ledger, the schedule), so a number shown in the
+browser is one a cron alert would also have seen. The frontend ships as static files
+embedded in the binary — no node build step — so the cargo-only build and the release
+packaging stay true. It lands as four PR-sized issues in dependency order: the events
+file (#169), the server (#170), the views (#171), the action surface (#172).
+
 ## 9. Known gaps (tracked, not hidden)
 
 Each fix that lands adds a "Closed by #NN" paragraph to this section. A new entry is
@@ -1960,3 +1978,13 @@ What #137 records honestly rather than hides:
  non-loopback bind without TLS refuses unless `--insecure` is given explicitly, with a
  warning naming the exposure. Server-side TLS (the client already speaks it via `rustls`)
  is the peer-tier wiring work that follows.
+- **The dashboard is a view of the catalog and the passes, not a second policy engine.**
+  `just_cache ui` (#170–#172) serves what the read-only commands already print, and it
+  computes no policy of its own: the numbers a view shows are `--json` documents a cron
+  alert would have seen, and a mutating action exists only when the invocation named its
+  `--allow-*` flag. The UI can never do something the same binary invoked with fewer flags
+  could not, and it never writes the catalog directly.
+- **Animations on the dashboard are real events, never a simulation.** The live views
+  render the reports the maintenance passes appended to the events file (#169); nothing is
+  interpolated between events, and a quiet system is shown as still. A UI that invented
+  movement would be a second, untrusted record of what happened to someone's data.
