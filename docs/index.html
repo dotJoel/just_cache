@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>just_cache — local cold storage you can inspect and verify</title>
-<meta name="description" content="Move idle files to slower local storage without renaming paths. just_cache journals moves and includes catalog, audit, scrub and restore tools. Local, LAN-peer, cloud-object and offline tiers are served as one namespace, and its read-only answers go to coding agents over MCP.">
+<meta name="description" content="Move idle files to slower storage; a FUSE mount promotes frequent reads into a bounded RAM/SSD cache. just_cache catalogs copies across local, remote and offline tiers.">
 <style>
   :root {
     --bg: #0b0f14;
@@ -165,7 +165,7 @@
 <header>
   <div class="wordmark"><span class="prompt">$</span> <span>~/storage</span> <span class="sep">::</span> <span>tiered&nbsp;mover</span></div>
   <h1>just_cache<span class="dot">.</span></h1>
-  <p class="lede">Move idle files to slower local storage without renaming their paths. just_cache journals moves and includes tools to catalog, locate, audit, scrub and restore copies — and serves those read-only answers to a coding agent over MCP.</p>
+  <p class="lede">Move idle files to slower storage without changing their paths, and promote frequently read files into a bounded RAM/SSD cache. The durable copy stays authoritative; just_cache also catalogs, checks and restores copies across tiers.</p>
 </header>
 
 <div class="term">
@@ -212,6 +212,31 @@
     not mounted (#144). The namespace today is served locally by the symlink tree, a FUSE mount
     and a WebDAV gateway. <a href="design.md">See the design and roadmap.</a>
   </p>
+</section>
+
+<section id="ram-cache">
+  <div class="kicker">Hot-file cache</div>
+  <h2>Promote frequently read files into RAM</h2>
+  <p class="lead">
+    When a read through the FUSE mount meets the configured <code class="inline">promote_on</code>
+    threshold, just_cache copies the file into a bounded RAM or SSD overlay and serves it from
+    there. The durable home stays authoritative; this is a cache copy, not a tier move.
+  </p>
+  <div class="grid">
+    <div class="card">
+      <h4>Promote on access</h4>
+      <p>The mount observes reads directly. When a file meets the configured threshold, it copies bytes from the home tier and serves the cached copy.</p>
+    </div>
+    <div class="card">
+      <h4>Stay within the cap</h4>
+      <p>LRU eviction keeps the overlay under its size limit. A file larger than the entire cache is not promoted.</p>
+    </div>
+    <div class="card">
+      <h4>RAM is never the only copy</h4>
+      <p>Writes through the mount invalidate the cached copy before changing the home. Cache residency is disposable and is cleared on restart.</p>
+    </div>
+  </div>
+  <div class="note"><strong>Not a durability tier:</strong> cached bytes do not change the catalog's tier of record or count toward its copy floor.</div>
 </section>
 
 <section id="quickstart">
@@ -299,8 +324,8 @@
     <div class="feat"><div class="name">audit</div><p>Walks both sides and classifies every path: healthy, duplicate, dangling, orphaned. Exit code 1 on any finding, so cron can alert.</p></div>
     <div class="feat"><div class="name">locate</div><p>"Where does this live?" answered from the catalog, even when the tier holding it is not mounted.</p></div>
     <div class="feat"><div class="name">restore</div><p>Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
-    <div class="feat"><div class="name">scrub</div><p>Reads every stored copy back and checks it against the recorded checksum; repairs rot from a verified sibling.</p></div>
-    <div class="feat"><div class="name">reconcile</div><p>Rebuilds copies a re-added disk is missing, each one proved against the catalog before it is recorded.</p></div>
+    <div class="feat"><div class="name">scrub</div><p>Checks each reachable stored copy against its recorded checksum and repairs rot only from a sibling copy that verifies.</p></div>
+    <div class="feat"><div class="name">reconcile</div><p>Rebuilds missing copies on reachable disks, proving each against the catalog before recording it.</p></div>
     <div class="feat"><div class="name">pin</div><p>Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
     <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
     <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
@@ -309,7 +334,7 @@
     <div class="feat"><div class="name">events</div><p>Every maintenance pass appends the JSON report it produced to an append-only JSONL file under the <code class="inline">.just_cache</code> prefix the walk skips — the stream a web dashboard tails over SSE, and the command's own report, never a second schema. A torn final line is skipped by readers, not called corrupt.</p></div>
     <div class="feat"><div class="name">ui</div><p>Serves a small read-only dashboard from the binary: a static shell, JSON views that replay the read-only commands' own documents byte for byte, and the maintenance events streamed live. Token auth from a file or an environment variable, loopback by default, and no route that moves, repairs or deletes anything.</p></div>
     <div class="feat"><div class="name">unpin</div><p>Clears a pin set by <code class="inline">pin</code>.</p></div>
-    <div class="feat"><div class="name">cache</div><p>A RAM or SSD overlay in front of a durable tier: promotion copies bytes, eviction is LRU against a size cap, and residency is never data of record.</p></div>
+    <div class="feat"><div class="name">RAM cache</div><p>Promotes reads that meet a configured threshold into a bounded RAM/SSD overlay. The durable home stays authoritative; <a href="#ram-cache">see how promotion and eviction work.</a></p></div>
     <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
     <div class="feat"><div class="name">gc</div><p>Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
     <div class="feat"><div class="name">object-server</div><p>Serves an S3-compatible object endpoint backed by local directories, so a LAN peer can be a tier without running a full tool install. SigV4 auth; writes land through the same verified path.</p></div>
