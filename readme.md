@@ -55,6 +55,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🌐 [Serving it over WebDAV](#serving-it-over-webdav)
 - 🤖 [Asking it from an agent (MCP)](#asking-it-from-an-agent-mcp)
 - ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
+- 📝 [The maintenance events file](#the-maintenance-events-file)
 - 🔨 [Building and testing](#building-and-testing)
 - 👷 [How this codebase is built](#how-this-codebase-is-built)
 - 🗺️ [Layout](#layout)
@@ -1156,6 +1157,39 @@ Exit codes: `0` nothing due or every due pass clean, `1` a pass found something 
 back by its floor, `2` a bad invocation (missing catalog, missing explicit `--config`, or a
 malformed `schedule.toml` naming its line).
 
+## The maintenance events file
+
+Every maintenance pass — `sweep`, `scrub`, `reconcile`, `gc`, `catalog sync`, `audit`, and
+the passes `schedule --run` triggers — appends the JSON report it produced to an
+append-only JSONL file, `.just_cache-events.jsonl`, beside the catalog. It is the record a
+web dashboard (the planned `just_cache ui`, #170) tails over SSE, and it is the report the
+command itself produced — not a second schema that could drift from it:
+
+```json
+{"v":1,"pass":"gc","time":1760000000,"report":{"applied":false,"files":0,"empty_dirs":0,"bytes":0,"removed":[],"failures":[],"tiers":[]}}
+```
+
+What the contract is:
+
+- **The event is the report.** The `report` object is the command's own JSON document —
+  the same one `--json` prints where a command has it — so what a viewer sees is what the
+  CLI produced. `-v`/`-q`/`--json` change only stdout, never the line that lands.
+- **Append-only, never rewritten.** A crash mid-pass leaves a truncated final line; a
+  reader skips a line that does not parse as a complete object rather than calling the file
+  corrupt. Nothing reads the file as a move journal or as recovery evidence.
+- **The walk never sees it.** The file is under the `.just_cache` prefix the walk already
+  skips (invariant 8), so a sweep never moves it and `audit` never reports it as a finding.
+- **Bounded by rotation.** When the live file would exceed its byte budget (default 4 MiB;
+  `JUST_CACHE_EVENTS_MAX_BYTES` overrides it), it is renamed aside to a single segment and a
+  fresh one is started, dropping the oldest events first. The live file is never rewritten.
+- **`--dry-run` records nothing** for `sweep`/`scrub`/`reconcile`; a report-only `gc` does
+  record, because it is still a pass to watch. `audit --no-filesystem` records nothing,
+  because that mode makes no filesystem access at all.
+
+Where it lives: beside the catalog the pass resolved. `--catalog` names that path; with no
+catalog the file falls back to the catalog's default location beside the watch root. One
+known file, never scattered into the tree.
+
 ## Building and testing
 
 ```sh
@@ -1271,6 +1305,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/scrub.rs`](src/scrub.rs) | Reading every stored copy back, repairing rot from a verified sibling, marking what cannot be repaired. |
 | [`src/reconcile.rs`](src/reconcile.rs) | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
 | [`src/schedule.rs`](src/schedule.rs) | The maintenance schedule: `schedule.toml`, which pass is due at a given time, the last-run state file, and the free-space floor a pass is held back by. |
+| [`src/events.rs`](src/events.rs) | The append-only maintenance events file (#169): the enveloped report each pass appends, the byte-bounded rotation, and the reader that skips a torn final line. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
 | [`src/namespace.rs`](src/namespace.rs) | The catalog's names resolved into a directory tree, with a proven filesystem path to each object's tier of record — the testable half of `mount`. |
@@ -1288,6 +1323,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
 | [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
 | [`tests/schedule.rs`](tests/schedule.rs) | The schedule through the binary: nothing-configured runs nothing, the visible next-run, the configured rate pacing a read, a floor holding a pass back, and find-or-quiet. |
+| [`tests/events.rs`](tests/events.rs) | The maintenance events file through the binary: one parseable line per report for a scripted pass, the walk and `audit` never seeing it, a torn final line skipped by a reader, and `-v`/`-q`/`--json` landing the same record. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |
