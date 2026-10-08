@@ -54,6 +54,7 @@ as a real filesystem so a consumer that does not follow symlinks still sees byte
 - 🗂️ [Mounting the namespace](#mounting-the-namespace)
 - 🌐 [Serving it over WebDAV](#serving-it-over-webdav)
 - 🤖 [Asking it from an agent (MCP)](#asking-it-from-an-agent-mcp)
+- 🖥️ [The dashboard](#the-dashboard)
 - ⏲️ [Scheduling the maintenance passes](#scheduling-the-maintenance-passes)
 - 📝 [The maintenance events file](#the-maintenance-events-file)
 - 🔨 [Building and testing](#building-and-testing)
@@ -1110,6 +1111,47 @@ a shell — including the CLI's exit code, which is an answer here and not a fai
 exits 1 to say "look at this"; `isError` is set only when a command produced no output at
 all).
 
+## The dashboard
+
+`just_cache ui` serves a small read-only dashboard: a static shell embedded in the binary,
+JSON views over the same documents the commands print, and a live stream of the maintenance
+events file (#170, views in #171).
+
+```sh
+just_cache ui --watch /mnt/user/media --dest /mnt/disk2/cold \
+              --catalog /mnt/user/media/.just_cache-catalog.sqlite \
+              --token-file ~/.jc-ui-token
+# then open http://127.0.0.1:8732/ and paste the token
+```
+
+It binds loopback by default (`--bind` overrides, printing a warning for a non-loopback
+address), speaks plain HTTP — put a TLS terminator in front before exposing it — and takes
+its token from a file or `JUST_CACHE_UI_TOKEN`, never the command line. Without a token it
+refuses to serve; with one, an unauthenticated request answers `401`, and the token never
+appears in a log. The roots are chosen once at invocation, exactly like `mcp`: a request
+names a query, never a path.
+
+The shell is the only public route (it holds no data and has to load before a token can be
+entered); everything under `/api/` needs the bearer token. Each route runs this same binary
+and returns what it printed, so a view is byte-for-byte the `--json` document a shell would
+see:
+
+- `/api/audit` — consistency between the tree and its tiers (`audit --json`)
+- `/api/catalog` — the catalog-only summary: recorded floors, damage marks, scrub state
+  (`audit --no-filesystem --json`)
+- `/api/explain?path=<namespace path>` — why one path is where it is (`explain --json`)
+- `/api/locate?query=<path or digest>` — every recorded copy and its tier (`locate --json`)
+- `/api/pins` — every recorded pin (`pin --list`)
+- `/api/volumes` — the vault ledger (`volume list --json`)
+- `/api/schedule` — the next planned pass (`schedule`)
+- `/api/events` — server-sent events, one per appended maintenance report (#169)
+- `/api/surface` — which routes this invocation can answer
+
+A command that has no `--json` printer (`pin --list`, `schedule`) is wrapped as
+`{"text": ...}`, never recomputed. A missing catalog answers with the command's own refusal
+(`{"error": ...}`), not a stack trace. This PR ships no route that moves, repairs, deletes or
+pins anything; mutating actions are #172.
+
 ## Scheduling the maintenance passes
 
 `scrub` and `reconcile` are on-demand commands, and a small `schedule.toml` lets them run
@@ -1161,8 +1203,8 @@ malformed `schedule.toml` naming its line).
 
 Every maintenance pass — `sweep`, `scrub`, `reconcile`, `gc`, `catalog sync`, `audit`, and
 the passes `schedule --run` triggers — appends the JSON report it produced to an
-append-only JSONL file, `.just_cache-events.jsonl`, beside the catalog. It is the record a
-web dashboard (the planned `just_cache ui`, #170) tails over SSE, and it is the report the
+append-only JSONL file, `.just_cache-events.jsonl`, beside the catalog. It is the record the
+dashboard (`just_cache ui`, #170) tails over SSE, and it is the report the
 command itself produced — not a second schema that could drift from it:
 
 ```json
@@ -1306,13 +1348,14 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/reconcile.rs`](src/reconcile.rs) | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
 | [`src/schedule.rs`](src/schedule.rs) | The maintenance schedule: `schedule.toml`, which pass is due at a given time, the last-run state file, and the free-space floor a pass is held back by. |
 | [`src/events.rs`](src/events.rs) | The append-only maintenance events file (#169): the enveloped report each pass appends, the byte-bounded rotation, and the reader that skips a torn final line. |
+| [`src/ui.rs`](src/ui.rs) | The dashboard server (#170): hand-rolled HTTP like the gateway, the fixed read-only JSON routes that replay each command's own document, the token auth, and the SSE tail over the events file. One thread per connection. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
 | [`src/digest.rs`](src/digest.rs) | BLAKE3 content digests, streamed — one answer to "are these the same file" for the whole tool. |
 | [`src/namespace.rs`](src/namespace.rs) | The catalog's names resolved into a directory tree, with a proven filesystem path to each object's tier of record — the testable half of `mount`. |
 | [`src/fuse.rs`](src/fuse.rs) | The FUSE adapter over the namespace: inode↔path, read/write through to the tier of record, and the fail-closed refusals. Unix-only; nothing else links `fuser`. |
 || [`src/object_server.rs`](src/object_server.rs) | The S3-compatible object server for LAN-peer tiers (#142): PUT/GET/HEAD/DELETE with SigV4 auth, path-containment, and atomic writes via `.partial` temp. |
 || [`src/offline.rs`](src/offline.rs) | The offline-volume tier driver (#143): export to a volume through the envelope, the `<volume-id>/<path>` storage key, and the insert prompt that names a volume a read needs. |
-|| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule`, `mount`, `gateway`, `object-server` and `volume` subcommands) and the sweep loop. |
+|| [`src/main.rs`](src/main.rs) | The CLI (`sweep`, `audit`, `catalog`, `explain`, `locate`, `restore`, `scrub`, `reconcile`, `schedule`, `mount`, `gateway`, `object-server`, `volume` and `ui` subcommands) and the sweep loop. |
 | [`tests/migration.rs`](tests/migration.rs) | End-to-end behaviour against temporary trees. |
 | [`tests/cross_device.rs`](tests/cross_device.rs) | The EXDEV copy fallback, against a real second filesystem. |
 | [`tests/support/mod.rs`](tests/support/mod.rs) | Shared helpers for tests that need a second filesystem. |
@@ -1324,6 +1367,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
 | [`tests/schedule.rs`](tests/schedule.rs) | The schedule through the binary: nothing-configured runs nothing, the visible next-run, the configured rate pacing a read, a floor holding a pass back, and find-or-quiet. |
 | [`tests/events.rs`](tests/events.rs) | The maintenance events file through the binary: one parseable line per report for a scripted pass, the walk and `audit` never seeing it, a torn final line skipped by a reader, and `-v`/`-q`/`--json` landing the same record. |
+| [`tests/ui.rs`](tests/ui.rs) | The dashboard through the binary: no token refuses to serve, `401` without one and no token in the log, the JSON routes replay the commands' documents byte for byte, a missing catalog answers with the command's refusal, and an SSE client reads an appended event live. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
 | [`tests/catalog.rs`](tests/catalog.rs) | Catalog ingest, the lifecycle states, and the report-don't-rewrite contract, plus CLI exit codes. |
 | [`tests/preserve_metadata.rs`](tests/preserve_metadata.rs) | Mode, ownership, xattrs, mtime and sparseness across a real mount point. |

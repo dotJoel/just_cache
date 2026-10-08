@@ -150,7 +150,10 @@ pub fn read_events(path: &Path) -> io::Result<Vec<String>> {
 /// Tracks string contents (and their escapes) so a brace or quote *inside* a value does
 /// not confuse the count; the tool's hand-rolled writers escape `"` and `\` exactly, so
 /// this is exact for what they emit.
-fn is_complete_object(line: &str) -> bool {
+///
+/// `pub(crate)` because the SSE tail (#170) holds a torn final line back until it is whole:
+/// it must apply the same test to each line as it streams.
+pub(crate) fn is_complete_object(line: &str) -> bool {
     let bytes = line.as_bytes();
     if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
         return false;

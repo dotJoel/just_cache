@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>just_cache dashboard</title>
+<style>
+  :root { color-scheme: dark; --fg: #d8dee9; --bg: #1b1f27; --panel: #242a34;
+          --line: #333a47; --accent: #88c0d0; --warn: #d08770; --ok: #a3be8c; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         background: var(--bg); color: var(--fg); }
+  header { padding: 18px 22px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .02em; }
+  h1 span { color: var(--accent); }
+  main { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 62px); }
+  aside { border-right: 1px solid var(--line); padding: 16px; }
+  section { padding: 16px 22px; }
+  .field { display: flex; gap: 6px; margin-bottom: 14px; }
+  input { flex: 1; min-width: 0; padding: 6px 8px; background: var(--panel);
+          color: var(--fg); border: 1px solid var(--line); border-radius: 4px;
+          font: inherit; }
+  button { padding: 6px 10px; background: var(--panel); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 4px; font: inherit;
+           cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  nav button { display: block; width: 100%; text-align: left; margin-bottom: 6px; }
+  nav button:disabled { opacity: .4; cursor: not-allowed; }
+  nav button:disabled:hover { border-color: var(--line); color: var(--fg); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+       color: #7d879c; margin: 18px 0 8px; }
+  pre { margin: 0; padding: 14px; background: var(--panel); border: 1px solid var(--line);
+        border-radius: 6px; overflow: auto; max-height: 60vh; white-space: pre-wrap;
+        word-break: break-word; }
+  .status { font-size: 12px; color: #7d879c; margin-bottom: 10px; min-height: 1.2em; }
+  .status.ok { color: var(--ok); } .status.bad { color: var(--warn); }
+  .events pre { max-height: 30vh; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .hidden { display: none; }
+  .hint { color: #7d879c; font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1><span>just_cache</span> dashboard</h1></header>
+<main>
+  <aside>
+    <h2>Token</h2>
+    <div class="field">
+      <input id="token" type="password" placeholder="bearer token" autocomplete="off">
+      <button id="save">use</button>
+    </div>
+    <p class="hint">Held in this tab only. Sent as an
+      <code>Authorization: Bearer</code> header, never in a URL.</p>
+    <h2>Views</h2>
+    <nav id="nav"></nav>
+  </aside>
+  <section>
+    <div class="status" id="status"></div>
+    <pre id="output">Set a token, then choose a view.</pre>
+    <div class="events">
+      <h2>Maintenance events <span class="hint" id="stream-state">(disconnected)</span></h2>
+      <pre id="events">—</pre>
+    </div>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var TOKEN_KEY = "just_cache.ui.token";
+  var nav = document.getElementById("nav");
+  var output = document.getElementById("output");
+  var status = document.getElementById("status");
+  var events = document.getElementById("events");
+  var tokenInput = document.getElementById("token");
+  var streamState = document.getElementById("stream-state");
+  var streamController = null;
+  var promptFor = null;
+
+  function token() {
+    var value = sessionStorage.getItem(TOKEN_KEY) || "";
+    return value.trim();
+  }
+
+  function setStatus(text, kind) {
+    status.textContent = text;
+    status.className = "status" + (kind ? " " + kind : "");
+  }
+
+  function authHeaders() {
+    return { "Authorization": "Bearer " + token() };
+  }
+
+  function render(path, name) {
+    if (!token()) { setStatus("set a token first", "bad"); return; }
+    setStatus("loading " + name + "...");
+    fetch(path, { headers: authHeaders() })
+      .then(function (response) {
+        if (response.status === 401) {
+          setStatus("401 — the token was refused", "bad");
+          output.textContent = "unauthorized";
+          return null;
+        }
+        return response.text();
+      })
+      .then(function (text) {
+        if (text === null) { return; }
+        setStatus(name + " — HTTP 200", "ok");
+        try { output.textContent = JSON.stringify(JSON.parse(text), null, 2); }
+        catch (err) { output.textContent = text; }
+      })
+      .catch(function (err) { setStatus("request failed: " + err, "bad"); });
+  }
+
+  function connectStream() {
+    if (streamController) { streamController.abort(); streamController = null; }
+    if (!token()) { streamState.textContent = "(no token)"; return; }
+    streamController = new AbortController();
+    // EventSource cannot set headers, so the stream is read with fetch and a
+    // ReadableStream: the token stays in the Authorization header, never a URL.
+    fetch("/api/events", { headers: authHeaders(), signal: streamController.signal })
+      .then(function (response) {
+        if (response.status === 401) {
+          streamState.textContent = "(401 — token refused)";
+          return;
+        }
+        streamState.textContent = "(connected)";
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        var lines = [];
+        function pump() {
+          return reader.read().then(function (result) {
+            if (result.done) { streamState.textContent = "(disconnected)"; return; }
+            buffer += decoder.decode(result.value, { stream: true });
+            var parts = buffer.split("\n");
+            buffer = parts.pop();
+            parts.forEach(function (part) {
+              if (part.indexOf("data: ") === 0) {
+                lines.push(part.slice(6));
+                if (lines.length > 200) { lines = lines.slice(-200); }
+              }
+            });
+            events.textContent = lines.length ? lines.slice().reverse().join("\n") : "—";
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (err) {
+        if (err.name !== "AbortError") { streamState.textContent = "(failed)"; }
+      });
+  }
+
+  function applyToken() {
+    sessionStorage.setItem(TOKEN_KEY, tokenInput.value.trim());
+    loadSurface();
+    connectStream();
+  }
+
+  function loadSurface() {
+    if (!token()) { return; }
+    fetch("/api/surface", { headers: authHeaders() })
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .then(function (surface) {
+        if (!surface) { return; }
+        nav.textContent = "";
+        surface.routes.forEach(function (route) {
+          if (route.name === "events") { return; }
+          var button = document.createElement("button");
+          button.textContent = route.name;
+          button.disabled = !route.available;
+          button.title = route.available ? route.path : "needs " + route.needs;
+          button.addEventListener("click", function () {
+            var path = route.path;
+            if (route.name === "explain" || route.name === "locate") {
+              var key = route.name === "explain" ? "path" : "query";
+              var value = promptFor ? promptFor : null;
+              value = window.prompt(key + " (namespace path or digest)", value || "");
+              if (value === null || value === "") { return; }
+              promptFor = value;
+              path += "?" + key + "=" + encodeURIComponent(value);
+            }
+            render(path, route.name);
+          });
+          nav.appendChild(button);
+        });
+      });
+  }
+
+  document.getElementById("save").addEventListener("click", applyToken);
+  tokenInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { applyToken(); }
+  });
+
+  if (token()) {
+    tokenInput.value = token();
+    loadSurface();
+    connectStream();
+  }
+})();
+</script>
+</body>
+</html>

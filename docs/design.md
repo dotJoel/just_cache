@@ -2030,3 +2030,71 @@ it produced to an append-only JSONL file the walk already skips, so the dashboar
   render the reports the maintenance passes appended to the events file (#169); nothing is
   interpolated between events, and a quiet system is shown as still. A UI that invented
   movement would be a second, untrusted record of what happened to someone's data.
+- **The dashboard hand-rolls HTTP over `std::net`, exactly as `gateway` and
+  `object-server` do, and takes one thread per connection.** `just_cache ui` (#170) adds
+  no web framework and no runtime: the request line and headers are parsed by hand, the
+  routes are a fixed match, and the only concurrency is a thread spawned per accepted
+  connection. That last point is the one place `ui` departs from `gateway`'s strictly
+  sequential loop: the SSE stream (below) holds a connection open for the life of a
+  viewer, and a single-threaded accept loop would answer nobody else while one person
+  watched the events file. A framework would buy routing and a worker pool at the price of
+  a large dependency tree — already the reasoning that kept `gateway` dependency-free — so
+  the choice is the repo's own approach plus `std::thread`, at zero added dependency
+  weight.
+- **The frontend is one self-contained `index.html` embedded with `include_str!`, and the
+  token is entered by the operator.** The shell is plain HTML, inline CSS and inline
+  vanilla JS — no framework, no node build step, no second release artifact — so the
+  cargo-only build stays true. The page is served publicly, because it is inert (it holds
+  no catalog data) and it has to load before a person can present a token to it; **every
+  route that answers from the catalog, and the event stream itself, requires the bearer
+  token and answers `401` without it.** The page keeps the token in `sessionStorage` and
+  sends it in the `Authorization` header on every `fetch`. The SSE stream is consumed with
+  `fetch`'s streaming reader rather than the browser `EventSource`, precisely because
+  `EventSource` cannot set headers and the token would have to ride in a query string,
+  where an access log would capture it. This is why the token is in a header and never in
+  a URL anywhere in this command.
+- **The event stream tails the rotating file by byte offset, replays the retained ring on
+  attach, and drains a rotated segment before restarting.** `src/events.rs` (§9) names the
+  gap: the file rotates at a byte budget, so a reader that attaches after a rotation has
+  missed whatever the old segment held. The tail (#170) answers it the only honest way. A
+  client connecting gets the retained ring replayed first — the rotated segment, then the
+  live file, in order — so a late viewer sees the recent window rather than nothing. A
+  client already connected holds a byte offset into the live file; when the file shrinks
+  under that offset (the signal that it was renamed to a segment and a fresh live file
+  begun), the tail reads the *unread remainder* of the rotated segment before it resets and
+  continues on the new live file, so a viewer that had not caught up across a rotation still
+  loses nothing. What is genuinely lost is the segment dropped at rotation beyond the
+  two-file ring: the previous segment is overwritten, and no reader — this one included —
+  can recover events older than the retained window. That bound is the cost of a file nobody
+  has to prune, and it is stated here rather than papered over. A torn final line is held
+  back until it is whole (the same `is_complete_object` test `read_events` uses) so a crash
+  mid-append cannot put half an object on the wire.
+- **Every JSON route answers `200` with either the command's own document or a wrapped
+  refusal.** A route runs this same binary (`program`), exactly as `mcp` does, and returns
+  its stdout verbatim when the command produced a `--json` document — so `GET /api/audit`
+  is byte-for-byte what `just_cache audit --json` prints to a shell. When the command
+  refused and produced no document (a missing catalog, a route whose roots were not given
+  at invocation), the body is `{"error": "...", "command": "...", "exit": N}` carrying the
+  command's own stderr; a missing catalog is therefore the refusal a person would have read,
+  not a stack trace and not a `5xx`. `401` (no or wrong token), `404` (unknown path) and
+  `405` (a method other than `GET`/`HEAD`) are the only non-`200` answers. Routes that map
+  to a command with no `--json` printer — `pin --list`, `schedule` — wrap the command's text
+  as `{"text": "..."}`, again with no recomputation.
+- **Two views named in the issue are not invented here, and the routes are fixed.** There
+  is no read-only command that prints the tier *configuration* (`tiers.toml`) as a document:
+  the per-tier copy floor the catalog records is served by `GET /api/catalog`
+  (`audit --no-filesystem`), and the configured set of tiers, kinds and recall classes is
+  not synthesized, because §9's rule is that an endpoint which computes something no command
+  prints is a design decision, not default behaviour. Likewise the `pending_removal` rows a
+  deferred `catalog delete` leaves have no `--json` printer, so no route reports them yet.
+  Both are view work for #171, recorded here so their absence is a decision rather than an
+  oversight. This PR also ships no mutating route at all — mutating actions are #172 — so
+  the exposed surface is the whole policy: the fixed set of read-only queries above.
+- **The shell is the one unauthenticated route, and that is the deliberate exception to
+  `gateway`'s all-or-nothing auth.** `gateway` authenticates every request because every
+  request can move bytes; the `ui` shell cannot — it is a static document that names no
+  object. Requiring a token for it would make the dashboard unusable from a browser, since
+  a page cannot present a credential before it loads. So `/` is public and holds no data;
+  every `/api/` route and `/api/events` requires the token. The 401 carries
+  `WWW-Authenticate: Bearer` and never echoes the presented value, and the access log line
+  names only method, target and status — never a header — so the token cannot reach a log.
