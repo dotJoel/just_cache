@@ -88,6 +88,14 @@
   .term .ok { color: var(--good); }
   .term .dim { color: var(--text-dim); }
 
+  /* dashboard screenshots */
+  .shot { margin: 26px 0 34px; }
+  .shot img { width: 100%; border: 1px solid var(--border); border-radius: 10px;
+              box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35); display: block; }
+  .shot figcaption { font-family: var(--mono); font-size: 12.5px; color: var(--text-faint);
+                     margin-top: 8px; }
+  .shot figcaption b { color: var(--text-dim); font-weight: 600; }
+
   /* sections */
   section { margin-top: 64px; }
   .kicker { font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
@@ -307,6 +315,51 @@
     <div class="feat"><div class="name">object-server</div><p>Serves an S3-compatible object endpoint backed by local directories, so a LAN peer can be a tier without running a full tool install. SigV4 auth; writes land through the same verified path.</p></div>
     <div class="feat"><div class="name">volume</div><p>The vault ledger for offline-volume tiers: which physical volume is in a tier's drive and where the others are. The catalog is the source of truth — no marker file is ever written into the volume.</p></div>
   </div>
+</section>
+
+<section id="dashboard">
+  <div class="kicker">The dashboard</div>
+  <h2>A read-only window on the whole system</h2>
+  <p class="lead">
+    <code class="inline">just_cache ui</code> serves a small dashboard from the binary itself:
+    the tier map, the audit findings, the schedule, and the maintenance events as they happen.
+    Every number on screen is one of the commands' own <code class="inline">--json</code>
+    documents, fetched live — the page computes nothing of its own. It binds loopback by
+    default, and every data route answers a bearer token from <code class="inline">--token-file</code>.
+  </p>
+
+  <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">serve it</span></div><pre><code><span class="ps">$</span> just_cache ui <span class="dim">\
+    --watch</span> /mnt/cache/media <span class="dim">\
+    --dest</span> /mnt/disk-slow/media <span class="dim">\
+    --catalog</span> /mnt/cache/media/.just_cache-catalog.sqlite <span class="dim">\
+    --token-file</span> ~/.jc-ui-token
+<span class="cm"># then open http://127.0.0.1:8732/ and paste the token</span></code></pre></div>
+
+  <figure class="shot">
+    <img src="images/dashboard-tiers.png" alt="The dashboard's tier map: one card per tier with kind, recall class, volatility, and the recorded locations shown as a gauge against the recorded copy floor" loading="lazy">
+    <figcaption><b>The tier map</b> — a card per tier from <code class="inline">tiers --json</code>; the bar is the recorded locations against the recorded copy floor, the two numbers printed as they are, no verdict computed in between.</figcaption>
+  </figure>
+  <figure class="shot">
+    <img src="images/dashboard-activity.png" alt="The live activity view: a feed of real maintenance events, newest first, each naming the paths its report carried" loading="lazy">
+    <figcaption><b>Live activity</b> — the events the <code class="inline">/api/events</code> stream actually delivers, newest first, each path clickable. A real event also flashes the tier card it names; nothing arrives, nothing moves.</figcaption>
+  </figure>
+  <figure class="shot">
+    <img src="images/dashboard-audit.png" alt="The audit view: findings grouped by classification with the document's own counts, one group drilled open to its paths" loading="lazy">
+    <figcaption><b>Audit</b> — findings grouped by classification with the document's own counts, each group drillable to its paths; the catalog-only summary shows the <code class="inline">unchecked</code> list as what it is.</figcaption>
+  </figure>
+  <figure class="shot">
+    <img src="images/dashboard-explain.png" alt="The explain-on-click panel: one path's scope, guards, policy and verdict as the document reports them" loading="lazy">
+    <figcaption><b>Explain on click</b> — any path opens <code class="inline">explain --json</code> for that one path: scope, guards, policy, then the verdict, with the raw document a toggle away.</figcaption>
+  </figure>
+  <figure class="shot">
+    <img src="images/dashboard-schedule.png" alt="The schedule view: one card per maintenance pass with its cadence, next run and free-space floor" loading="lazy">
+    <figcaption><b>Schedule</b> — each pass from <code class="inline">schedule --json</code>: cadence, next run, rate and free-space floor, and whether it is due now.</figcaption>
+  </figure>
+
+  <div class="note"><strong>These are captures, not a demo.</strong> The screenshots were taken
+  from a real server running against a throwaway tree. There is no hosted demo, on purpose: a
+  static copy of the page would have no documents to render, and the page does not invent
+  numbers its documents do not carry. Run the three commands above and this is what you get.</div>
 </section>
 
 <section id="vision">
