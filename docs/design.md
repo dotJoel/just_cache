@@ -2129,3 +2129,16 @@ left open, and the honest gaps:
   every `/api/` route and `/api/events` requires the token. The 401 carries
   `WWW-Authenticate: Bearer` and never echoes the presented value, and the access log line
   names only method, target and status — never a header — so the token cannot reach a log.
+- **The views are renderings of documents, never a second policy.** Each view fetches one
+  route's document and shows its fields; a page that computed a verdict, a health label or
+  a number would be a decision the commands did not make, so the tier map prints the
+  recorded locations and the recorded copy floor as the two numbers they are and a gauge
+  only as their proportion. Empty states come from the document's own `configured`/`error`
+  fields, not a guessed default. The SSE-driven animation lights a tier card only when a
+  real event's paths fall under it — no event, no motion; there is no ambient animation,
+  because a feed of real events that shimmered when nothing happened would be lying. What
+  could not be tested: the page's JavaScript. The tests drive the binary over HTTP only,
+  so they pin the served shell (its scaffolding, its empty-state wording, that every
+  `/api/…` string it names is a route the surface serves) and the documents behind the
+  views; the browser behaviour itself — animation, drill-downs, the explain panel — is
+  verified by hand, and this is the gap, named here rather than hidden.

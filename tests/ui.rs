@@ -619,3 +619,110 @@ fn a_pass_running_against_the_server_reaches_an_attached_sse_client() {
         "the pass's event reached the client that was attached while it ran:\n{seen}"
     );
 }
+
+// ---- The views layer (issue #171): what the served page itself promises. ----
+
+#[test]
+fn the_served_shell_carries_the_views_their_empty_states_and_no_data() {
+    let tree = build();
+    let server = UiServer::start(&tree, &[]);
+
+    let (status, body) = request(server.addr, "/", None);
+    assert_eq!(status, 200, "the shell is the one public route");
+    // The five views' scaffolding is in the served page.
+    for marker in [
+        "view-tiers",
+        "view-activity",
+        "view-audit",
+        "view-schedule",
+        "explain-panel",
+    ] {
+        assert!(body.contains(marker), "the shell names {marker}");
+    }
+    // The empty states are the page's own wording, named for what is missing.
+    for wording in [
+        "no tier map is configured",
+        "no schedule is configured",
+        "no maintenance events have arrived",
+    ] {
+        assert!(body.contains(wording), "the shell carries: {wording}");
+    }
+    // The shell is inert: no token, no catalog data.
+    assert!(!body.contains(TOKEN), "the shell never carries the token");
+    assert!(
+        !body.contains("movie bytes") && !body.contains("moved.mkv"),
+        "the shell carries no catalog data"
+    );
+}
+
+#[test]
+fn the_shell_references_only_routes_the_surface_serves() {
+    let tree = build();
+    let config = tree.hot.join("tiers.toml");
+    let server = UiServer::start(
+        &tree,
+        &[
+            "--catalog".into(),
+            tree.catalog.display().to_string(),
+            "--tiers".into(),
+            config.display().to_string(),
+        ],
+    );
+    let (_, surface_body) = request(server.addr, "/api/surface", Some(TOKEN));
+    let surface: serde_json::Value = serde_json::from_str(surface_body.trim()).unwrap();
+    let served: Vec<String> = surface["routes"]
+        .as_array()
+        .expect("the surface lists routes")
+        .iter()
+        .map(|route| route["path"].as_str().unwrap().to_string())
+        .collect();
+
+    let (_, shell) = request(server.addr, "/", None);
+    // Every `/api/…` the page names must be a route the server actually serves, so no
+    // view can fetch its way into a 404.
+    let mut rest = shell.as_str();
+    while let Some(at) = rest.find("\"/api/") {
+        let after = &rest[at + 1..];
+        let end = after.find('"').unwrap();
+        let path = &after[..end];
+        assert!(
+            served.iter().any(|served_path| served_path == path)
+                || path == "/api/surface"
+                || path.starts_with("/api/explain?path="),
+            "the shell names {path}, which the surface does not serve"
+        );
+        rest = &rest[at + end + 1..];
+    }
+    // And the routes the views render are among them.
+    for path in ["/api/tiers", "/api/pending", "/api/schedule", "/api/audit"] {
+        assert!(
+            served.iter().any(|served_path| served_path == path),
+            "the surface serves {path}"
+        );
+    }
+}
+
+/// The explain-on-click view renders `/api/explain`'s sections; this pins that the route
+/// answers with the document carrying them, over HTTP, for a namespace path.
+#[test]
+fn the_explain_route_a_view_click_answers_with_the_four_gate_document() {
+    let tree = build();
+    let server = UiServer::start(
+        &tree,
+        &["--catalog".into(), tree.catalog.display().to_string()],
+    );
+
+    let (status, body) = request(
+        server.addr,
+        "/api/explain?path=shows%2Flive.bin",
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200);
+    let document: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+    for section in ["scope", "guards", "policy", "verdict", "catalog"] {
+        assert!(
+            document.get(section).is_some(),
+            "the document carries {section}: {document}"
+        );
+    }
+}

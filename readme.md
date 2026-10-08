@@ -1164,6 +1164,37 @@ recomputed. A missing catalog answers with the command's own refusal (`{"error":
 a stack trace. This PR ships no route that moves, repairs, deletes or pins anything; mutating
 actions are #172.
 
+### The views (#171)
+
+The page renders five views, each a rendering of one of those documents — the page adds no
+number it did not fetch. **Tier map**: a card per tier from `/api/tiers` — kind, recall
+class, volatility, cost when the document carries one — with the catalog-recorded
+`locations` shown as a gauge against the recorded copy floor (`copies`), the two numbers
+printed as they are and no verdict computed in between; a tier with pending removals is
+highlighted and lists its paths from `/api/pending`; an offline tier shows its
+volume-ledger rows (`/api/volumes`) and the document's `insert_prompts` as the prompt they
+are. **Live activity**: the events `/api/events` actually delivers are kept in a feed and
+light up the tier card the event's paths fall under — nothing happening means the map is
+still; there is no ambient animation, because the feed shows real events only. **Audit**:
+findings from `/api/audit` grouped by classification with the document's own counts, each
+group drillable to its paths, and the catalog-only summary (`/api/catalog`) with its
+`unchecked` list shown as what it is — the findings that cannot be made without the tree —
+and its scrub summary as recorded. **Explain on click**: a path in the map or the findings
+opens `/api/explain?path=` in a panel presenting the document's own sections (`scope`,
+`guards`, `policy`, `verdict`, plus its `catalog` block), with a raw-JSON toggle. **Schedule**:
+each pass from `/api/schedule` with its cadence, next run, rate and free-space floor, and
+its last-run state.
+
+Empty states come from the documents, not a guessed default: no `tiers.toml`, no
+`schedule.toml`, an empty catalog, a server started without `--tiers` — each renders the
+`configured`/`error` field the route answered with, naming what is missing. The
+raw-document escape hatch stays: every route in `/api/surface` is still reachable as its
+JSON verbatim, so a viewer can always see the document a view is a rendering of. What is
+not tested: the page's JavaScript — the SSE-driven animation and the drill-downs are
+browser behaviour no HTTP-level test can reach — so the tests pin the served shell (its
+scaffolding, its empty-state wording, that it references only routes the surface serves)
+and the documents behind the views.
+
 ## Reading the tier configuration back
 
 `just_cache tiers` prints what `tiers.toml` describes — the same lines `audit` and `locate`
