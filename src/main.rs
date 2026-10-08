@@ -18,6 +18,7 @@ use clap::{Args, Parser, Subcommand};
 use just_cache::audit::{self, AuditSource, RepairAction};
 use just_cache::catalog;
 use just_cache::disk_management;
+use just_cache::events;
 use just_cache::explain::{self, ExplainContext};
 use just_cache::file_movement::{self, FileOutcome, MigrationReport, Policy, UsageTracker};
 use just_cache::gc::{self, GcRequest};
@@ -1036,6 +1037,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// Append one maintenance pass's report to the append-only events file the dashboard
+/// tails (#169).
+///
+/// The event is the report the pass produced — the same document `--json` prints where a
+/// command has one — so a viewer never sees a second record that could drift from the
+/// command's own output. A failure to record is a warning, never a failure of the pass:
+/// the work is done, and cron must not be told otherwise because a log line could not be
+/// written. `catalog` is the path the pass resolved (an explicit `--catalog`, or an
+/// existing default); `watch` is the fallback for a pass with no catalog of its own.
+fn record_event(catalog: Option<&Path>, watch: &Path, pass: &str, report_json: &str) {
+    if let Err(err) = events::append(catalog, watch, pass, report_json) {
+        let path = events::events_path(catalog, watch);
+        eprintln!(
+            "just_cache: warning: could not append the {pass} report to {}: {err}",
+            path.display()
+        );
+    }
+}
+
 fn run_sweep(args: SweepArgs) -> ExitCode {
     let watch = match args.watch.clone() {
         Some(watch) => watch,
@@ -1195,6 +1215,12 @@ fn run_sweep(args: SweepArgs) -> ExitCode {
             tiers: tiers.as_ref(),
         };
         let report = sweep(&mut state, pass);
+        // Every pass appends its own report to the events file (#169). A dry run moved
+        // nothing and so records nothing (docs/design.md §9); the event is built from the
+        // report, never from stdout, so `-v`/`-q` do not change what lands.
+        if !args.dry_run {
+            record_event(None, &watch, "sweep", &report.to_json());
+        }
         // Compaction is what keeps the journal describing only what is still in flight:
         // finished moves are dropped, and any incomplete record is written back so the
         // next start reads a file the size of the work actually outstanding. A compaction
@@ -1304,6 +1330,15 @@ fn run_catalog_sync(args: CatalogSyncArgs) -> ExitCode {
     for line in report.summary_lines() {
         println!("{line}");
     }
+
+    // The sync is a maintenance pass, so its report joins the events stream (#169),
+    // beside the catalog it just wrote.
+    record_event(
+        Some(&catalog_path),
+        &args.watch,
+        "catalog-sync",
+        &report.to_json(),
+    );
 
     if report.has_differences() {
         ExitCode::from(EXIT_FINDINGS)
@@ -1689,6 +1724,23 @@ fn run_audit(args: AuditArgs) -> ExitCode {
                 println!("{line}");
             }
         }
+    }
+
+    // The audit is one of the passes whose report joins the events stream (#169). This is
+    // skipped for `--no-filesystem`: that mode promises no filesystem access at all, and
+    // appending an event is a write (docs/design.md §9 names the gap).
+    if !args.no_filesystem {
+        let events_catalog = if catalog_path.is_file() {
+            Some(catalog_path.as_path())
+        } else {
+            None
+        };
+        record_event(
+            events_catalog,
+            &args.watch,
+            "audit",
+            &report.to_json(repairs.as_deref()),
+        );
     }
 
     // Read-only audit alerts on any finding; a repair run only alerts on findings it
@@ -2198,6 +2250,17 @@ fn run_scrub(args: ScrubArgs) -> ExitCode {
         }
     }
 
+    // A scrub that ran appends its report to the events file (#169); a dry run records
+    // nothing, because nothing was done (docs/design.md §9).
+    if !args.dry_run {
+        record_event(
+            Some(&args.catalog),
+            Path::new("."),
+            "scrub",
+            &report.to_json(),
+        );
+    }
+
     if report.has_findings() {
         ExitCode::from(EXIT_FINDINGS)
     } else {
@@ -2250,6 +2313,17 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
         for line in report.summary_lines() {
             println!("{line}");
         }
+    }
+
+    // A reconcile that ran appends its report to the events file (#169); a dry run
+    // records nothing (docs/design.md §9).
+    if !args.dry_run {
+        record_event(
+            Some(&args.catalog),
+            Path::new("."),
+            "reconcile",
+            &report.to_json(),
+        );
     }
 
     if report.has_findings() {
@@ -2377,6 +2451,10 @@ fn run_gc(args: GcArgs) -> ExitCode {
             println!("{line}");
         }
     }
+
+    // GC is a maintenance pass whether it removed anything or only reported: a report-only
+    // `gc` is a pass the operator watches, so it joins the events stream (#169) too.
+    record_event(Some(&args.catalog), Path::new("."), "gc", &report.to_json());
 
     if report.has_findings() {
         ExitCode::from(EXIT_FINDINGS)
@@ -2506,6 +2584,12 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                 };
                 match scrub::scrub(&request) {
                     Ok(report) => {
+                        // A pass that ran records its report (#169) even when it found
+                        // nothing and stays quiet on stdout: activity is the event stream's
+                        // job, and a dry run records nothing.
+                        if !args.dry_run {
+                            record_event(Some(&args.catalog), base, "scrub", &report.to_json());
+                        }
                         if report.has_findings() {
                             findings = true;
                             for line in report.summary_lines() {
@@ -2533,6 +2617,11 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                 };
                 match reconcile::reconcile(&request) {
                     Ok(report) => {
+                        // As with the scrub arm: a pass that ran is an event even when its
+                        // stdout summary is empty (#169); a dry run records nothing.
+                        if !args.dry_run {
+                            record_event(Some(&args.catalog), base, "reconcile", &report.to_json());
+                        }
                         if report.has_findings() {
                             findings = true;
                             for line in report.summary_lines() {

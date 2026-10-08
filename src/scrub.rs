@@ -273,6 +273,107 @@ impl ScrubReport {
         }
         lines
     }
+
+    /// The scrub report as a self-contained JSON document (#169), hand-rolled like every
+    /// other `--json` in this tool. A scrub appends this whatever `--quiet` says, so the
+    /// event does not depend on how much stdout showed.
+    pub fn to_json(&self) -> String {
+        use crate::events::json_string;
+        let join = |items: Vec<String>| items.join(",");
+        let mut out = String::from("{");
+        out.push_str(&format!(
+            "\"catalog\":{},",
+            json_string(&self.catalog.display().to_string())
+        ));
+        out.push_str(&format!("\"dry_run\":{},", self.dry_run));
+        out.push_str(&format!("\"locations\":{},", self.locations));
+        out.push_str(&format!("\"verified\":{},", self.verified));
+        out.push_str(&format!("\"already_verified\":{},", self.already_verified));
+        out.push_str(&format!("\"has_findings\":{},", self.has_findings()));
+        out.push_str(&format!(
+            "\"skipped_tiers\":[{}],",
+            join(
+                self.skipped_tiers
+                    .iter()
+                    .map(|tier| json_string(tier))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"repairs\":[{}],",
+            join(
+                self.repairs
+                    .iter()
+                    .map(|repair| format!(
+                        "{{\"path\":{},\"source\":{},\"object\":{},\"bytes\":{},\"applied\":{}}}",
+                        json_string(&repair.path.display().to_string()),
+                        json_string(&repair.source.display().to_string()),
+                        json_string(&repair.object),
+                        repair.bytes,
+                        repair.applied
+                    ))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"damaged\":[{}],",
+            join(
+                self.damaged
+                    .iter()
+                    .map(|damage| format!(
+                        "{{\"object\":{},\"locations\":[{}],\"detail\":{}}}",
+                        json_string(&damage.object),
+                        join(
+                            damage
+                                .locations
+                                .iter()
+                                .map(|path| json_string(&path.display().to_string()))
+                                .collect()
+                        ),
+                        json_string(&damage.detail)
+                    ))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"missing\":[{}],",
+            join(
+                self.missing
+                    .iter()
+                    .map(|path| json_string(&path.display().to_string()))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"unreadable\":[{}],",
+            join(
+                self.unreadable
+                    .iter()
+                    .map(|(path, detail)| format!(
+                        "{{\"path\":{},\"detail\":{}}}",
+                        json_string(&path.display().to_string()),
+                        json_string(detail)
+                    ))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"malformed\":[{}]",
+            join(
+                self.malformed
+                    .iter()
+                    .map(|row| format!(
+                        "{{\"tier\":{},\"storage_key\":{},\"detail\":{}}}",
+                        json_string(&row.tier),
+                        json_string(&row.storage_key),
+                        json_string(&row.detail)
+                    ))
+                    .collect()
+            )
+        ));
+        out.push('}');
+        out
+    }
 }
 
 /// Everything one scrub needs.

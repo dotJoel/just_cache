@@ -1688,6 +1688,39 @@ mod tests {
     }
 
     #[test]
+    fn walks_past_the_events_file_under_the_internal_prefix() {
+        // Invariant 8: the events file the maintenance passes append to (#169) lives under
+        // the `.just_cache` prefix, so the walk that decides what to move never sees it —
+        // not as a candidate, and not as a finding for `audit`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("watched");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(crate::events::EVENTS_NAME),
+            b"{\"v\":1,\"pass\":\"gc\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(crate::events::EVENTS_SEGMENT_NAME),
+            b"{\"v\":1,\"pass\":\"gc\"}\n",
+        )
+        .unwrap();
+        fs::write(root.join("keep.bin"), b"real").unwrap();
+
+        let names: Vec<String> = list_files_recursive(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.relative.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["keep.bin".to_string()],
+            "the events file and its rotated segment must never be walk candidates"
+        );
+    }
+
+    #[test]
     fn symlink_target_is_relative_between_siblings() {
         let target = symlink_target(
             Path::new("/pool/cache/movies/a.mkv"),

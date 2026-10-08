@@ -1836,6 +1836,48 @@ What #137 records honestly rather than hides:
   (`2025-06-18`); it does not read the client's requested version and pick a compatible one,
   because the tool surface has nothing version-dependent in it yet.
 
+Closed by #169 (the maintenance events file): every maintenance pass now appends the report
+it produced to an append-only JSONL file the walk already skips, so the dashboard server
+(#170) has a stream to tail. The decisions this issue left open, and the honest gaps:
+
+- **The event is the pass's own report, wrapped only for routing.** Each line is
+  `{"v":1,"pass":<name>,"time":<unix>,"report":<document>}`, where `<document>` is exactly
+  the command's own JSON — the existing `--json` output for `gc` and `audit`, and new
+  `to_json` methods on `MigrationReport` (sweep), `ScrubReport`, `ReconcileReport` and
+  `SyncReport`. No UI-only schema is invented; verbosity (`-v`/`-q`/`--json`) moves only
+  what stdout shows, never what lands, and tests pin that equality.
+- **The name is fixed and it lives beside the catalog.** `.just_cache-events.jsonl`, that
+  path's sibling: with `--catalog` naming a file the events file sits in the same directory,
+  and with no catalog it falls back to the catalog's default location beside the watch root.
+  Either way it is one well-known file under the `.just_cache` prefix (invariant 8), never
+  scattered per directory the pass touches — and a catalog outside the tree keeps the events
+  file outside it too.
+- **Growth is bounded by rotation, not by rewriting.** The live file is never rewritten,
+  only appended to; when an incoming line would push it past the byte budget (default 4 MiB,
+  overridable with `JUST_CACHE_EVENTS_MAX_BYTES`) it is renamed aside to a single segment
+  and a fresh file is started, dropping the oldest events first. A single event larger than
+  the budget is written whole — splitting a line would leave two non-events. Named gap: a
+  tailing reader that attaches after a rotation misses events now in the dropped segment;
+  the segment is not part of the live stream.
+- **`--dry-run` records nothing.** A dry run changed nothing, so there is no event to record
+  for `sweep`, `scrub` or `reconcile`; a report-only `gc` (no `--apply`) does record, because
+  it is still a pass the operator watches, and `catalog sync` always records.
+- **Sub-sweep progress is deferred.** Events land at report granularity in this issue: an
+  interval-mode sweep appends one event per completed pass, and no per-copy `progress` ping
+  is written from `disk_management` mid-copy. The enveloped report is the contract a later
+  issue can extend.
+- **`schedule --run` records through the pass it runs.** A scheduled scrub or reconcile is
+  the same code path as the on-demand command, so it appends that pass's own report; the
+  scheduler emits no separate event.
+- **The reader skips a torn tail without a JSON dependency.** A final line that is not a
+  complete, brace-balanced object — the truncated write a crash mid-pass leaves — is skipped
+  rather than reported as corrupt. The writer escapes quotes and backslashes and emits no raw
+  newline inside a string, so the brace scan is exact for what this tool writes.
+- **`audit --no-filesystem` writes no event.** That mode promises no filesystem access at
+  all, and appending an event is a write; the pass is deliberately silent in the stream
+  rather than breaking its own contract. This is the one maintenance mode that does not
+  append, and it is named here rather than hidden.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator

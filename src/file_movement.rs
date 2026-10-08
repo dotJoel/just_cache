@@ -698,6 +698,93 @@ impl MigrationReport {
             })
             .collect()
     }
+
+    /// The sweep report as a self-contained JSON document (#169), hand-rolled like every
+    /// other `--json` in this tool.
+    ///
+    /// This is what a sweep appends to the events file *whatever* `-v`/`-q` say: the
+    /// event is the whole report, and verbosity moves only what stdout shows. A `-q` run
+    /// and a `-v` run therefore land the same record.
+    pub fn to_json(&self) -> String {
+        let mut out = String::from("{");
+        out.push_str(&format!("\"files\":{},", self.records.len()));
+        out.push_str(&format!("\"moved\":{},", self.moved()));
+        out.push_str(&format!("\"linked\":{},", self.linked_existing()));
+        out.push_str(&format!("\"planned\":{},", self.planned()));
+        out.push_str(&format!(
+            "\"waiting_for_room\":{},",
+            self.waiting_for_room()
+        ));
+        out.push_str(&format!("\"in_use\":{},", self.in_use()));
+        out.push_str(&format!("\"excluded\":{},", self.excluded()));
+        out.push_str(&format!(
+            "\"under_replicated\":{},",
+            self.under_replicated()
+        ));
+        out.push_str(&format!("\"failed\":{},", self.failed()));
+        out.push_str(&format!("\"bytes_moved\":{},", self.bytes_moved()));
+        out.push_str("\"records\":[");
+        out.push_str(
+            &self
+                .records
+                .iter()
+                .map(migration_record_json)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push_str("]}");
+        out
+    }
+}
+
+/// One sweep record as a JSON object.
+fn migration_record_json(record: &MigrationRecord) -> String {
+    let destination = record
+        .destination
+        .as_ref()
+        .map(|dest| crate::events::json_string(&dest.display().to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let rule = record
+        .rule
+        .as_ref()
+        .map(|rule| crate::events::json_string(rule))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"path\":{},\"destination\":{},\"outcome\":{},\"detail\":{},\"size\":{},\"rule\":{}}}",
+        crate::events::json_string(&record.path.display().to_string()),
+        destination,
+        crate::events::json_string(outcome_kind(&record.outcome)),
+        outcome_detail(&record.outcome),
+        record.size,
+        rule
+    )
+}
+
+/// The stable outcome kind for an event record. Separate from the human description so a
+/// reader routes on the kind without parsing prose.
+fn outcome_kind(outcome: &FileOutcome) -> &'static str {
+    match outcome {
+        FileOutcome::Planned => "planned",
+        FileOutcome::Moved => "moved",
+        FileOutcome::LinkedExisting => "linked-existing",
+        FileOutcome::AlreadyLinked => "already-linked",
+        FileOutcome::NoRoom => "no-room",
+        FileOutcome::UnderReplicated { .. } => "under-replicated",
+        FileOutcome::Skipped(_) => "skipped",
+        FileOutcome::Failed(_) => "failed",
+    }
+}
+
+/// The extra detail a kind needs, as a JSON string or `null` when the kind says it all.
+fn outcome_detail(outcome: &FileOutcome) -> String {
+    match outcome {
+        FileOutcome::UnderReplicated { verified, floor } => {
+            crate::events::json_string(&format!("{verified}/{floor} copies verified; source kept"))
+        }
+        FileOutcome::Skipped(reason) => crate::events::json_string(&reason.to_string()),
+        FileOutcome::Failed(err) => crate::events::json_string(err),
+        _ => "null".to_string(),
+    }
 }
 
 /// Move the cold files of `entries` onto a cold tier and symlink them back.

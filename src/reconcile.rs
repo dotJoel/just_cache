@@ -297,6 +297,64 @@ impl ReconcileReport {
         }
         lines
     }
+
+    /// The reconcile report as a self-contained JSON document (#169), hand-rolled like
+    /// every other `--json` in this tool, and independent of verbosity.
+    pub fn to_json(&self) -> String {
+        use crate::events::json_string;
+        let mut out = String::from("{");
+        out.push_str(&format!(
+            "\"catalog\":{},",
+            json_string(&self.catalog.display().to_string())
+        ));
+        out.push_str(&format!("\"dry_run\":{},", self.dry_run));
+        out.push_str(&format!("\"objects\":{},", self.objects));
+        out.push_str(&format!("\"tiers\":{},", self.tiers));
+        out.push_str(&format!("\"min_free\":{},", self.min_free));
+        out.push_str(&format!(
+            "\"read_budget\":{},",
+            self.read_budget
+                .map(|budget| budget.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ));
+        out.push_str(&format!("\"reads\":{},", self.reads));
+        out.push_str(&format!("\"deferred\":{},", self.deferred));
+        out.push_str(&format!("\"has_findings\":{},", self.has_findings()));
+        out.push_str("\"records\":[");
+        out.push_str(
+            &self
+                .records
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{{\"object\":{},\"path\":{},\"outcome\":{},\"detail\":{}}}",
+                        json_string(&record.object),
+                        json_string(&record.path.display().to_string()),
+                        json_string(record.outcome.kind()),
+                        reconcile_detail(&record.outcome)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push_str("]}");
+        out
+    }
+}
+
+/// The extra detail a reconcile outcome carries, as a JSON string or `null` when the
+/// kind says it all.
+fn reconcile_detail(outcome: &ReconcileOutcome) -> String {
+    use crate::events::json_string;
+    match outcome {
+        ReconcileOutcome::Conflict { detail }
+        | ReconcileOutcome::NoSource { detail }
+        | ReconcileOutcome::Malformed { detail }
+        | ReconcileOutcome::Failed { detail }
+        | ReconcileOutcome::NoRoom { detail }
+        | ReconcileOutcome::Deferred { detail } => json_string(detail),
+        _ => "null".to_string(),
+    }
 }
 
 /// The total bytes one reconcile pass may read, or `None` for unlimited.

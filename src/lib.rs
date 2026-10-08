@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod digest;
 pub mod disk_management;
 pub mod envelope;
+pub mod events;
 pub mod explain;
 // The FUSE namespace provider (issue #42). Unix-only: it is the only module that
 // links `fuser`, and the only path into it is the `mount` subcommand, so a build on a
@@ -66,6 +67,7 @@ pub use disk_management::{
     allocated_bytes, available_space, destination_with_room, last_use, list_files_recursive,
     move_file_with_symlink, AccessSource, DiskError, FileEntry, MoveOutcome,
 };
+pub use events::{append, append_to, events_path, read_events, EVENTS_NAME, EVENTS_SEGMENT_NAME};
 pub use explain::{
     explain, explain_with, CatalogAnswer, ExplainContext, Explanation, GuardsReport, PolicyReport,
     RuleReport, ScopeReport, Verdict as ExplainVerdict,

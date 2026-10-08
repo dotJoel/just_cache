@@ -866,6 +866,60 @@ impl SyncReport {
         }
         lines
     }
+
+    /// The sync report as a self-contained JSON document (#169), hand-rolled like every
+    /// other `--json` in this tool, and independent of verbosity.
+    pub fn to_json(&self) -> String {
+        let mut out = String::from("{");
+        out.push_str(&format!(
+            "\"catalog\":{},",
+            crate::events::json_string(&self.catalog.display().to_string())
+        ));
+        out.push_str(&format!(
+            "\"watch\":{},",
+            crate::events::json_string(&self.watch.display().to_string())
+        ));
+        out.push_str("\"dests\":[");
+        out.push_str(
+            &self
+                .dests
+                .iter()
+                .map(|dest| crate::events::json_string(&dest.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push_str("],");
+        out.push_str(&format!("\"objects\":{},", self.objects));
+        out.push_str(&format!("\"names\":{},", self.names));
+        out.push_str(&format!("\"locations\":{},", self.locations));
+        out.push_str(&format!("\"objects_ingested\":{},", self.objects_ingested));
+        out.push_str(&format!("\"names_ingested\":{},", self.names_ingested));
+        out.push_str(&format!(
+            "\"locations_ingested\":{},",
+            self.locations_ingested
+        ));
+        out.push_str(&format!("\"hashed\":{},", self.hashed));
+        out.push_str(&format!("\"trusted\":{},", self.trusted));
+        out.push_str(&format!("\"has_differences\":{},", self.has_differences()));
+        out.push_str("\"differences\":[");
+        out.push_str(
+            &self
+                .differences
+                .iter()
+                .map(|difference| {
+                    format!(
+                        "{{\"kind\":{},\"path\":{},\"detail\":{}}}",
+                        crate::events::json_string(difference.kind.as_str()),
+                        crate::events::json_string(&difference.path.display().to_string()),
+                        crate::events::json_string(&difference.detail)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push_str("]}");
+        out
+    }
 }
 
 /// One difference a resolution pass concluded about, and — unless the pass was report-only —
