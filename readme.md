@@ -31,6 +31,10 @@ and [`catalog resolve ...`](#the-catalog) concludes the differences it reports,
 the catalog, [`reconcile ...`](#reconciling-a-re-added-disk) rebuilds copies a
 re-added disk is missing, and [`mount ...`](#mounting-the-namespace) serves the namespace
 as a real filesystem so a consumer that does not follow symlinks still sees bytes.
+[`tiers ...`](#reading-the-tier-configuration-back) prints the tier configuration and what
+the catalog records per tier, [`catalog pending ...`](#deleting-an-object) lists the
+releases a delete still owes, and `schedule`/`volume list`/`tiers`/`catalog pending` all
+accept `--json` for the documents the dashboard reads.
 
 ## Contents
 
@@ -583,6 +587,10 @@ just_cache catalog delete shows/old.mkv \
   so the deferred location is named as the delete reports.
 - **It is auditable.** The name is gone from `audit` and `locate`, and no orphan copy is left
   counted as good. Bytes that no delete reaches are left for `gc`.
+- **The deferred releases are listed on demand.** `catalog pending` reads the
+  `pending_removal` rows back — per row, the path, kind, tier and storage key — as text or
+  `--json` (#171), so the dashboard's pending view shows what a browser would ask for
+  without a second schema. It reports and resolves nothing.
 
 Through the mount, `unlink` and `rmdir` perform the same transition instead of answering
 `EROFS` (see [Mounting the namespace](#mounting-the-namespace)).
@@ -1143,14 +1151,80 @@ see:
 - `/api/locate?query=<path or digest>` — every recorded copy and its tier (`locate --json`)
 - `/api/pins` — every recorded pin (`pin --list`)
 - `/api/volumes` — the vault ledger (`volume list --json`)
-- `/api/schedule` — the next planned pass (`schedule`)
+- `/api/schedule` — the next planned pass (`schedule --json`)
+- `/api/pending` — the releases a committed delete still owes an unlink (`catalog pending
+  --json`)
+- `/api/tiers` — the tier configuration and the counts the catalog records per tier
+  (`tiers --json`; this route answers only when the server was started with `--tiers`)
 - `/api/events` — server-sent events, one per appended maintenance report (#169)
 - `/api/surface` — which routes this invocation can answer
 
-A command that has no `--json` printer (`pin --list`, `schedule`) is wrapped as
-`{"text": ...}`, never recomputed. A missing catalog answers with the command's own refusal
-(`{"error": ...}`), not a stack trace. This PR ships no route that moves, repairs, deletes or
-pins anything; mutating actions are #172.
+A command that has no `--json` printer (`pin --list`) is wrapped as `{"text": ...}`, never
+recomputed. A missing catalog answers with the command's own refusal (`{"error": ...}`), not
+a stack trace. This PR ships no route that moves, repairs, deletes or pins anything; mutating
+actions are #172.
+
+### The views (#171)
+
+The page renders five views, each a rendering of one of those documents — the page adds no
+number it did not fetch. **Tier map**: a card per tier from `/api/tiers` — kind, recall
+class, volatility, cost when the document carries one — with the catalog-recorded
+`locations` shown as a gauge against the recorded copy floor (`copies`), the two numbers
+printed as they are and no verdict computed in between; a tier with pending removals is
+highlighted and lists its paths from `/api/pending`; an offline tier shows its
+volume-ledger rows (`/api/volumes`) and the document's `insert_prompts` as the prompt they
+are. **Live activity**: the events `/api/events` actually delivers are kept in a feed and
+light up the tier card the event's paths fall under — nothing happening means the map is
+still; there is no ambient animation, because the feed shows real events only. **Audit**:
+findings from `/api/audit` grouped by classification with the document's own counts, each
+group drillable to its paths, and the catalog-only summary (`/api/catalog`) with its
+`unchecked` list shown as what it is — the findings that cannot be made without the tree —
+and its scrub summary as recorded. **Explain on click**: a path in the map or the findings
+opens `/api/explain?path=` in a panel presenting the document's own sections (`scope`,
+`guards`, `policy`, `verdict`, plus its `catalog` block), with a raw-JSON toggle. **Schedule**:
+each pass from `/api/schedule` with its cadence, next run, rate and free-space floor, and
+its last-run state.
+
+Empty states come from the documents, not a guessed default: no `tiers.toml`, no
+`schedule.toml`, an empty catalog, a server started without `--tiers` — each renders the
+`configured`/`error` field the route answered with, naming what is missing. The
+raw-document escape hatch stays: every route in `/api/surface` is still reachable as its
+JSON verbatim, so a viewer can always see the document a view is a rendering of. What is
+not tested: the page's JavaScript — the SSE-driven animation and the drill-downs are
+browser behaviour no HTTP-level test can reach — so the tests pin the served shell (its
+scaffolding, its empty-state wording, that it references only routes the surface serves)
+and the documents behind the views.
+
+## Reading the tier configuration back
+
+`just_cache tiers` prints what `tiers.toml` describes — the same lines `audit` and `locate`
+quote, one per tier and per cache overlay — so the dashboard's tier map is drawn from a
+document, not from a second parse of the file:
+
+```sh
+just_cache tiers --tiers /mnt/cache/media/tiers.toml \
+                 --catalog /mnt/cache/media/.just_cache-catalog.sqlite
+# tiers: 2 configured
+#   cold: kind=fs path=/mnt/disk2/cold volatility=persistent recall=s copies=1 locations=2 damaged=1 pending_removals=0
+# caches: 1 configured (ephemeral overlays, never data of record)
+#   ram: over=cold kind=ram path=/dev/shm/jc max_size=4 GiB promote_on=2 accesses / 24h ...
+
+just_cache tiers --tiers ... --catalog ... --json
+```
+
+The report is read-only and invents nothing:
+
+- **With no `tiers.toml`** the default (beside `--catalog`) is named as missing and the
+  command exits `0` — an empty state, not an error, because nothing is configured.
+- **With a catalog named, each tier also carries the counts the catalog itself records**:
+  `locations` (location rows on that tier), `damaged` (locations a scrub marked), and
+  `pending_removals` (releases a delete deferred until the tier returns). No policy on top —
+  a floor or a health verdict is nobody's to compute here, and without a catalog the counts
+  are not printed at all: a number must be traceable to a document.
+- **An offline tier whose volumes are out of the drive carries the insert prompt** — the
+  same text a read of an offloaded object serves, verbatim, per volume the recorded
+  locations name that is not the one mounted. The dashboard shows the prompt, not a generic
+  error.
 
 ## Scheduling the maintenance passes
 
@@ -1191,6 +1265,10 @@ What the contract is:
   prints its report once and exits `1` (the same code a manual pass uses); a clean pass prints
   nothing. With no `schedule.toml`, nothing runs and the command says so.
 - **`--run --dry-run` changes nothing** and does not record the run, so the pass stays due.
+- **`--json` prints the same report as a document** (#171): per pass, its cadence in human
+  and exact form, whether it is due, its last and next run, the rate and free-space floor,
+  and the roots currently holding it back — the values `report_schedule` prints, in one
+  object, so the dashboard's schedule view reads the CLI's own document.
 - **Last-run times live in `.just_cache-schedule.state` beside the catalog.** It is internal
   bookkeeping under the `.just_cache` prefix the walk skips; the config file itself is never
   created, and an explicitly named `--config` that is missing is an error.

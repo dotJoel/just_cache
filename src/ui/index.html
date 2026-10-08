@@ -38,6 +38,43 @@
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
   .hidden { display: none; }
   .hint { color: #7d879c; font-size: 12px; }
+  /* The five views (#171). */
+  .empty { padding: 18px; border: 1px dashed var(--line); border-radius: 6px;
+           color: #7d879c; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+           gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+          padding: 12px 14px; }
+  .card.lit { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .card.pending-removals { border-color: var(--warn); }
+  .card h3 { margin: 0 0 6px; font-size: 14px; color: var(--accent); }
+  .kv { margin: 2px 0; font-size: 13px; }
+  .kv b { color: #7d879c; font-weight: 400; }
+  .gauge { height: 8px; background: #1b1f27; border: 1px solid var(--line);
+           border-radius: 4px; margin: 6px 0; overflow: hidden; }
+  .gauge div { height: 100%; background: var(--accent); }
+  .card.offline .gauge div { background: var(--warn); }
+  .paths { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+  .paths li { margin: 2px 0; }
+  .clickable { color: var(--accent); cursor: pointer; text-decoration: underline;
+               text-underline-offset: 2px; }
+  .clickable:hover { color: var(--fg); }
+  .prompt { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid var(--warn);
+            background: #1b1f27; border-radius: 4px; font-size: 13px; }
+  .feed { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  .feed li { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .feed .pass { color: var(--accent); }
+  .group { margin: 8px 0; }
+  .group > button { display: inline-block; min-width: 260px; text-align: left; }
+  .group .paths { display: none; }
+  .group.open .paths { display: block; }
+  #explain-panel { position: fixed; inset: 0; background: rgba(0,0,0,.6);
+                   display: flex; align-items: center; justify-content: center; }
+  #explain-panel .sheet { background: var(--bg); border: 1px solid var(--line);
+                          border-radius: 8px; padding: 18px; width: min(720px, 92vw);
+                          max-height: 85vh; overflow: auto; }
+  #explain-panel h3 { margin: 14px 0 4px; font-size: 13px; color: var(--accent); }
+  #explain-panel .verdict { border-left: 3px solid var(--ok); padding-left: 10px; }
 </style>
 </head>
 <body>
@@ -50,31 +87,63 @@
       <button id="save">use</button>
     </div>
     <p class="hint">Held in this tab only. Sent as an
-      <code>Authorization: Bearer</code> header, never in a URL.</p>
+      <code>Authorization</code> header, never in a URL.</p>
     <h2>Views</h2>
+    <nav id="views-nav">
+      <button id="view-tiers">tier map</button>
+      <button id="view-activity">live activity</button>
+      <button id="view-audit">audit</button>
+      <button id="view-schedule">schedule</button>
+    </nav>
+    <h2>Raw documents</h2>
     <nav id="nav"></nav>
   </aside>
   <section>
     <div class="status" id="status"></div>
-    <pre id="output">Set a token, then choose a view.</pre>
+    <div id="view"></div>
+    <div id="raw" class="hidden">
+      <pre id="output">Set a token, then choose a view.</pre>
+    </div>
     <div class="events">
       <h2>Maintenance events <span class="hint" id="stream-state">(disconnected)</span></h2>
       <pre id="events">—</pre>
     </div>
   </section>
 </main>
+<div id="explain-panel" class="hidden">
+  <div class="sheet">
+    <div class="row">
+      <h2 style="margin:0">Why this path</h2>
+      <button id="explain-close" style="justify-self:end">close</button>
+    </div>
+    <div id="explain-body"></div>
+  </div>
+</div>
 <script>
 (function () {
   "use strict";
   var TOKEN_KEY = "just_cache.ui.token";
+  // The routes the views fetch. Every one is a route in /api/surface — the page never
+  // invents an endpoint; the raw-documents nav is built from that surface document itself.
+  var ROUTES = ["/api/surface", "/api/audit", "/api/catalog", "/api/explain", "/api/locate",
+                "/api/pins", "/api/volumes", "/api/schedule", "/api/pending", "/api/tiers",
+                "/api/events"];
+  // Passes whose events animate the map (issue #171: real events only).
+  var ANIMATED = ["sweep", "scrub", "reconcile", "gc", "audit", "catalog-sync"];
   var nav = document.getElementById("nav");
+  var view = document.getElementById("view");
+  var raw = document.getElementById("raw");
   var output = document.getElementById("output");
   var status = document.getElementById("status");
   var events = document.getElementById("events");
   var tokenInput = document.getElementById("token");
   var streamState = document.getElementById("stream-state");
+  var explainPanel = document.getElementById("explain-panel");
+  var explainBody = document.getElementById("explain-body");
   var streamController = null;
   var promptFor = null;
+  var feed = [];          // the real events as they arrived, newest first
+  var lastTiers = null;   // the /api/tiers document the tier map was drawn from
 
   function token() {
     var value = sessionStorage.getItem(TOKEN_KEY) || "";
@@ -90,14 +159,19 @@
     return { "Authorization": "Bearer " + token() };
   }
 
-  function render(path, name) {
+  function esc(text) {
+    var div = document.createElement("div");
+    div.textContent = String(text);
+    return div.innerHTML;
+  }
+
+  function fetchDocument(path, name, done) {
     if (!token()) { setStatus("set a token first", "bad"); return; }
     setStatus("loading " + name + "...");
     fetch(path, { headers: authHeaders() })
       .then(function (response) {
         if (response.status === 401) {
           setStatus("401 — the token was refused", "bad");
-          output.textContent = "unauthorized";
           return null;
         }
         return response.text();
@@ -105,10 +179,424 @@
       .then(function (text) {
         if (text === null) { return; }
         setStatus(name + " — HTTP 200", "ok");
-        try { output.textContent = JSON.stringify(JSON.parse(text), null, 2); }
-        catch (err) { output.textContent = text; }
+        var document_ = null;
+        try { document_ = JSON.parse(text); } catch (err) { /* not JSON; carried as text */ }
+        done(document_, text);
       })
       .catch(function (err) { setStatus("request failed: " + err, "bad"); });
+  }
+
+  // A route answers 200 with either the command's document or its refusal; the view
+  // renders whichever the body carries, never something it made up.
+  function refused(document_) {
+    return document_ && typeof document_ === "object" && document_.error;
+  }
+
+  function emptyState(message) {
+    return '<div class="empty">' + esc(message) + "</div>";
+  }
+
+  // ---- Raw documents: the escape hatch. Every surface route shows its JSON verbatim. ----
+
+  function render(path, name) {
+    if (!token()) { setStatus("set a token first", "bad"); return; }
+    raw.classList.remove("hidden");
+    view.classList.add("hidden");
+    fetchDocument(path, name, function (document_, text) {
+      if (document_ === null) { output.textContent = "unauthorized"; return; }
+      output.textContent = document_ !== null
+        ? JSON.stringify(document_, null, 2)
+        : text;
+    });
+  }
+
+  // ---- Tier map: cards per tier, from /api/tiers. ----
+
+  function showView(which) {
+    view.classList.remove("hidden");
+    raw.classList.add("hidden");
+    if (which === "tiers") { drawTiers(); }
+    if (which === "audit") { drawAudit(); }
+    if (which === "schedule") { drawSchedule(); }
+    if (which === "activity") { drawActivity(); }
+  }
+
+  function kv(label, value) {
+    return '<div class="kv"><b>' + esc(label) + ":</b> " +
+      (value === null || value === undefined || value === ""
+        ? '<span class="hint">not reported</span>'
+        : esc(value)) +
+      "</div>";
+  }
+
+  function drawTiers() {
+    fetchDocument("/api/tiers", "tier map", function (document_) {
+      if (document_ === null) { view.innerHTML = emptyState("unauthorized"); return; }
+      if (refused(document_)) {
+        view.innerHTML = emptyState(
+          "the tier map is not served: the document says: " + document_.error);
+        return;
+      }
+      if (!document_.configured) {
+        view.innerHTML = emptyState(
+          'no tier map is configured — the document records "configured": false' +
+          (document_.config ? " for " + document_.config : ""));
+        return;
+      }
+      if (!document_.tiers.length) {
+        view.innerHTML = emptyState(
+          'the configuration names no tiers — the document records "tiers": []');
+        return;
+      }
+      var html = '<div class="cards" id="tier-cards">';
+      document_.tiers.forEach(function (tier) {
+        var offline = tier.kind === "offline";
+        html += '<div class="card' + (offline ? " offline" : "") +
+          (tier.pending_removals > 0 ? " pending-removals" : "") +
+          '" data-tier="' + esc(tier.name) + '">';
+        html += "<h3>" + esc(tier.name) + "</h3>";
+        html += kv("kind", tier.kind);
+        html += kv("recall class", tier.recall);
+        html += kv("volatility", tier.volatility);
+        html += kv("cost", tier.cost === undefined ? null : tier.cost);
+        html += kv("path", tier.path);
+        if (offline && tier.vaults) {
+          html += kv("vaults", tier.vaults.join(", "));
+        }
+        // The gauge shows the two documented numbers — the recorded copy floor and the
+        // catalog-recorded locations — as a proportion; no verdict is computed here.
+        if (tier.locations !== undefined) {
+          html += '<div class="kv"><b>locations:</b> ' + esc(tier.locations) +
+            " against the recorded copy floor of " + esc(tier.copies) + "</div>";
+          if (tier.copies > 0) {
+            var width = Math.min(100, (tier.locations / tier.copies) * 100);
+            html += '<div class="gauge"><div style="width:' + width + '%"></div></div>';
+          }
+          html += kv("damaged", tier.damaged);
+          if (tier.pending_removals > 0) {
+            html += '<div class="kv" style="color:var(--warn)"><b>pending removals:</b> ' +
+              esc(tier.pending_removals) + "</div>";
+          } else {
+            html += kv("pending removals", tier.pending_removals);
+          }
+        } else {
+          html += '<div class="kv"><span class="hint">no catalog is configured, so the ' +
+            "catalog-recorded counts are not reported</span></div>";
+        }
+        if (offline && tier.insert_prompts && tier.insert_prompts.length) {
+          tier.insert_prompts.forEach(function (prompt) {
+            html += '<div class="prompt">' + esc(prompt) + "</div>";
+          });
+        }
+        html += "</div>";
+      });
+      html += "</div>";
+      view.innerHTML = html;
+      lastTiers = document_;
+      attachPendingPaths();
+      attachOfflineLedger(document_);
+    });
+  }
+
+  // A tier with pending removals lists the paths, from /api/pending — the document the
+  // `catalog pending` command prints — filtered to the tier the row names.
+  function attachPendingPaths() {
+    fetchDocument("/api/pending", "pending removals", function (pending) {
+      if (pending === null || refused(pending) || !pending.rows) { return; }
+      pending.rows.forEach(function (row) {
+        var card = view.querySelector('.card[data-tier="' + CSS.escape(row.tier) + '"]');
+        if (!card) { return; }
+        var list = card.querySelector(".paths") || card.appendChild(
+          document.createElement("ul"));
+        list.className = "paths";
+        var item = document.createElement("li");
+        item.innerHTML = '<span class="clickable" data-explain-path="' +
+          esc(row.path) + '">' + esc(row.path) + "</span>";
+        list.appendChild(item);
+      });
+      wireExplainClicks();
+    });
+  }
+
+  // An offline tier shows the volume-ledger rows that name it, from /api/volumes
+  // (`volume list --json`), as recorded — the page adds nothing.
+  function attachOfflineLedger(document_) {
+    var offline = document_.tiers.filter(function (tier) {
+      return tier.kind === "offline";
+    });
+    if (!offline.length) { return; }
+    fetchDocument("/api/volumes", "volume ledger", function (ledger) {
+      if (ledger === null || refused(ledger) || !ledger.length) {
+        offline.forEach(function (tier) {
+          var card = view.querySelector('.card[data-tier="' + CSS.escape(tier.name) + '"]');
+          if (card && !card.querySelector(".ledger")) {
+            var div = document.createElement("div");
+            div.className = "kv ledger";
+            div.innerHTML = '<span class="hint">no volume-ledger rows are recorded for ' +
+              "this tier</span>";
+            card.appendChild(div);
+          }
+        });
+        return;
+      }
+      ledger.forEach(function (row) {
+        var card = view.querySelector('.card[data-tier="' + CSS.escape(row.tier) + '"]');
+        if (!card) { return; }
+        var div = document.createElement("pre");
+        div.className = "ledger";
+        div.style.maxHeight = "10em";
+        div.textContent = JSON.stringify(row, null, 2);
+        card.appendChild(div);
+      });
+    });
+  }
+
+  // ---- Audit view: /api/audit (the walk) and /api/catalog (catalog-only). ----
+
+  function drawAudit() {
+    fetchDocument("/api/audit", "audit", function (audit) {
+      if (audit === null) { view.innerHTML = emptyState("unauthorized"); return; }
+      if (refused(audit)) {
+        view.innerHTML = emptyState(
+          "the audit is not served: the document says: " + audit.error);
+        return;
+      }
+      var html = '<div class="kv"><b>scanned:</b> ' + esc(audit.scanned) +
+        " &nbsp; <b>healthy:</b> " + esc(audit.healthy) + "</div>";
+      var counts = audit.counts || {};
+      var kinds = Object.keys(counts);
+      if (!kinds.length) {
+        html += emptyState('the document records no findings counts ("counts": {})');
+      }
+      // Findings grouped by classification, from the document's own counts; each group
+      // drills down to the paths in the findings list. A count with no findings carries
+      // none — the page does not fill one in.
+      kinds.forEach(function (kind) {
+        var paths = (audit.findings || []).filter(function (finding) {
+          return finding.kind === kind;
+        });
+        html += '<div class="group" data-kind="' + esc(kind) + '">';
+        html += "<button>" + esc(kind) + ": " + esc(counts[kind]) + "</button>";
+        if (paths.length) {
+          html += '<ul class="paths">';
+          paths.forEach(function (finding) {
+            var shown = finding.relative || finding.path;
+            html += '<li><span class="clickable" data-explain-path="' +
+              esc(finding.relative || finding.path) + '">' + esc(shown) + "</span></li>";
+          });
+          html += "</ul>";
+        } else {
+          html += '<ul class="paths"><li><span class="hint">no paths are listed for ' +
+            "this classification in the findings</span></li></ul>";
+        }
+        html += "</div>";
+      });
+      // The catalog-only summary: `audit --no-filesystem`. Its `unchecked` list is what it
+      // is — the findings that cannot be made without the tree — and its scrub summary is
+      // rendered as recorded.
+      var nofs = audit["no-filesystem"];
+      if (nofs) {
+        html += "<h2>Catalog-only summary</h2>";
+        html += kv("objects", nofs.objects) + kv("names", nofs.names) +
+          kv("locations", nofs.locations) + kv("damaged", nofs.damaged);
+        if (nofs.scrub) {
+          html += '<div class="kv"><b>scrub:</b> ' +
+            esc(nofs.scrub.locations) + " location(s), " +
+            esc(nofs.scrub.verified) + " verified, " +
+            esc(nofs.scrub["never-scrubbed"]) + " never scrubbed, " +
+            esc(nofs.scrub.damaged) + " damaged</div>";
+        }
+        if (nofs.unchecked && nofs.unchecked.length) {
+          html += '<div class="kv"><b>not checked without the filesystem:</b> ' +
+            esc(nofs.unchecked.join(", ")) + "</div>";
+        }
+      }
+      view.innerHTML = html;
+      wireGroups();
+      wireExplainClicks();
+    });
+  }
+
+  function wireGroups() {
+    view.querySelectorAll(".group > button").forEach(function (button) {
+      button.addEventListener("click", function () {
+        button.parentElement.classList.toggle("open");
+      });
+    });
+  }
+
+  // ---- Schedule view: /api/schedule, one card per pass. ----
+
+  function drawSchedule() {
+    fetchDocument("/api/schedule", "schedule", function (document_) {
+      if (document_ === null) { view.innerHTML = emptyState("unauthorized"); return; }
+      if (refused(document_)) {
+        view.innerHTML = emptyState(
+          "the schedule is not served: the document says: " + document_.error);
+        return;
+      }
+      if (!document_.configured) {
+        view.innerHTML = emptyState(
+          'no schedule is configured — the document records "configured": false' +
+          (document_.config ? " for " + document_.config : ""));
+        return;
+      }
+      if (!document_.passes.length) {
+        view.innerHTML = emptyState(
+          'the schedule names no passes — the document records "passes": []');
+        return;
+      }
+      var html = '<div class="cards">';
+      document_.passes.forEach(function (pass) {
+        html += '<div class="card"><h3>' + esc(pass.pass) + "</h3>";
+        html += kv("cadence", "every " + pass.every);
+        html += kv("next run", pass.next_run);
+        html += kv("last run", pass.last_run === null ? "never recorded" : pass.last_run);
+        html += kv("rate",
+          pass.rate_kib_per_sec === null || pass.rate_kib_per_sec === undefined
+            ? null : pass.rate_kib_per_sec + " KiB/s");
+        html += kv("free-space floor",
+          pass.min_free_gb === null || pass.min_free_gb === undefined
+            ? null : pass.min_free_gb + " GB");
+        html += kv("due now", pass.due ? "yes" : "no");
+        if (pass.held_back_by && pass.held_back_by.length) {
+          html += kv("held back by", pass.held_back_by.join("; "));
+        }
+        html += "</div>";
+      });
+      html += "</div>";
+      view.innerHTML = html;
+    });
+  }
+
+  // ---- Live activity: the events the stream actually delivered, newest first, and the
+  // flash on the tier card an event names. Nothing arrives, nothing moves. ----
+
+  function drawActivity() {
+    var html = '<ul class="feed" id="activity-feed">';
+    if (!feed.length) {
+      html += '<li><span class="hint">no maintenance events have arrived — the map is ' +
+        "still until a pass appends one</span></li>";
+    }
+    feed.forEach(function (event_) {
+      html += "<li>";
+      html += '<span class="pass">' + esc(event_.pass) + "</span> ";
+      html += '<span class="hint">' + esc(event_.time || "") + "</span>";
+      (event_.paths || []).forEach(function (path) {
+        html += '<div class="paths"><span class="clickable" data-explain-path="' +
+          esc(path) + '">' + esc(path) + "</span></div>";
+      });
+      html += "</li>";
+    });
+    html += "</ul>";
+    view.innerHTML = html;
+    wireExplainClicks();
+  }
+
+  function eventPaths(report) {
+    var paths = [];
+    function push(value) {
+      if (typeof value === "string" && paths.indexOf(value) < 0) { paths.push(value); }
+    }
+    if (!report || typeof report !== "object") { return paths; }
+    push(report.path);
+    (report.findings || []).forEach(function (finding) {
+      push(finding.path); push(finding.relative);
+    });
+    (report.differences || []).forEach(function (difference) {
+      push(difference.path); push(difference.relative);
+    });
+    return paths;
+  }
+
+  // A real event lights the tier card whose recorded path is a prefix of a path the event
+  // names. When no event names a tier, no card lights.
+  function lightTiers(paths) {
+    if (!lastTiers || !paths.length) { return; }
+    lastTiers.tiers.forEach(function (tier) {
+      var named = paths.some(function (path) {
+        return tier.path && (path === tier.path || path.indexOf(tier.path + "/") === 0);
+      });
+      if (!named) { return; }
+      var card = view.querySelector('.card[data-tier="' + CSS.escape(tier.name) + '"]');
+      if (!card) { return; }
+      card.classList.add("lit");
+      setTimeout(function () { card.classList.remove("lit"); }, 2000);
+    });
+  }
+
+  function onEvent(line) {
+    var event_;
+    try { event_ = JSON.parse(line); } catch (err) { return; }
+    if (ANIMATED.indexOf(event_.pass) < 0) { return; }
+    var paths = eventPaths(event_.report);
+    feed.unshift({ pass: event_.pass, time: event_.time, paths: paths });
+    if (feed.length > 200) { feed = feed.slice(0, 200); }
+    lightTiers(paths);
+    if (!view.classList.contains("hidden") &&
+        document.getElementById("activity-feed")) {
+      drawActivity();
+    }
+  }
+
+  // ---- Explain on click: the four-gate verdict, as the document prints it. ----
+
+  function explain(path) {
+    explainPanel.classList.remove("hidden");
+    explainBody.innerHTML = "<p>loading…</p>";
+    fetchDocument("/api/explain?path=" + encodeURIComponent(path), "explain",
+      function (document_) {
+        if (document_ === null) {
+          explainBody.innerHTML = emptyState("unauthorized");
+          return;
+        }
+        if (refused(document_)) {
+          explainBody.innerHTML = emptyState("the document says: " + document_.error);
+          return;
+        }
+        var html = '<div class="kv"><b>path:</b> ' + esc(document_.path) + "</div>";
+        ["scope", "guards", "policy", "verdict"].forEach(function (section) {
+          html += "<h3>" + esc(section) + "</h3>";
+          html += objectAsKv(document_[section], section === "verdict");
+        });
+        html += "<h3>rules</h3>" + objectAsKv(document_.rules, false);
+        html += "<h3>catalog</h3>" + objectAsKv(document_.catalog, false);
+        html += "<h3>raw JSON <button id=\"explain-raw\">show</button></h3>" +
+          '<pre id="explain-raw-json" class="hidden"></pre>';
+        explainBody.innerHTML = html;
+        var rawJson = explainBody.querySelector("#explain-raw-json");
+        rawJson.textContent = JSON.stringify(document_, null, 2);
+        explainBody.querySelector("#explain-raw").addEventListener("click",
+          function () {
+            rawJson.classList.toggle("hidden");
+            this.textContent = rawJson.classList.contains("hidden") ? "show" : "hide";
+          });
+      });
+  }
+
+  function objectAsKv(object, emphasis) {
+    if (!object || typeof object !== "object") {
+      return '<div class="kv"><span class="hint">not reported</span></div>';
+    }
+    var html = emphasis ? '<div class="verdict">' : "<div>";
+    Object.keys(object).forEach(function (key) {
+      var value = object[key];
+      if (value !== null && typeof value === "object") {
+        html += '<div class="kv"><b>' + esc(key) + ":</b> " +
+          esc(JSON.stringify(value)) + "</div>";
+      } else {
+        html += kv(key, value);
+      }
+    });
+    return html + "</div>";
+  }
+
+  function wireExplainClicks() {
+    view.querySelectorAll("[data-explain-path]").forEach(function (element) {
+      element.addEventListener("click", function () {
+        explain(element.getAttribute("data-explain-path"));
+      });
+    });
   }
 
   function connectStream() {
@@ -136,8 +624,10 @@
             buffer = parts.pop();
             parts.forEach(function (part) {
               if (part.indexOf("data: ") === 0) {
-                lines.push(part.slice(6));
+                var line = part.slice(6);
+                lines.push(line);
                 if (lines.length > 200) { lines = lines.slice(-200); }
+                onEvent(line);
               }
             });
             events.textContent = lines.length ? lines.slice().reverse().join("\n") : "—";
@@ -174,8 +664,8 @@
             var path = route.path;
             if (route.name === "explain" || route.name === "locate") {
               var key = route.name === "explain" ? "path" : "query";
-              var value = promptFor ? promptFor : null;
-              value = window.prompt(key + " (namespace path or digest)", value || "");
+              var value = window.prompt(key + " (namespace path or digest)",
+                promptFor || "");
               if (value === null || value === "") { return; }
               promptFor = value;
               path += "?" + key + "=" + encodeURIComponent(value);
@@ -190,6 +680,17 @@
   document.getElementById("save").addEventListener("click", applyToken);
   tokenInput.addEventListener("keydown", function (event) {
     if (event.key === "Enter") { applyToken(); }
+  });
+  document.getElementById("view-tiers").addEventListener("click",
+    function () { showView("tiers"); });
+  document.getElementById("view-activity").addEventListener("click",
+    function () { showView("activity"); });
+  document.getElementById("view-audit").addEventListener("click",
+    function () { showView("audit"); });
+  document.getElementById("view-schedule").addEventListener("click",
+    function () { showView("schedule"); });
+  document.getElementById("explain-close").addEventListener("click", function () {
+    explainPanel.classList.add("hidden");
   });
 
   if (token()) {

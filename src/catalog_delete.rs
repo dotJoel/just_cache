@@ -142,8 +142,25 @@ struct PendingRow {
     storage_key: Option<String>,
 }
 
-/// A `pending_removal` row as read back: `(path, object, size, kind, tier, storage_key)`.
+/// One `pending_removal` row as read back: `(path, object, size, kind, tier, storage_key)`.
 type PendingRecord = (String, Vec<u8>, i64, String, Option<String>, Option<String>);
+
+/// One intent a committed delete still owes, as `catalog pending` reports it (#171).
+/// Read-only: the row is printed, not resolved or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRemoval {
+    /// The path to unlink, or the `<tier>/<key>` surrogate for an offline copy whose
+    /// mount is not knowable yet — exactly as recorded, never recomputed.
+    pub path: PathBuf,
+    /// The released size in bytes.
+    pub size: i64,
+    /// `bytes` (a regular file) or `link` (the symlink a migrated name was).
+    pub kind: String,
+    /// The released location's tier, when it is one (`None` for a name symlink).
+    pub tier: Option<String>,
+    /// The released location's storage key, when it is one.
+    pub storage_key: Option<String>,
+}
 
 /// Where a recorded `(tier, storage_key)` resolves to, or why it cannot be finished yet.
 enum Released {
@@ -505,6 +522,29 @@ impl Catalog {
         let mut out = Vec::new();
         for row in rows {
             out.push(PathBuf::from(row?));
+        }
+        Ok(out)
+    }
+
+    /// Every `pending_removal` row as read back, ordered by path — the document behind
+    /// `catalog pending` (issue #171): a report of intents the tool still owes, never a
+    /// guess at what a delete left. Nothing here resolves or removes anything.
+    pub fn pending_removal_rows(&self) -> Result<Vec<PendingRemoval>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, kind, tier, storage_key FROM pending_removal ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingRemoval {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                size: row.get(1)?,
+                kind: row.get(2)?,
+                tier: row.get(3)?,
+                storage_key: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }

@@ -66,7 +66,7 @@ use crate::tiers::TierSet;
 #[path = "catalog_delete.rs"]
 mod delete;
 use crate::disk_management::{self, DiskError};
-pub use delete::{DeleteError, DeleteOutcome, DeleteRefusal, RemovalOutcome};
+pub use delete::{DeleteError, DeleteOutcome, DeleteRefusal, PendingRemoval, RemovalOutcome};
 
 /// Name of the catalog inside (beside) the watched root. It shares the journal's
 /// `.just_cache` prefix so the walk skips it: the catalog must never become a move
@@ -345,6 +345,23 @@ impl VolumeRecord {
     pub fn is_mounted(&self) -> bool {
         self.state == VOLUME_MOUNTED
     }
+}
+
+/// Recorded counts for one tier (issue #171): what the catalog itself says about it.
+///
+/// Nothing here is policy — no floor arithmetic, no health judgement — because the tier-map
+/// view shows only numbers a document already carries. Each count is one `SELECT COUNT(*)`
+/// over the table that owns the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierCounts {
+    /// Location rows recorded on the tier: copies the catalog vouches for (or reports on).
+    pub locations: u64,
+    /// Locations on the tier a scrub marked damaged — still the only evidence of what the
+    /// bytes were (§9), and still owned by a human.
+    pub damaged: u64,
+    /// `pending_removal` rows recorded on the tier: files a committed delete released whose
+    /// removal is waiting for the tier to return (#144).
+    pub pending_removals: u64,
 }
 
 /// How a name or a location disagrees with what the catalog recorded.
@@ -2369,6 +2386,60 @@ impl Catalog {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// The recorded counts for one tier (`TierCounts`): location rows, damage marks and
+    /// pending-removal rows recorded under any of `tier_keys`. Read-only and policy-free
+    /// (§3): the tier-map view (#171) prints exactly these, so what a browser shows is
+    /// what a query against the catalog would say.
+    ///
+    /// The keys come in a set because the catalog already stores them two ways: a local
+    /// tier's locations are keyed on the canonical root path (what `catalog sync` sees),
+    /// while an offline export keys on the tier's configured name — callers pass both and
+    /// the counts are the union.
+    pub fn tier_counts(&self, tier_keys: &[String]) -> Result<TierCounts, CatalogError> {
+        let mut counts = TierCounts {
+            locations: 0,
+            damaged: 0,
+            pending_removals: 0,
+        };
+        for key in tier_keys {
+            let count = |table: &str| -> Result<u64, CatalogError> {
+                let sql = format!("SELECT COUNT(*) FROM {table} WHERE tier = ?1");
+                let found: i64 = self.conn.query_row(&sql, params![key], |row| row.get(0))?;
+                Ok(found.try_into().unwrap_or(0))
+            };
+            counts.locations += count("location")?;
+            counts.damaged += count("damage")?;
+            counts.pending_removals += count("pending_removal")?;
+        }
+        Ok(counts)
+    }
+
+    /// The volume ids an `offline` tier's recorded location keys name, sorted and
+    /// distinct. `tier_keys` is the same set [`Catalog::tier_counts`] reads (§3): an
+    /// offline export keys its locations on the tier's configured name, a sync on the
+    /// canonical root, so both are searched.
+    ///
+    /// This is what makes the insert prompt on the tier map (#171) traceable: the ids come
+    /// from the catalog's own `location` rows, and a key without a volume id names no
+    /// volume and is skipped, exactly as `catalog delete` refuses such a key rather than
+    /// guessing at it.
+    pub fn offline_volume_ids(&self, tier_keys: &[String]) -> Result<Vec<String>, CatalogError> {
+        use std::collections::BTreeSet;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT storage_key FROM location WHERE tier = ?1")?;
+        let mut ids = BTreeSet::new();
+        for key in tier_keys {
+            let rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Some((volume, _)) = crate::offline::parse_storage_key(&row?) {
+                    ids.insert(volume);
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
     }
 
     /// The volume recorded under `id`, if any.

@@ -128,6 +128,10 @@ enum Command {
     /// is in a tier's drive, and where the others are. The catalog is the source of truth
     /// for a volume's whereabouts — no marker file is ever written into the volume (#143).
     Volume(VolumeArgs),
+    /// Print the tier configuration as text or `--json` (issue #171): a read-only report
+    /// of what `tiers.toml` describes, plus, when a catalog is present, the counts the
+    /// catalog itself records per tier and the insert prompt an offline read would serve.
+    Tiers(TiersArgs),
     /// Serve the dashboard: a static shell embedded in the binary, read-only JSON views
     /// over the catalog-backed commands, and a live stream of the events file (#170).
     /// Read-only — no route moves, repairs, deletes or pins anything. Roots are chosen at
@@ -368,9 +372,32 @@ enum CatalogCommand {
     /// location row — is released in one committed transition before any byte is
     /// unlinked. An object with another name keeps its copies. Refuses, changing
     /// nothing, when the object is pinned or a copy is damaged; a copy on a tier that is
+    /// nothing, when the object is pinned or a copy is damaged; a copy on a tier that is
     /// not mounted now is *deferred* — recorded in `pending_removal` and finished when
     /// the tier returns (#144).
     Delete(CatalogDeleteArgs),
+    /// List the `pending_removal` rows: every release a committed delete still owes an
+    /// unlink, per file, waiting for the tier that holds it to return (#144, #171).
+    /// Read-only: it reports and resolves nothing.
+    Pending(CatalogPendingArgs),
+}
+
+/// Everything `catalog pending` needs. The same catalog resolution `volume list` uses:
+/// `--catalog` names a file that must exist; the default is the one beside `--watch`.
+#[derive(Debug, Args)]
+struct CatalogPendingArgs {
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// It must already exist; `catalog pending` never creates one.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// The watch root the default catalog is found beside.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    watch: PathBuf,
+
+    /// Print the rows as JSON rather than one line per pending removal.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Everything `catalog delete` needs. No `--dest`: the catalog already records every
@@ -838,6 +865,10 @@ struct ScheduleArgs {
     /// tests, and for asking what the next tick would do.
     #[arg(long, value_name = "UNIX_SECS")]
     now: Option<u64>,
+
+    /// Print the schedule as JSON rather than one line per pass.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Everything `mount` needs: the catalog to serve, the tiers its rows are proven
@@ -942,13 +973,15 @@ struct UiArgs {
     dest: Vec<PathBuf>,
 
     /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
-    /// Enables the `locate`, `pins`, `volumes` and `schedule` views; read only, never
-    /// created — a request against a missing catalog answers with the command's own
-    /// refusal.
+    /// Enables the `locate`, `pins`, `volumes`, `schedule` and `pending` views; read
+    /// only, never created — a request against a missing catalog answers with the
+    /// command's own refusal.
     #[arg(long, value_name = "FILE")]
     catalog: Option<PathBuf>,
 
     /// Tier configuration (`tiers.toml`), passed through to the commands that accept it.
+    /// Naming it enables the `tiers` view: the config is a root the server was given,
+    /// and a view must not read a config it was never pointed at.
     #[arg(long, value_name = "FILE")]
     tiers: Option<PathBuf>,
 
@@ -1062,6 +1095,281 @@ struct VolumeSetArgs {
     watch: PathBuf,
 }
 
+/// Everything `tiers` needs: the config to describe, and the catalog to answer counts
+/// from (issue #171). Read-only: it opens no walk, writes no row, and never creates
+/// either file.
+#[derive(Debug, Args)]
+struct TiersArgs {
+    /// Tier configuration (`tiers.toml`). An explicitly named file must exist; the
+    /// default is `tiers.toml` beside `--catalog` (or here, with no `--catalog`), read
+    /// only when it is already there — never created.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// The catalog to read the per-tier counts from (locations, damage marks and
+    /// pending removals). Read only, never created — the counts are what the catalog
+    /// itself records, no policy on top.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// Print the tiers as JSON rather than one line per tier.
+    #[arg(long)]
+    json: bool,
+}
+
+/// The catalog keys a configured tier's rows are recorded under: the tier's configured
+/// name, plus its canonical root path. A local tier's locations are keyed on the root
+/// (what `catalog sync` sees); an offline export keys on the name — so a count over the
+/// tier must read both (§3).
+fn tier_keys(tier: &just_cache::tiers::Tier) -> Vec<String> {
+    let mut keys = vec![tier.name.clone()];
+    let canonical = std::fs::canonicalize(&tier.path).unwrap_or_else(|_| tier.path.clone());
+    let canonical = canonical.to_string_lossy().into_owned();
+    if canonical != tier.name {
+        keys.push(canonical);
+    }
+    keys
+}
+
+/// The `tiers` subcommand (issue #171): what `tiers.toml` describes, printed as text or
+/// `--json`. With a catalog named, each tier also carries the counts the catalog itself
+/// records — locations, damage marks, pending removals — and an `offline` tier carries
+/// the insert prompt a read of its objects would serve, verbatim. Nothing is computed
+/// here beyond the counts; no policy, no health judgement, no invented number.
+fn run_tiers(args: TiersArgs) -> ExitCode {
+    if let Some(catalog_path) = &args.catalog {
+        if !catalog_path.is_file() {
+            eprintln!(
+                "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+                catalog_path.display()
+            );
+            return ExitCode::from(EXIT_USAGE);
+        }
+    }
+
+    // The default config is `tiers.toml` beside the catalog when one is named (the
+    // placement `schedule.toml` uses), otherwise beside the current directory. The same
+    // open-if-present rule everywhere else follows: a named file that is missing is an
+    // error, the default is read only when it is already there.
+    let base = match &args.catalog {
+        Some(path) => path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+        None => Path::new("."),
+    };
+    let tiers = match load_tiers(args.tiers.as_deref(), base) {
+        Ok(tiers) => tiers,
+        Err(message) => {
+            eprintln!("just_cache: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let config_path = args
+        .tiers
+        .clone()
+        .unwrap_or_else(|| TierSet::default_path(base));
+
+    let catalog = match args
+        .catalog
+        .as_deref()
+        .map(catalog::Catalog::open)
+        .transpose()
+    {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if args.json {
+        let document = match tiers_document(&config_path, tiers.as_ref(), catalog.as_ref()) {
+            Ok(document) => document,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("{document}");
+    } else {
+        match &tiers {
+            Some(tiers) => {
+                println!("tiers: {} configured", tiers.tiers().len());
+                for tier in tiers.tiers() {
+                    let mut line = format!("  {}", tier.describe());
+                    if let Some(catalog) = &catalog {
+                        let counts = match catalog.tier_counts(&tier_keys(tier)) {
+                            Ok(counts) => counts,
+                            Err(err) => {
+                                eprintln!("just_cache: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        line.push_str(&format!(
+                            " locations={} damaged={} pending_removals={}",
+                            counts.locations, counts.damaged, counts.pending_removals
+                        ));
+                    }
+                    println!("{line}");
+                    if let Some(catalog) = &catalog {
+                        if tier.offline_config.is_some() {
+                            match insert_prompts_for(tier, catalog) {
+                                Ok(prompts) => {
+                                    for prompt in prompts {
+                                        println!("    {prompt}");
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("just_cache: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !tiers.caches().is_empty() {
+                    println!(
+                        "caches: {} configured (ephemeral overlays, never data of record)",
+                        tiers.caches().len()
+                    );
+                    for cache in tiers.caches() {
+                        println!("  {}", cache.describe());
+                    }
+                }
+            }
+            None => println!(
+                "tiers: no tier config ({}); nothing is configured",
+                config_path.display()
+            ),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The insert prompts an offline tier's recorded locations would serve: the volume each
+/// needs, minus the one currently mounted. The prompts are the same strings `recall`
+/// prints, verbatim — the tier map (#171) shows the prompt, not a generic error.
+fn insert_prompts_for(
+    tier: &just_cache::tiers::Tier,
+    catalog: &catalog::Catalog,
+) -> Result<Vec<String>, catalog::CatalogError> {
+    let mounted = catalog.mounted_volume_for_tier(&tier.name)?;
+    let needed = catalog.offline_volume_ids(&tier_keys(tier))?;
+    let mounted_id = mounted.as_ref().map(|volume| volume.id.as_str());
+    Ok(needed
+        .iter()
+        .filter(|id| Some(id.as_str()) != mounted_id)
+        .map(|id| {
+            just_cache::offline::insert_prompt(
+                &tier.name,
+                &tier.path,
+                tier.vaults(),
+                id,
+                mounted_id,
+            )
+        })
+        .collect())
+}
+
+/// The `tiers` `--json` document: the same facts the text form prints, in one object.
+fn tiers_document(
+    config_path: &Path,
+    tiers: Option<&TierSet>,
+    catalog: Option<&catalog::Catalog>,
+) -> Result<String, catalog::CatalogError> {
+    let mut out = String::from("{\"command\":\"tiers\",\"config\":");
+    out.push_str(&json_string(&config_path.display().to_string()));
+    let Some(tiers) = tiers else {
+        // No config is the documented empty state, not an error: name what is missing.
+        out.push_str(",\"configured\":false,\"tiers\":[],\"caches\":[]}");
+        return Ok(out);
+    };
+    out.push_str(",\"configured\":true,\"tiers\":[");
+    for (index, tier) in tiers.tiers().iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        out.push_str(&json_string(&tier.name));
+        out.push_str(",\"kind\":");
+        out.push_str(&json_string(&tier.kind.to_string()));
+        out.push_str(",\"path\":");
+        out.push_str(&json_string(&tier.path.display().to_string()));
+        out.push_str(",\"volatility\":");
+        out.push_str(&json_string(tier.volatility.as_str()));
+        out.push_str(",\"recall\":");
+        out.push_str(&json_string(tier.recall.as_str()));
+        out.push_str(&format!(",\"copies\":{}", tier.copies));
+        if let Some(cost) = &tier.cost {
+            out.push_str(",\"cost\":");
+            out.push_str(&json_string(cost));
+        }
+        if let Some(ref object) = tier.object_config {
+            out.push_str(",\"endpoint\":");
+            out.push_str(&json_string(&object.endpoint));
+            out.push_str(",\"bucket\":");
+            out.push_str(&json_string(&object.bucket));
+        }
+        if tier.offline_config.is_some() {
+            out.push_str(",\"vaults\":[");
+            for (index, vault) in tier.vaults().iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_string(vault));
+            }
+            out.push(']');
+        }
+        // The counts and the insert prompt exist only when a catalog is present: they are
+        // the catalog's numbers, so a tiers report without one shows none.
+        if let Some(catalog) = catalog {
+            let counts = catalog.tier_counts(&tier_keys(tier))?;
+            out.push_str(&format!(
+                ",\"locations\":{},\"damaged\":{},\"pending_removals\":{}",
+                counts.locations, counts.damaged, counts.pending_removals
+            ));
+            if tier.offline_config.is_some() {
+                let prompts = insert_prompts_for(tier, catalog)?;
+                if !prompts.is_empty() {
+                    out.push_str(",\"insert_prompts\":[");
+                    for (index, prompt) in prompts.iter().enumerate() {
+                        if index > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&json_string(prompt));
+                    }
+                    out.push(']');
+                }
+            }
+        }
+        out.push('}');
+    }
+    out.push_str("],\"caches\":[");
+    for (index, cache) in tiers.caches().iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        out.push_str(&json_string(&cache.name));
+        out.push_str(",\"over\":");
+        out.push_str(&json_string(&cache.over));
+        out.push_str(",\"kind\":");
+        out.push_str(&json_string(&cache.kind));
+        out.push_str(",\"path\":");
+        out.push_str(&json_string(&cache.path.display().to_string()));
+        out.push_str(&format!(
+            ",\"max_size\":{},\"promote_on\":{},\"window_s\":{}",
+            cache.max_size,
+            cache.promote_on.accesses,
+            cache.promote_on.window.as_secs()
+        ));
+        out.push('}');
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -1084,6 +1392,7 @@ fn main() -> ExitCode {
         Some(Command::Gateway(args)) => run_gateway(args),
         Some(Command::ObjectServer(args)) => run_object_server(args),
         Some(Command::Volume(args)) => run_volume(args),
+        Some(Command::Tiers(args)) => run_tiers(args),
         Some(Command::Ui(args)) => run_ui(args),
         None => run_sweep(cli.sweep),
     }
@@ -1301,6 +1610,7 @@ fn run_catalog(args: CatalogArgs) -> ExitCode {
         CatalogCommand::Sync(sync) => run_catalog_sync(sync),
         CatalogCommand::Resolve(resolve) => run_catalog_resolve(resolve),
         CatalogCommand::Delete(delete) => run_catalog_delete(delete),
+        CatalogCommand::Pending(pending) => run_catalog_pending(pending),
     }
 }
 
@@ -1504,6 +1814,76 @@ fn run_catalog_delete(args: CatalogDeleteArgs) -> ExitCode {
     } else {
         ExitCode::from(EXIT_FINDINGS)
     }
+}
+
+/// The `catalog pending` subcommand (issue #171): every `pending_removal` row, read back
+/// and reported. A report of intents the tool still owes, not a resolution: it finishes
+/// nothing, removes nothing, and never creates the catalog it reads.
+fn run_catalog_pending(args: CatalogPendingArgs) -> ExitCode {
+    let catalog_path = volume_catalog_path(args.catalog.as_ref(), &args.watch);
+    if !catalog_path.is_file() {
+        eprintln!(
+            "just_cache: --catalog {} does not exist (create it with `just_cache catalog sync`)",
+            catalog_path.display()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let catalog = match catalog::Catalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows = match catalog.pending_removal_rows() {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.json {
+        println!("{}", pending_json(&catalog_path, &rows));
+    } else if rows.is_empty() {
+        println!("pending_removal: no rows; nothing is waiting to be unlinked");
+    } else {
+        println!("pending_removal: {} row(s)", rows.len());
+        for row in &rows {
+            println!(
+                "  {} ({}, tier {}, key {}, {})",
+                row.path.display(),
+                row.kind,
+                row.tier.as_deref().unwrap_or("-"),
+                row.storage_key.as_deref().unwrap_or("-"),
+                scope::human_bytes(row.size.max(0) as u64)
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The `catalog pending` `--json` document: the same rows the text form prints.
+fn pending_json(catalog_path: &Path, rows: &[catalog::PendingRemoval]) -> String {
+    let mut out = String::from("{\"command\":\"pending\",\"catalog\":");
+    out.push_str(&json_string(&catalog_path.display().to_string()));
+    out.push_str(",\"rows\":[");
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"path\":");
+        out.push_str(&json_string(&row.path.display().to_string()));
+        out.push_str(&format!(",\"size\":{}", row.size));
+        out.push_str(",\"kind\":");
+        out.push_str(&json_string(&row.kind));
+        out.push_str(",\"tier\":");
+        out.push_str(&json_optional(&row.tier));
+        out.push_str(",\"storage_key\":");
+        out.push_str(&json_optional(&row.storage_key));
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
 }
 
 fn run_catalog_resolve(args: CatalogResolveArgs) -> ExitCode {
@@ -2557,10 +2937,17 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
     };
     let Some(schedule) = schedule else {
         // No schedule is the documented default, not an error: report it and do nothing.
-        println!(
-            "schedule: no schedule configured ({}); nothing runs",
-            ScheduleSet::default_path(base).display()
-        );
+        if args.json {
+            println!(
+                "{{\"command\":\"schedule\",\"config\":{},\"configured\":false,\"passes\":[]}}",
+                json_string(&ScheduleSet::default_path(base).display().to_string())
+            );
+        } else {
+            println!(
+                "schedule: no schedule configured ({}); nothing runs",
+                ScheduleSet::default_path(base).display()
+            );
+        }
         return ExitCode::SUCCESS;
     };
 
@@ -2599,7 +2986,11 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
     };
 
     if !args.run {
-        report_schedule(&schedule, &state, &roots, now);
+        if args.json {
+            println!("{}", schedule_json(&schedule, &state, &roots, now));
+        } else {
+            report_schedule(&schedule, &state, &roots, now);
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -2766,6 +3157,69 @@ fn report_schedule(
             schedule::human_duration(config.every)
         );
     }
+}
+
+/// The `schedule` `--json` document (issue #171): the same facts `report_schedule` prints
+/// — one entry per pass, its cadence, budget, due-ness, last run and next run — plus the
+/// roots a floor is currently holding a pass back on. Nothing here invents a number:
+/// every value is the config's, the state's, or a root the catalog records.
+fn schedule_json(
+    schedule: &ScheduleSet,
+    state: &ScheduleState,
+    roots: &[PathBuf],
+    now: SystemTime,
+) -> String {
+    let mut out = String::from("{\"command\":\"schedule\",\"config\":");
+    out.push_str(&json_string(&schedule.path().display().to_string()));
+    out.push_str(",\"configured\":true,\"passes\":[");
+    for (index, (pass, config)) in schedule.passes().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let last = state.last_run(pass);
+        out.push_str("{\"pass\":");
+        out.push_str(&json_string(pass.name()));
+        out.push_str(",\"every\":");
+        out.push_str(&json_string(&schedule::human_duration(config.every)));
+        out.push_str(&format!(",\"every_seconds\":{}", config.every.as_secs()));
+        out.push_str(",\"due\":");
+        out.push_str(&schedule::is_due(last, config.every, now).to_string());
+        out.push_str(",\"last_run\":");
+        match last {
+            Some(last) => out.push_str(&json_string(&schedule::format_time(last))),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"next_run\":");
+        out.push_str(&json_string(&schedule::format_time(schedule::next_run(
+            last,
+            config.every,
+            now,
+        ))));
+        match config.rate_kib_per_sec {
+            Some(rate) => out.push_str(&format!(",\"rate_kib_per_sec\":{rate}")),
+            None => out.push_str(",\"rate_kib_per_sec\":null"),
+        }
+        match config.min_free_gb {
+            Some(gb) => out.push_str(&format!(",\"min_free_gb\":{gb}")),
+            None => out.push_str(",\"min_free_gb\":null"),
+        }
+        out.push_str(&format!(
+            ",\"min_free_bytes\":{},\"held_back_by\":[",
+            config.min_free_bytes()
+        ));
+        for (index, root) in schedule::roots_below_floor(roots, config.min_free_bytes())
+            .iter()
+            .enumerate()
+        {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(&root.display().to_string()));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    out
 }
 
 fn validate_sweep(watch: &Path, args: &SweepArgs, tiers: Option<&TierSet>) -> Result<(), String> {
