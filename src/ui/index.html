@@ -70,6 +70,7 @@
   .group.open .paths { display: block; }
   #explain-panel { position: fixed; inset: 0; background: rgba(0,0,0,.6);
                    display: flex; align-items: center; justify-content: center; }
+  #explain-panel.hidden { display: none; }
   #explain-panel .sheet { background: var(--bg); border: 1px solid var(--line);
                           border-radius: 8px; padding: 18px; width: min(720px, 92vw);
                           max-height: 85vh; overflow: auto; }
@@ -165,9 +166,9 @@
     return div.innerHTML;
   }
 
-  function fetchDocument(path, name, done) {
+  function fetchDocument(path, name, done, quiet) {
     if (!token()) { setStatus("set a token first", "bad"); return; }
-    setStatus("loading " + name + "...");
+    if (!quiet) { setStatus("loading " + name + "..."); }
     fetch(path, { headers: authHeaders() })
       .then(function (response) {
         if (response.status === 401) {
@@ -178,7 +179,7 @@
       })
       .then(function (text) {
         if (text === null) { return; }
-        setStatus(name + " — HTTP 200", "ok");
+        if (!quiet) { setStatus(name + " — HTTP 200", "ok"); }
         var document_ = null;
         try { document_ = JSON.parse(text); } catch (err) { /* not JSON; carried as text */ }
         done(document_, text);
@@ -315,7 +316,7 @@
         list.appendChild(item);
       });
       wireExplainClicks();
-    });
+    }, true);
   }
 
   // An offline tier shows the volume-ledger rows that name it, from /api/volumes
@@ -348,7 +349,7 @@
         div.textContent = JSON.stringify(row, null, 2);
         card.appendChild(div);
       });
-    });
+    }, true);
   }
 
   // ---- Audit view: /api/audit (the walk) and /api/catalog (catalog-only). ----

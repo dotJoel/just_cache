@@ -1132,6 +1132,37 @@ just_cache ui --watch /mnt/user/media --dest /mnt/disk2/cold \
 # then open http://127.0.0.1:8732/ and paste the token
 ```
 
+### What it looks like
+
+Captured from a real server running against a throwaway tree (there is no hosted demo: a
+static copy of the page would have no documents to render, and the page invents no numbers
+its documents do not carry).
+
+The tier map — a card per tier, the recorded locations gauged against the recorded copy
+floor, both numbers printed as they are:
+
+![The dashboard's tier map](docs/images/dashboard-tiers.png)
+
+Live activity — the events the `/api/events` stream actually delivers, newest first; a real
+event also flashes the tier card it names:
+
+![The live activity view](docs/images/dashboard-activity.png)
+
+Audit — findings grouped by classification with the document's own counts, each group
+drillable to its paths:
+
+![The audit view](docs/images/dashboard-audit.png)
+
+Explain on click — any path opens `explain --json` for that one path, with the raw document
+a toggle away:
+
+![The explain-on-click panel](docs/images/dashboard-explain.png)
+
+Schedule — each pass with its cadence, next run, rate, free-space floor, and whether it is
+due now:
+
+![The schedule view](docs/images/dashboard-schedule.png)
+
 It binds loopback by default (`--bind` overrides, printing a warning for a non-loopback
 address), speaks plain HTTP — put a TLS terminator in front before exposing it — and takes
 its token from a file or `JUST_CACHE_UI_TOKEN`, never the command line. Without a token it
