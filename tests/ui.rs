@@ -49,6 +49,22 @@ fn build() -> Tree {
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(Catalog::open(&catalog).is_ok());
+    // The tier config the dashboard's tiers view reads (issue #171): written after the
+    // sync, like a config that already sat beside the tree when the server started.
+    let config = hot.join("tiers.toml");
+    fs::write(
+        &config,
+        format!(
+            "[tiers.cold]\n\
+             kind = \"fs\"\n\
+             path = \"{}\"\n\
+             volatility = \"persistent\"\n\
+             recall = \"s\"\n\
+             copies = 1\n",
+            cold.display()
+        ),
+    )
+    .unwrap();
     Tree {
         _dir: dir,
         hot,
@@ -418,5 +434,188 @@ fn the_surface_lists_the_routes_and_their_roots() {
     assert!(
         body.contains("\"available\":false"),
         "a route whose roots were not given is marked unavailable: {body}"
+    );
+    // The views this issue added are on the same terms: `pending` follows the catalog the
+    // server was given, and `tiers` follows the tier config it was given.
+    assert!(body.contains("\"name\":\"pending\""), "{body}");
+    assert!(body.contains("\"name\":\"tiers\""), "{body}");
+}
+
+#[test]
+fn the_tier_pending_and_schedule_views_replay_their_documents() {
+    let tree = build();
+    let config = tree.hot.join("tiers.toml");
+    let server = UiServer::start(
+        &tree,
+        &[
+            "--catalog".into(),
+            tree.catalog.display().to_string(),
+            "--tiers".into(),
+            config.display().to_string(),
+        ],
+    );
+
+    // `/api/tiers` replays `tiers --tiers <config> --catalog <catalog> --json`.
+    let expected = direct(&[
+        "tiers",
+        "--tiers",
+        &config.display().to_string(),
+        "--catalog",
+        &tree.catalog.display().to_string(),
+        "--json",
+    ]);
+    let (status, body) = request(server.addr, "/api/tiers", Some(TOKEN));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.trim(),
+        expected,
+        "tiers replays the command's document"
+    );
+    assert!(
+        expected.contains("\"configured\":true"),
+        "the fixture's config is served, not an empty state: {expected}"
+    );
+    assert!(
+        expected.contains("\"locations\":1"),
+        "the counts come from the catalog the server was given: {expected}"
+    );
+
+    // `/api/pending` replays `catalog pending --catalog <catalog> --json`.
+    let expected = direct(&[
+        "catalog",
+        "pending",
+        "--catalog",
+        &tree.catalog.display().to_string(),
+        "--json",
+    ]);
+    let (status, body) = request(server.addr, "/api/pending", Some(TOKEN));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.trim(),
+        expected,
+        "pending replays the command's document"
+    );
+
+    // `/api/schedule` replays `schedule --catalog <catalog> --json` — now a document.
+    let expected = direct(&[
+        "schedule",
+        "--catalog",
+        &tree.catalog.display().to_string(),
+        "--json",
+    ]);
+    let (status, body) = request(server.addr, "/api/schedule", Some(TOKEN));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.trim(),
+        expected,
+        "schedule replays the command's document"
+    );
+    assert!(
+        expected.contains("\"configured\":false") && expected.contains("\"passes\":[]"),
+        "no schedule is the empty state, named the same way in both places: {expected}"
+    );
+}
+
+#[test]
+fn the_tiers_view_refuses_without_a_tier_config_like_the_command_would() {
+    let tree = build();
+    let server = UiServer::start(
+        &tree,
+        &["--catalog".into(), tree.catalog.display().to_string()],
+    );
+
+    let (status, body) = request(server.addr, "/api/tiers", Some(TOKEN));
+    assert_eq!(
+        status, 200,
+        "a refusal is an answer, not a transport failure"
+    );
+    assert!(
+        body.contains("\"error\"") && body.contains("--tiers"),
+        "the refusal names the root the server was not given: {body}"
+    );
+    assert!(
+        !body.contains("\"configured\""),
+        "no document is invented in its place: {body}"
+    );
+}
+
+#[test]
+fn a_pass_running_against_the_server_reaches_an_attached_sse_client() {
+    let tree = build();
+    let server = UiServer::start(
+        &tree,
+        &["--catalog".into(), tree.catalog.display().to_string()],
+    );
+
+    // Attach before the pass starts, so the client is connected while the pass runs.
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /api/events HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = stream.read(&mut byte).unwrap();
+        assert_ne!(read, 0, "the stream stayed open");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&head)
+            .to_lowercase()
+            .contains("text/event-stream"),
+        "the client is attached: {}",
+        String::from_utf8_lossy(&head)
+    );
+
+    // The pass: a real `catalog sync` against the tree the server serves, with a file
+    // added so the pass has something to ingest. It appends its own report when done.
+    fs::write(tree.hot.join("shows/late.bin"), b"late bytes").unwrap();
+    let mut pass = Command::new(BIN)
+        .args([
+            "catalog",
+            "sync",
+            "--watch",
+            &tree.hot.display().to_string(),
+            "--dest",
+            &tree.cold.display().to_string(),
+            "--catalog",
+            &tree.catalog.display().to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the pass starts");
+    let status = pass.wait().unwrap();
+    assert!(status.success(), "the pass ran clean");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        let mut buffer = [0u8; 1024];
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if seen.contains("\"pass\":\"catalog-sync\"") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        seen.contains("data: ") && seen.contains("\"pass\":\"catalog-sync\""),
+        "the pass's event reached the client that was attached while it ran:\n{seen}"
     );
 }

@@ -1878,6 +1878,37 @@ it produced to an append-only JSONL file the walk already skips, so the dashboar
   rather than breaking its own contract. This is the one maintenance mode that does not
   append, and it is named here rather than hidden.
 
+Closed by #171 (the backend documents of the dashboard's views): every view in the issue now
+has a document a CLI command prints, so no view computes policy. The decisions this issue
+left open, and the honest gaps:
+
+- **The commands are new, not routes.** #170's rule — a `ui` route only replays what a
+  command prints, and an endpoint that computes something no command prints is a design
+  decision, not default behaviour (docs/design.md §9) — means the tier map, the pending
+  view and the schedule view needed `just_cache tiers`, `catalog pending` and
+  `schedule --json` first. Each route runs the same binary and replays its `--json`
+  document byte for byte; nothing in the server reads a config or a table itself.
+- **Per-tier counts are the catalog's, not policy.** `tiers --json` carries, per tier, the
+  rows the catalog records: `locations` (location rows), `damaged` (locations a scrub
+  marked), `pending_removals` (releases a delete deferred). Each is one `SELECT COUNT(*)`
+  over the table that owns the fact, so a browser cannot show a number a query would not
+  return. Without a catalog the counts are omitted entirely — a number with no document
+  behind it is worse than an absent one. Because the catalog already keys local tiers on
+  the canonical root and offline exports on the tier name, a count reads both keys; the
+  dual keying is named at the query, not worked around.
+- **The insert prompt is served verbatim.** `tiers` builds the prompt from the volume ids
+  the catalog's own location rows name, minus the one the ledger records mounted, through
+  the same `insert_prompt` the recall path refuses with — so the dashboard shows the
+  prompt, never a paraphrase of it.
+- **`schedule --json` retires the text-wrapping.** `/api/schedule` now replays a document;
+  `pin --list` is the only route still wrapped as `{"text": ...}`, because it has no
+  printer yet. The document carries no `--run` behaviour: JSON or text, a report never
+  runs a pass.
+- **The views named in the issue that need no new backend are not invented here.** The
+  audit and explain views render documents #170 already replays (`audit --json`,
+  `explain --json`); the live activity view reads the events stream #169 lands. What they
+  look like is the frontend's work, in a later issue against the same documents.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator

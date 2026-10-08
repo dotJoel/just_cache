@@ -478,6 +478,8 @@ fn route(config: &UiConfig, method: &str, target: &Target) -> Response {
         "/api/pins" => Response::json(json_or_error("pins", pins_document(config))),
         "/api/volumes" => Response::json(json_or_error("volumes", volumes_document(config))),
         "/api/schedule" => Response::json(json_or_error("schedule", schedule_document(config))),
+        "/api/pending" => Response::json(json_or_error("pending", pending_document(config))),
+        "/api/tiers" => Response::json(json_or_error("tiers", tiers_document(config))),
         _ => Response::text(404, "Not Found", "not found\n"),
     }
 }
@@ -521,6 +523,8 @@ fn surface_json(config: &UiConfig) -> String {
         ("pins", "/api/pins", has_catalog, "catalog"),
         ("volumes", "/api/volumes", has_catalog, "catalog"),
         ("schedule", "/api/schedule", has_catalog, "catalog"),
+        ("pending", "/api/pending", has_catalog, "catalog"),
+        ("tiers", "/api/tiers", config.tiers.is_some(), "tiers"),
         ("events", "/api/events", true, "catalog or watch"),
     ];
     let mut out = String::from("{\"routes\":[");
@@ -674,7 +678,8 @@ fn volumes_document(config: &UiConfig) -> Result<String, String> {
     replay_document(config, args)
 }
 
-/// `schedule` has no `--json` document either; like `pins`, its text is wrapped.
+/// `schedule --json` prints a document (#171), so the route replays it like every other
+/// JSON view: byte for byte, no adapter.
 fn schedule_document(config: &UiConfig) -> Result<String, String> {
     let catalog = config
         .catalog
@@ -684,8 +689,49 @@ fn schedule_document(config: &UiConfig) -> Result<String, String> {
         "schedule".into(),
         "--catalog".into(),
         catalog.clone().into_os_string(),
+        "--json".into(),
     ];
-    replay_text(config, args)
+    replay_document(config, args)
+}
+
+/// The `catalog pending` document (#171): every release a committed delete still owes an
+/// unlink, read from the catalog's own rows. Refuses when the server has no catalog.
+fn pending_document(config: &UiConfig) -> Result<String, String> {
+    let catalog = config
+        .catalog
+        .as_ref()
+        .ok_or("this server was not started with --catalog")?;
+    let args = vec![
+        "catalog".into(),
+        "pending".into(),
+        "--catalog".into(),
+        catalog.clone().into_os_string(),
+        "--json".into(),
+    ];
+    replay_document(config, args)
+}
+
+/// The `tiers` document (#171): what `tiers.toml` describes, with the per-tier counts the
+/// catalog records when the server has one, and the insert prompt an offline read would
+/// serve. The route exists only when the server was started with `--tiers`: the config is
+/// a root the server was given, and a route that could answer without one would compute
+/// something no command prints (docs/design.md §9 — a design decision, not default).
+fn tiers_document(config: &UiConfig) -> Result<String, String> {
+    let tiers = config
+        .tiers
+        .as_ref()
+        .ok_or("this server was not started with --tiers")?;
+    let mut args = vec![
+        "tiers".into(),
+        "--tiers".into(),
+        tiers.clone().into_os_string(),
+    ];
+    if let Some(catalog) = &config.catalog {
+        args.push("--catalog".into());
+        args.push(catalog.clone().into_os_string());
+    }
+    args.push("--json".into());
+    replay_document(config, args)
 }
 
 /// Run this binary and return what it printed to stdout, verbatim.
