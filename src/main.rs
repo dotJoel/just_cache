@@ -33,6 +33,7 @@ use just_cache::schedule::{self, Pass, ScheduleSet, ScheduleState, SCHEDULE_STAT
 use just_cache::scope::{self, Scope};
 use just_cache::scrub::{self, ScrubRequest};
 use just_cache::tiers::TierSet;
+use just_cache::ui::{self, UiConfig};
 
 /// Exit code for findings that were reported and not resolved, so cron can alert
 /// without parsing any text.
@@ -127,6 +128,11 @@ enum Command {
     /// is in a tier's drive, and where the others are. The catalog is the source of truth
     /// for a volume's whereabouts — no marker file is ever written into the volume (#143).
     Volume(VolumeArgs),
+    /// Serve the dashboard: a static shell embedded in the binary, read-only JSON views
+    /// over the catalog-backed commands, and a live stream of the events file (#170).
+    /// Read-only — no route moves, repairs, deletes or pins anything. Roots are chosen at
+    /// invocation exactly like `mcp`: a request names a query, never a path.
+    Ui(UiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -916,6 +922,51 @@ struct GatewayArgs {
     quiet: bool,
 }
 
+/// Everything `ui` needs. The dashboard (#170) serves a static shell embedded in the
+/// binary plus read-only JSON views, and streams the events file (#169). Roots are chosen
+/// once here, exactly like `mcp`: a request names a query, never a path.
+#[derive(Debug, Args)]
+struct UiArgs {
+    /// Address to bind. Loopback by default: the endpoint speaks plain HTTP, so exposing it
+    /// beyond the host belongs behind a TLS terminator (a non-loopback bind prints a
+    /// warning).
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8732")]
+    bind: String,
+
+    /// Directory to watch. With `--dest`, enables the `audit` and `explain` views.
+    #[arg(long, value_name = "DIR")]
+    watch: Option<PathBuf>,
+
+    /// Cold-storage root, fastest tier first. Repeat for each slower disk.
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    dest: Vec<PathBuf>,
+
+    /// The catalog file. Defaults to `.just_cache-catalog.sqlite` beside the watch root.
+    /// Enables the `locate`, `pins`, `volumes` and `schedule` views; read only, never
+    /// created — a request against a missing catalog answers with the command's own
+    /// refusal.
+    #[arg(long, value_name = "FILE")]
+    catalog: Option<PathBuf>,
+
+    /// Tier configuration (`tiers.toml`), passed through to the commands that accept it.
+    #[arg(long, value_name = "FILE")]
+    tiers: Option<PathBuf>,
+
+    /// Lifecycle policy (`policy.toml`), passed through to `explain`.
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
+
+    /// File holding the bearer token (surrounding whitespace is trimmed). Read from a file,
+    /// or from `JUST_CACHE_UI_TOKEN`, never from the command line, where it would show up
+    /// in `ps` and shell history.
+    #[arg(long, value_name = "FILE")]
+    token_file: Option<PathBuf>,
+
+    /// Do not print the per-request access log (method, target, status).
+    #[arg(long, short)]
+    quiet: bool,
+}
+
 /// Everything the S3-compatible object server needs. This is the server half of the
 /// LAN-peer tier (§4): a peer runs `just_cache object-server`, which speaks the same
 /// S3-compatible subset the object-store client uses — PUT/GET/HEAD/DELETE with SigV4
@@ -1033,6 +1084,7 @@ fn main() -> ExitCode {
         Some(Command::Gateway(args)) => run_gateway(args),
         Some(Command::ObjectServer(args)) => run_object_server(args),
         Some(Command::Volume(args)) => run_volume(args),
+        Some(Command::Ui(args)) => run_ui(args),
         None => run_sweep(cli.sweep),
     }
 }
@@ -3684,6 +3736,86 @@ fn run_gateway(args: GatewayArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("just_cache: gateway failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Serve the dashboard (issue #170) until killed.
+///
+/// Read-only: no route moves, repairs, deletes or pins anything. Exit `2` for a bad
+/// invocation — no roots to answer from, or no token; `1` if the listener fails while
+/// serving.
+fn run_ui(args: UiArgs) -> ExitCode {
+    if args.catalog.is_none() && (args.watch.is_none() || args.dest.is_empty()) {
+        eprintln!(
+            "just_cache: ui needs somewhere to answer from: --catalog, or --watch with --dest"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // The token's value never reaches an error message: only where it was looked for.
+    let token = match &args.token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text.trim().to_string(),
+            Err(err) => {
+                eprintln!(
+                    "just_cache: cannot read --token-file {}: {err}",
+                    path.display()
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => match std::env::var(ui::TOKEN_ENV) {
+            Ok(token) => token.trim().to_string(),
+            Err(_) => {
+                eprintln!(
+                    "just_cache: the ui needs a token: pass --token-file or set {}",
+                    ui::TOKEN_ENV
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("just_cache: ui cannot find its own binary to run the commands: {error}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let config = UiConfig {
+        catalog: args.catalog,
+        watch: args.watch,
+        dest: args.dest,
+        tiers: args.tiers,
+        policy: args.policy,
+        token,
+        program,
+        log: !args.quiet,
+    };
+    let server = match ui::UiServer::bind(&args.bind, config) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if let Ok(addr) = server.local_addr() {
+        eprintln!(
+            "just_cache: ui listening on http://{addr}/ (plain HTTP; put a TLS terminator \
+             in front before exposing it)"
+        );
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "just_cache: ui warning: {addr} is not loopback, so the token and every view \
+                 travel in clear text"
+            );
+        }
+    }
+    match server.serve() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("just_cache: ui failed: {err}");
             ExitCode::FAILURE
         }
     }

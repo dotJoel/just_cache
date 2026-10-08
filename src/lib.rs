@@ -50,6 +50,10 @@ pub mod schedule;
 pub mod scope;
 pub mod scrub;
 pub mod tiers;
+// The dashboard server (#170): a static shell embedded in the binary, read-only JSON
+// routes over the commands' own `--json` documents, and an SSE stream of the events file.
+// Hand-rolled HTTP over `std::net`, like the gateway; only the `ui` subcommand reaches it.
+pub mod ui;
 
 pub use audit::{
     audit, audit_with_copies, catalog_audit, catalog_audit_no_filesystem, catalog_repair, classify,
@@ -111,3 +115,4 @@ pub use tiers::{
     CacheConfig, OfflineTierConfig, PromoteOn, Recall, Tier, TierSet, TiersError, Volatility,
     TIERS_FILE_NAME,
 };
+pub use ui::{UiConfig, UiError, UiServer, TOKEN_ENV as UI_TOKEN_ENV};
