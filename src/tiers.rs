@@ -189,6 +189,196 @@ impl std::fmt::Display for TierKind {
     }
 }
 
+/// The bytes one *billed* gigabyte covers.
+///
+/// Decimal, not binary: a `$/GB-month` figure is a price off a provider's bill and the
+/// billing unit is a 10^9-byte GB. The rest of the tool sizes disks in binary units
+/// (`parse_size`'s `1G` is a GiB); the price unit is deliberately the billing one, and a
+/// report that divides bytes by any other constant is pricing a different gigabyte (#163).
+pub const BYTES_PER_BILLED_GB: u64 = 1_000_000_000;
+
+/// Micro-dollars in a dollar. A cost is carried in integer micro-dollars, never a float, so
+/// a report that multiplies many bytes by a price accumulates no binary-float error: `$0.02`
+/// is exactly 20 000 (#163).
+const MICRO_DOLLARS_PER_DOLLAR: u64 = 1_000_000;
+
+/// A tier's cost, as a value a report can multiply by bytes (#163).
+///
+/// Only the `$/GB-month` form is modelled here — the figure a placement report can use. A
+/// W-idle figure is *not* modelled: turning watts into dollars needs a `$/kWh` price, a duty
+/// cycle and an assumption about how long the pool is idle, none of which the config
+/// carries, so [`TierCost::parse`] refuses a watt figure by name rather than inventing a
+/// reading for it (invariant 3).
+///
+/// **Not priced is not priced at zero.** The field that holds this is `Option<TierCost>`:
+/// `None` means nobody priced the tier, while `Some(cost)` with a zero figure is a tier
+/// priced at zero — two different values, so no report can render `$0.00` for a tier nobody
+/// priced. There is no "unknown" state *inside* `TierCost` that a missing price could
+/// collapse into; the absence lives entirely in the `Option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierCost {
+    /// The text as written in `tiers.toml` (trimmed of surrounding whitespace), kept so both
+    /// renderings still show the value a reader wrote — a reader's check that the file and
+    /// the parse agree.
+    written: String,
+    /// Micro-dollars per GB-month. Integer for exactness; see `MICRO_DOLLARS_PER_DOLLAR`.
+    micro_dollars_per_gb_month: u64,
+}
+
+impl TierCost {
+    /// The value as written in the config, for the one-line tier rendering and `--json`.
+    pub fn written(&self) -> &str {
+        &self.written
+    }
+
+    /// Micro-dollars to store one GB for one month. Never a float.
+    pub fn micro_dollars_per_gb_month(&self) -> u64 {
+        self.micro_dollars_per_gb_month
+    }
+
+    /// Micro-dollars to store `bytes` for one month, rounded down.
+    ///
+    /// The multiplication is integer and widened to `u128` so a full-disk byte count cannot
+    /// overflow. Flooring loses less than one micro-dollar per call, so a report sums a
+    /// tier's bytes first and calls this once per tier rather than once per file.
+    pub fn micro_dollars_for_bytes(&self, bytes: u64) -> u128 {
+        u128::from(self.micro_dollars_per_gb_month) * u128::from(bytes)
+            / u128::from(BYTES_PER_BILLED_GB)
+    }
+
+    /// The canonical `$N/GB-month` spelling of the parsed value (fractional zeros trimmed),
+    /// for the parsed form a `--json` document carries beside the written one.
+    pub fn canonical(&self) -> String {
+        let whole = self.micro_dollars_per_gb_month / MICRO_DOLLARS_PER_DOLLAR;
+        let fraction = self.micro_dollars_per_gb_month % MICRO_DOLLARS_PER_DOLLAR;
+        if fraction == 0 {
+            return format!("${whole}/GB-month");
+        }
+        let mut frac = format!("{fraction:06}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("${whole}.{frac}/GB-month")
+    }
+
+    /// Read a configured `cost` string into the model, or say why it cannot be read.
+    ///
+    /// The only accepted form is `$<amount>/GB-month`. Everything else is refused: a bare
+    /// `$0.02` does not say whether it is a price per GB-month or a W-idle figure, a
+    /// unit-less number has no reading at all, and a watt figure needs inputs nobody
+    /// configured. The returned `Err` names the value and the reason; the caller adds the
+    /// tier and the line.
+    pub fn parse(raw: &str) -> Result<TierCost, String> {
+        let text = raw.trim();
+        if text.is_empty() {
+            return Err(
+                "is empty; write `$N/GB-month`, or leave the field out to mean not priced"
+                    .to_string(),
+            );
+        }
+        if let Some(watts) = watt_figure(text) {
+            return Err(format!(
+                "`{text}` is a W-idle figure ({watts} W); this tool prices only `$/GB-month`. \
+                 A W-idle figure needs a $/kWh price, a duty cycle and an assumption about how \
+                 long the pool is idle — none of them configured — so reading it as dollars \
+                 would invent a number and make the report dishonest. Express the cost as \
+                 `$N/GB-month` instead"
+            ));
+        }
+        let Some(rest) = text.strip_prefix('$') else {
+            return Err(format!(
+                "`{text}` is not a `$/GB-month` price: it has no `$` currency"
+            ));
+        };
+        let Some((amount, unit)) = rest.split_once('/') else {
+            return Err(format!(
+                "`{text}` has no unit; `$N` alone does not say per-GB-month or W-idle, and \
+                 reading it as either would be a guess. Write `$N/GB-month`"
+            ));
+        };
+        if !unit.trim().eq_ignore_ascii_case("GB-month") {
+            return Err(format!(
+                "`{text}` has unit `{}`, which this tool does not price; the only unit it \
+                 prices is `GB-month` (`$N/GB-month`)",
+                unit.trim()
+            ));
+        }
+        let micro_dollars_per_gb_month =
+            parse_micro_dollars(amount.trim()).map_err(|reason| format!("`{text}` {reason}"))?;
+        Ok(TierCost {
+            written: text.to_string(),
+            micro_dollars_per_gb_month,
+        })
+    }
+}
+
+impl std::fmt::Display for TierCost {
+    /// The value as written, so the one-line tier rendering is unchanged by the model.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.written)
+    }
+}
+
+/// The watts in a W-idle figure, if the text is one: `5W`, `5 W`, `5W idle`, `5 W-idle`.
+/// Case-insensitive; `None` for anything that is not a plain watt number.
+fn watt_figure(text: &str) -> Option<String> {
+    let mut rest = text.trim().to_ascii_lowercase();
+    for word in ["idle", "watts"] {
+        if let Some(stripped) = rest.strip_suffix(word) {
+            rest = stripped.trim_end_matches(['-', '_', ' ']).to_string();
+        }
+    }
+    let number = rest.strip_suffix('w')?.trim_end_matches(['-', '_']).trim();
+    if number.is_empty()
+        || !number.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || number.bytes().filter(|b| *b == b'.').count() > 1
+        || !number.bytes().any(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(number.to_string())
+}
+
+/// Micro-dollars for a dollar amount written as a decimal (e.g. `0.02`, `12`, `1.5`).
+///
+/// At most six fractional digits: a finer figure cannot be carried exactly in micro-dollars
+/// and is refused rather than rounded to a price nobody wrote.
+fn parse_micro_dollars(amount: &str) -> Result<u64, String> {
+    let (whole_str, frac_str) = amount.split_once('.').unwrap_or((amount, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (whole_str.is_empty() && frac_str.is_empty())
+        || !all_digits(whole_str)
+        || !all_digits(frac_str)
+    {
+        return Err(format!(
+            "has an amount `{amount}` that is not a plain dollar figure"
+        ));
+    }
+    if frac_str.len() > 6 {
+        return Err(format!(
+            "has amount `{amount}` with more precision than a micro-dollar provides \
+             (at most six fractional digits)"
+        ));
+    }
+    let whole: u64 = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str
+            .parse()
+            .map_err(|_| format!("has an amount `{amount}` too large to price"))?
+    };
+    let frac: u64 = if frac_str.is_empty() {
+        0
+    } else {
+        frac_str.parse().expect("digits checked above")
+    };
+    let frac_micro = frac * 10u64.pow((6 - frac_str.len()) as u32);
+    whole
+        .checked_mul(MICRO_DOLLARS_PER_DOLLAR)
+        .and_then(|value| value.checked_add(frac_micro))
+        .ok_or_else(|| format!("has an amount `{amount}` too large to price"))
+}
+
 /// One configured tier: §2's fields, with the name it was declared under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tier {
@@ -206,10 +396,11 @@ pub struct Tier {
     pub recall: Recall,
     /// Durability floor within the tier (§6): the copy count the engine maintains.
     pub copies: usize,
-    /// Optional cost model ($/GB-month, a W-idle figure, …), kept as written. Nothing
-    /// acts on it yet — placement decisions are P4 — but it is part of the tier's honest
-    /// description and printing it is how a reader checks it was parsed.
-    pub cost: Option<String>,
+    /// Optional cost model (§9, #163): a `$/GB-month` price a report can multiply by bytes.
+    /// `None` is "not priced", which is a different value from a tier priced at zero — see
+    /// [`TierCost`]. Nothing acts on it yet — placement decisions are P4 — but it is part of
+    /// the tier's honest description and printing it is how a reader checks it was parsed.
+    pub cost: Option<TierCost>,
     /// The object-store configuration, present when `kind == Object` or `kind == Peer`.
     /// Both kinds are served by the same S3-compatible driver (a peer runs the
     /// object-server, so its client config is the object-store config). Kept here so
@@ -849,13 +1040,23 @@ impl RawTier {
             )));
         }
 
-        let cost = self.cost.map(|cost| match cost.into_inner() {
-            // A quoted string is the value, not its TOML spelling: `"$0.02"` means the
-            // string `$0.02`, and printing the quotes would misreport the config.
-            toml::Value::String(text) => text,
-            other => other.to_string(),
-        });
-        let cost = cost.filter(|cost| !cost.trim().is_empty());
+        let cost = match self.cost {
+            None => None,
+            Some(spanned) => {
+                // A quoted string is the value, not its TOML spelling: `"$0.02/GB-month"`
+                // means the string, and printing the quotes would misreport the config.
+                let raw = match spanned.get_ref() {
+                    toml::Value::String(value) => value.clone(),
+                    other => other.to_string(),
+                };
+                Some(TierCost::parse(&raw).map_err(|reason| {
+                    invalid(format!(
+                        "line {}: tier `{name}` cost {reason}",
+                        line_at(text, spanned.span().start)
+                    ))
+                })?)
+            }
+        };
 
         // Offline-volume validation (#143): an offline tier has a mount point and vaults,
         // never a wire endpoint. The four wire fields are refused by name rather than
@@ -1104,7 +1305,7 @@ path = "/mnt/hdd-pool"
 volatility = "persistent"
 recall = "s"
 copies = 2
-cost = "$0.02"
+cost = "$0.02/GB-month"
 "#
     }
 
@@ -1123,7 +1324,15 @@ cost = "$0.02"
         let hdd = set.get("hdd").expect("hdd");
         assert_eq!(hdd.recall, Recall::S);
         assert_eq!(hdd.copies, 2);
-        assert_eq!(hdd.cost.as_deref(), Some("$0.02"));
+        // The written value survives for the rendering; the parsed model is the price.
+        assert_eq!(
+            hdd.cost.as_ref().map(TierCost::written),
+            Some("$0.02/GB-month")
+        );
+        assert_eq!(
+            hdd.cost.as_ref().unwrap().micro_dollars_per_gb_month(),
+            20_000
+        );
     }
 
     #[test]
@@ -1166,6 +1375,135 @@ copies = 1
         let rendered = err.to_string();
         assert!(rendered.contains("line 4"), "{rendered}");
         assert!(rendered.contains("volatility"), "{rendered}");
+    }
+
+    /// The accepted form: a `$/GB-month` figure parses to micro-dollars a report can
+    /// multiply by bytes, exactly and without a float.
+    #[test]
+    fn a_dollar_per_gb_month_cost_parses_to_micro_dollars() {
+        let cases = [
+            ("$0.02/GB-month", 20_000),
+            ("$12/GB-month", 12_000_000),
+            ("$1.5/GB-month", 1_500_000),
+            ("$0.000001/GB-month", 1),
+            ("$0/GB-month", 0),
+            ("  $0.02/gb-month ", 20_000),
+        ];
+        for (written, micro) in cases {
+            let cost =
+                TierCost::parse(written).unwrap_or_else(|reason| panic!("{written}: {reason}"));
+            assert_eq!(cost.micro_dollars_per_gb_month(), micro, "{written}");
+            assert_eq!(cost.written(), written.trim(), "{written}");
+        }
+    }
+
+    /// A price multiplies bytes in integer micro-dollars: ten billed GB at `$0.02` is
+    /// exactly twenty cents, and a zero price stays zero rather than becoming an absence.
+    #[test]
+    fn a_cost_multiplies_by_bytes_without_a_float() {
+        let cost = TierCost::parse("$0.02/GB-month").unwrap();
+        assert_eq!(
+            cost.micro_dollars_for_bytes(10 * BYTES_PER_BILLED_GB),
+            200_000
+        );
+        assert_eq!(
+            cost.micro_dollars_for_bytes(BYTES_PER_BILLED_GB / 2),
+            10_000
+        );
+        // Sub-GB bytes floor to a fraction of a micro-dollar, never a rounded-up price.
+        assert_eq!(cost.micro_dollars_for_bytes(1), 0);
+        assert_eq!(cost.canonical(), "$0.02/GB-month");
+    }
+
+    /// The type-level assertion the issue asks for: "not priced" and "priced at zero" are
+    /// different values, and a zero cost cannot be expressed as an absence (or vice versa).
+    #[test]
+    fn not_priced_is_not_priced_at_zero() {
+        let not_priced: Option<TierCost> = None;
+        let priced_at_zero = Some(TierCost::parse("$0/GB-month").unwrap());
+        assert_ne!(not_priced, priced_at_zero);
+        assert_eq!(
+            priced_at_zero
+                .as_ref()
+                .unwrap()
+                .micro_dollars_per_gb_month(),
+            0
+        );
+        // Absence is only ever the `Option`'s None, and the parse never returns None: a
+        // written zero is a Some. There is no "unknown" value inside `TierCost` for a
+        // missing price to collapse into, so the two can never be confused.
+        assert!(not_priced.is_none());
+        assert!(priced_at_zero.is_some());
+    }
+
+    /// The unit-less `$0.02` the old config carried is refused with its line — never read as
+    /// one unit or the other.
+    #[test]
+    fn a_cost_with_no_unit_names_its_line() {
+        let dir = tmp();
+        let text = "[tiers.hdd]\nkind = \"fs\"\npath = \"/mnt/hdd\"\nvolatility = \"persistent\"\nrecall = \"s\"\ncopies = 1\ncost = \"$0.02\"\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("line 7"), "{rendered}");
+        assert!(rendered.contains("tier `hdd`"), "{rendered}");
+        assert!(rendered.contains("$0.02"), "{rendered}");
+        assert!(rendered.contains("unit"), "{rendered}");
+    }
+
+    /// An unreadable cost does not parse at all, and the refusal names its line and value.
+    #[test]
+    fn an_unreadable_cost_names_its_line() {
+        let dir = tmp();
+        let text = "[tiers.hdd]\nkind = \"fs\"\npath = \"/mnt/hdd\"\nvolatility = \"persistent\"\nrecall = \"s\"\ncopies = 1\ncost = \"cheap\"\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("line 7"), "{rendered}");
+        assert!(rendered.contains("tier `hdd`"), "{rendered}");
+        assert!(rendered.contains("cheap"), "{rendered}");
+    }
+
+    /// A W-idle figure is refused *by name*, with the reason, rather than read as a price.
+    #[test]
+    fn a_watt_idle_cost_is_refused_by_name() {
+        for written in ["5W idle", "5 W", "5W-idle"] {
+            let dir = tmp();
+            let text = format!(
+                "[tiers.hdd]\nkind = \"fs\"\npath = \"/mnt/hdd\"\nvolatility = \"persistent\"\nrecall = \"s\"\ncopies = 1\ncost = \"{written}\"\n"
+            );
+            let err = TierSet::parse(&text, &dir.path().join("tiers.toml")).unwrap_err();
+            let rendered = err.to_string();
+            assert!(rendered.contains("line 7"), "{written}: {rendered}");
+            assert!(rendered.contains("W-idle"), "{written}: {rendered}");
+            assert!(rendered.contains("$/kWh"), "{written}: {rendered}");
+        }
+    }
+
+    /// A bare number — a unit-less value the old string field carried — is refused too, so
+    /// TOML's own float does not sneak in as a price.
+    #[test]
+    fn a_bare_number_cost_is_refused() {
+        let dir = tmp();
+        let text = "[tiers.hdd]\nkind = \"fs\"\npath = \"/mnt/hdd\"\nvolatility = \"persistent\"\nrecall = \"s\"\ncopies = 1\ncost = 0.02\n";
+        let err = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("line 7"), "{rendered}");
+        assert!(rendered.contains("0.02"), "{rendered}");
+    }
+
+    /// The one-line rendering still shows the written value, unchanged by the model.
+    #[test]
+    fn the_one_line_rendering_shows_the_written_cost() {
+        let dir = tmp();
+        let set = TierSet::parse(sample(), &dir.path().join("tiers.toml")).unwrap();
+        let hdd = set.get("hdd").expect("hdd");
+        assert!(
+            hdd.describe().contains("cost=$0.02/GB-month"),
+            "{}",
+            hdd.describe()
+        );
+        // A tier nobody priced shows no cost in the line, not a zero.
+        let ssd = set.get("ssd").expect("ssd");
+        assert!(!ssd.describe().contains("cost="), "{}", ssd.describe());
     }
 
     #[test]

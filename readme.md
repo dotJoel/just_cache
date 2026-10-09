@@ -148,7 +148,7 @@ path = "/mnt/hdd-pool"
 volatility = "persistent"
 recall = "s"
 copies = 2
-cost = "$0.02"
+cost = "$0.02/GB-month"
 
 [tiers.drawer]
 kind = "offline"
