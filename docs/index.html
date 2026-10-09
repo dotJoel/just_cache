@@ -153,9 +153,45 @@
     .feat { grid-template-columns: 1fr; gap: 4px; }
     .feat .name { white-space: normal; }
   }
+  /* big-brain / small-brain toggle */
+  .brain-toggle {
+    position: fixed;
+    right: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 10;
+  }
+  .brain-toggle button {
+    width: 46px;
+    height: 46px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+  }
+  .brain-toggle button:hover { opacity: 1; }
+  .brain-toggle button[aria-pressed="true"] {
+    opacity: 1;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-dim);
+    transform: scale(1.1);
+  }
+  .brain-toggle .small { font-size: 16px; }
+
+  @media (max-width: 900px) {
+    .brain-toggle { right: 6px; }
+  }
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     .card:hover { transform: none; }
+    .brain-toggle button { transition: none; }
   }
 </style>
 </head>
@@ -165,7 +201,7 @@
 <header>
   <div class="wordmark"><span class="prompt">$</span> <span>~/storage</span> <span class="sep">::</span> <span>tiered&nbsp;mover</span></div>
   <h1>just_cache<span class="dot">.</span></h1>
-  <p class="lede">Move idle files to slower storage without changing their paths, and promote frequently read files into a bounded RAM/SSD cache. The durable copy stays authoritative; just_cache also catalogs, checks and restores copies across tiers.</p>
+  <p class="lede" data-simple="Files you haven't opened in a while get moved to slower disks. The old path still works, so nothing notices. Popular files get a fast copy kept in RAM or on SSD so they open quickly.">Move idle files to slower storage without changing their paths, and promote frequently read files into a bounded RAM/SSD cache. The durable copy stays authoritative; just_cache also catalogs, checks and restores copies across tiers.</p>
 </header>
 
 <div class="term">
@@ -187,16 +223,16 @@
 <section id="why">
   <div class="kicker">Why just_cache</div>
   <h2>Move cold files and keep track of the copies</h2>
-  <p class="lead">
+  <p class="lead" data-simple="It moves old files, and it keeps track of where everything went so it can find it, check it, and bring it back.">
     A mover can relocate old files. just_cache adds a journal for interrupted moves and commands
     to record, find, check and restore stored copies.
   </p>
-  <p>
+  <p data-simple="Old files get moved to a slower disk and a shortcut (a symlink) is left behind at the old spot. Most programs follow the shortcut and never notice. Some don't - check yours first.">
     A sweep moves eligible files between local filesystem roots and leaves a <em>symlink</em> at
     each original path. Programs that follow symlinks can keep using that path; some tools and
     applications do not handle symlinks as ordinary files, so check your workload first.
   </p>
-  <p>
+  <p data-simple="Before any original is deleted, the new copy is checked against it. The tool writes down what it is about to do before it does it, so a crash cannot lose your files. There is a list of everything and where it lives, a checker that reads every copy back, and a repair tool.">
     Every move records and fsyncs its intent before work begins. Optional <code class="inline">--copies N</code>
     requires verified copies on distinct configured roots before retiring the source; the roots
     can still be on the same host. With the catalog, <code class="inline">locate</code> reports recorded
@@ -204,7 +240,7 @@
     and can repair a damaged copy from a sibling copy whose bytes match its recorded hash.
     These catalog and scrub operations are explicit commands.
   </p>
-  <p>
+  <p data-simple="It also knows about other places files can live: cloud storage, another computer on your network, or a disk you keep on a shelf. If a file is on the shelf-disk, it tells you which disk to plug in. Anything crossing the network is encrypted.">
     The catalog and namespace also cover remote tiers — cloud object storage, a LAN peer, and an
     offline disk in a drawer — with recall latency and cost declared per tier. All three drivers
     are implemented (#141, #142, #143), bytes that cross the machine boundary are sealed with a
@@ -217,7 +253,7 @@
 <section id="ram-cache">
   <div class="kicker">Hot-file cache</div>
   <h2>Promote frequently read files into RAM</h2>
-  <p class="lead">
+  <p class="lead" data-simple="If you keep opening the same files, it copies them into a chunk of RAM (or fast SSD) so they open faster. The real copy stays where it was. The fast one is just a spare.">
     When a read through the FUSE mount meets the configured <code class="inline">promote_on</code>
     threshold, just_cache copies the file into a bounded RAM or SSD overlay and serves it from
     there. The durable home stays authoritative; this is a cache copy, not a tier move.
@@ -225,24 +261,24 @@
   <div class="grid">
     <div class="card">
       <h4>Promote on access</h4>
-      <p>The mount observes reads directly. When a file meets the configured threshold, it copies bytes from the home tier and serves the cached copy.</p>
+      <p data-simple="When a file gets read a lot through the mount, a copy is stashed in the fast storage.">The mount observes reads directly. When a file meets the configured threshold, it copies bytes from the home tier and serves the cached copy.</p>
     </div>
     <div class="card">
       <h4>Stay within the cap</h4>
-      <p>LRU eviction keeps the overlay under its size limit. A file larger than the entire cache is not promoted.</p>
+      <p data-simple="When the fast storage fills up, the least recently used files get dropped first.">LRU eviction keeps the overlay under its size limit. A file larger than the entire cache is not promoted.</p>
     </div>
     <div class="card">
       <h4>RAM is never the only copy</h4>
-      <p>Writes through the mount invalidate the cached copy before changing the home. Cache residency is disposable and is cleared on restart.</p>
+      <p data-simple="The spare copy can disappear at any time - a restart clears it. The real copy is the only one that counts.">Writes through the mount invalidate the cached copy before changing the home. Cache residency is disposable and is cleared on restart.</p>
     </div>
   </div>
-  <div class="note"><strong>Not a durability tier:</strong> cached bytes do not change the catalog's tier of record or count toward its copy floor.</div>
+  <div class="note" data-simple="Short version: the cache is not a backup. If it vanished, nothing is lost."><strong>Not a durability tier:</strong> cached bytes do not change the catalog's tier of record or count toward its copy floor.</div>
 </section>
 
 <section id="quickstart">
   <div class="kicker">Quick start</div>
   <h2>Get from fast to slow in one command</h2>
-  <p class="lead">Build it, point it at a watched tree and a cold root. A dry run shows the plan without touching files; a real sweep moves eligible files and leaves symlinks at their original paths.</p>
+  <p class="lead" data-simple="Build it, tell it which folder to watch and where the slow storage is. Try a dry run first: it shows what it would do and touches nothing.">Build it, point it at a watched tree and a cold root. A dry run shows the plan without touching files; a real sweep moves eligible files and leaves symlinks at their original paths.</p>
 
   <h3>1. Build</h3>
   <div class="term"><div class="term-bar"><span class="light r"></span><span class="light y"></span><span class="light g"></span><span class="title">build</span></div><pre><code><span class="ps">$</span> cargo build --release</code></pre></div>
@@ -260,7 +296,7 @@
 <span class="dim">    --dest</span> /mnt/disk-slow/media \
 <span class="dim">    --interval</span> 3600   <span class="cm"># seconds between sweeps</span></code></pre></div>
 
-  <div class="note"><strong>One rule first:</strong> the destination must already exist. just_cache never creates one — an unmounted slow disk must not silently become a directory on the wrong filesystem.</div>
+  <div class="note" data-simple="One rule: the destination folder has to exist already. It refuses to create one, so a disk that is not plugged in cannot get faked with an empty directory."><strong>One rule first:</strong> the destination must already exist. just_cache never creates one — an unmounted slow disk must not silently become a directory on the wrong filesystem.</div>
 </section>
 
 <section id="usecases">
@@ -269,32 +305,32 @@
   <div class="grid">
     <div class="card">
       <h4>Media library</h4>
-      <p>Old episodes and movies nobody has opened this quarter leave the NVMe for a spinning disk; Plex still finds them through the symlink.</p>
+      <p data-simple="Old shows nobody watches get moved off the fast disk. Plex still finds them.">Old episodes and movies nobody has opened this quarter leave the NVMe for a spinning disk; Plex still finds them through the symlink.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache/media --dest /mnt/disk-slow/media --min-idle-days 60</div>
     </div>
     <div class="card">
       <h4>Build directories</h4>
-      <p>Vendor trees, build caches and old targets that outlive their usefulness. Exclude what is still live, keep everything else honest.</p>
+      <p data-simple="Old build folders and caches get moved out of the way.">Vendor trees, build caches and old targets that outlive their usefulness. Exclude what is still live, keep everything else honest.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /opt/builds --dest /mnt/cold/builds --exclude '*/target' --min-size 1MiB</div>
     </div>
     <div class="card">
       <h4>Strict scope</h4>
-      <p>Manage only the trees you say, never touch anything else. Scope is checked before every other rule and again before bytes move.</p>
+      <p data-simple="It only touches folders you name, and it checks that rule twice before moving anything.">Manage only the trees you say, never touch anything else. Scope is checked before every other rule and again before bytes move.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /srv/data --dest /mnt/cold --include 'media/**' --include 'scratch/**' --exclude '*.part'</div>
     </div>
     <div class="card">
       <h4>Replication</h4>
-      <p>A durability floor: N verified copies on N distinct disks before the source is removed. Checksummed, never guessed.</p>
+      <p data-simple="Want two copies before the original goes away? Ask for it, and it checks each one.">A durability floor: N verified copies on N distinct disks before the source is removed. Checksummed, never guessed.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache --dest /mnt/disk-a --dest /mnt/disk-b --copies 2 --min-idle-days 30 --once</div>
     </div>
     <div class="card">
       <h4>Backups &amp; archives</h4>
-      <p>Anything written once and read rarely — ISOs, VM images, old project snapshots — flows to cheap bulk storage and stays reachable.</p>
+      <p data-simple="Big files you rarely open end up on cheap storage and stay reachable.">Anything written once and read rarely — ISOs, VM images, old project snapshots — flows to cheap bulk storage and stays reachable.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/fast/archive --dest /mnt/bulk/archive --min-idle-days 90</div>
     </div>
     <div class="card">
       <h4>Never a full disk</h4>
-      <p>Each destination keeps a free-space floor. A tier that is out of room reports <em>waiting for room</em> and picks the file up next sweep.</p>
+      <p data-simple="Each destination keeps some free space spare. When one fills up, it waits and tries again on the next sweep.">Each destination keeps a free-space floor. A tier that is out of room reports <em>waiting for room</em> and picks the file up next sweep.</p>
       <div class="cmd"><span class="ps">$</span> just_cache --watch /mnt/cache --dest /mnt/disk-slow --min-free-gb 50 --limit 10</div>
     </div>
   </div>
@@ -303,50 +339,50 @@
 <section id="how">
   <div class="kicker">How it works</div>
   <h2>Cold is measured, not guessed</h2>
-  <p class="lead">A file moves only when every gate passes — and the tool tells you which gate stopped it.</p>
+  <p class="lead" data-simple="A file only moves if every rule says yes. If one says no, it tells you which.">A file moves only when every gate passes — and the tool tells you which gate stopped it.</p>
   <div class="features">
-    <div class="feat"><div class="name">Last use</div><p>Idle time comes from the filesystem's access time for a file reached through its symlink. A file read through the mount is judged by the accesses the mount observed itself, so a <code class="inline">noatime</code> filesystem cannot make a warm file look cold.</p></div>
-    <div class="feat"><div class="name">In use = not cold</div><p>A file held open by another process, or hardlinked elsewhere, is skipped and counted separately — never moved out from under a reader.</p></div>
-    <div class="feat"><div class="name">Scope is law</div><p><code class="inline">--include</code> / <code class="inline">--exclude</code> and the size window are the outermost gate, checked before every other rule and again right before bytes move.</p></div>
-    <div class="feat"><div class="name">Verify before delete</div><p>A copy is hashed and matched to the source before the original is removed. Same size is not enough; a mismatch is refused.</p></div>
-    <div class="feat"><div class="name">Survives a crash</div><p>Every move writes an fsynced intent record first. Recovery asks the filesystem what actually happened and never deletes the only copy.</p></div>
-    <div class="feat"><div class="name">One file never stops a sweep</div><p>Failures are per-file and reported; a sweep keeps going, and <code class="inline">--once</code> exits non-zero if anything failed.</p></div>
+    <div class="feat"><div class="name">Last use</div><p data-simple="Old means nobody has opened it in a long time. It checks that properly, even on filesystems that track read times badly.">Idle time comes from the filesystem's access time for a file reached through its symlink. A file read through the mount is judged by the accesses the mount observed itself, so a <code class="inline">noatime</code> filesystem cannot make a warm file look cold.</p></div>
+    <div class="feat"><div class="name">In use = not cold</div><p data-simple="If a program has the file open, it skips it. Nothing gets yanked out of anyone's hands.">A file held open by another process, or hardlinked elsewhere, is skipped and counted separately — never moved out from under a reader.</p></div>
+    <div class="feat"><div class="name">Scope is law</div><p data-simple="Only files you allowed. It checks that right before moving, not just at the start."><code class="inline">--include</code> / <code class="inline">--exclude</code> and the size window are the outermost gate, checked before every other rule and again right before bytes move.</p></div>
+    <div class="feat"><div class="name">Verify before delete</div><p data-simple="It compares the copy to the original before deleting anything. The same size is not good enough.">A copy is hashed and matched to the source before the original is removed. Same size is not enough; a mismatch is refused.</p></div>
+    <div class="feat"><div class="name">Survives a crash</div><p data-simple="It writes down its plan before moving anything, so after a crash it can work out what happened - and it never deletes your last copy.">Every move writes an fsynced intent record first. Recovery asks the filesystem what actually happened and never deletes the only copy.</p></div>
+    <div class="feat"><div class="name">One file never stops a sweep</div><p data-simple="One problem file does not stop the rest. You get a list of what failed.">Failures are per-file and reported; a sweep keeps going, and <code class="inline">--once</code> exits non-zero if anything failed.</p></div>
   </div>
 </section>
 
 <section id="more">
   <div class="kicker">The rest of the toolbox</div>
   <h2>Beyond moving files</h2>
-  <p class="lead">Catalog and recovery commands let you locate, check, and restore files explicitly.</p>
+  <p class="lead" data-simple="Commands that tell you where a file is, whether it is still good, and how to get it back.">Catalog and recovery commands let you locate, check, and restore files explicitly.</p>
   <div class="features">
-    <div class="feat"><div class="name">explain</div><p>Why is <em>this one file</em> still here? Answers one path in the mover's own evaluation order, read-only.</p></div>
-    <div class="feat"><div class="name">catalog</div><p>Records where every object lives, keyed by content hash, in a SQLite catalog — identity survives a rename.</p></div>
-    <div class="feat"><div class="name">audit</div><p>Walks both sides and classifies every path: healthy, duplicate, dangling, orphaned. Exit code 1 on any finding, so cron can alert.</p></div>
-    <div class="feat"><div class="name">locate</div><p>"Where does this live?" answered from the catalog, even when the tier holding it is not mounted.</p></div>
-    <div class="feat"><div class="name">restore</div><p>Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
-    <div class="feat"><div class="name">scrub</div><p>Checks each reachable stored copy against its recorded checksum and repairs rot only from a sibling copy that verifies. A copy on an offline volume is verified the same way when that volume is in the drive, and reported <code class="inline">unavailable</code> by its volume identity — never corrupt, never missing — when it is not.</p></div>
-    <div class="feat"><div class="name">reconcile</div><p>Rebuilds missing copies on reachable disks, proving each against the catalog before recording it.</p></div>
-    <div class="feat"><div class="name">pin</div><p>Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
-    <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
-    <div class="feat"><div class="name">gateway</div><p>Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
-    <div class="feat"><div class="name">mcp</div><p>Serves the read-only questions — locate, explain, audit, a dry-run scrub — to a coding agent over MCP on stdio. Starts with its client and exits with it, and no tool moves, repairs or deletes anything; <code class="inline">restore</code> appears only when the operator opts in.</p></div>
-    <div class="feat"><div class="name">schedule</div><p>Runs the maintenance passes <code class="inline">schedule.toml</code> says are due and prints, per pass, the next planned run — so cron can show what it will do before it does it.</p></div>
-    <div class="feat"><div class="name">events</div><p>Every maintenance pass appends the JSON report it produced to an append-only JSONL file under the <code class="inline">.just_cache</code> prefix the walk skips — the stream a web dashboard tails over SSE, and the command's own report, never a second schema. A torn final line is skipped by readers, not called corrupt.</p></div>
-    <div class="feat"><div class="name">notify</div><p>Posts a short summary of a scheduled run, and an <code class="inline">audit</code>'s findings, to a Discord-compatible webhook — only when <code class="inline">notify.toml</code> sits beside the catalog. Unconfigured, no socket is opened; the URL is a credential and is never printed; a delivery failure is a warning, never a failed pass.</p></div>
-    <div class="feat"><div class="name">ui</div><p>Serves a small read-only dashboard from the binary: a static shell, JSON views that replay the read-only commands' own documents byte for byte, and the maintenance events streamed live. Token auth from a file or an environment variable, loopback by default, and no route that moves, repairs or deletes anything.</p></div>
-    <div class="feat"><div class="name">unpin</div><p>Clears a pin set by <code class="inline">pin</code>.</p></div>
-    <div class="feat"><div class="name">RAM cache</div><p>Promotes reads that meet a configured threshold into a bounded RAM/SSD overlay. The durable home stays authoritative; <a href="#ram-cache">see how promotion and eviction work.</a></p></div>
-    <div class="feat"><div class="name">catalog delete</div><p>Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
-    <div class="feat"><div class="name">gc</div><p>Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
-    <div class="feat"><div class="name">object-server</div><p>Serves an S3-compatible object endpoint backed by local directories, so a LAN peer can be a tier without running a full tool install. SigV4 auth; writes land through the same verified path.</p></div>
-    <div class="feat"><div class="name">volume</div><p>The vault ledger for offline-volume tiers: which physical volume is in a tier's drive and where the others are. The catalog is the source of truth — no marker file is ever written into the volume.</p></div>
+    <div class="feat"><div class="name">explain</div><p data-simple="Ask about one file: why is it still here? It answers.">Why is <em>this one file</em> still here? Answers one path in the mover's own evaluation order, read-only.</p></div>
+    <div class="feat"><div class="name">catalog</div><p data-simple="A list of every file and every copy of it, so a rename never loses track.">Records where every object lives, keyed by content hash, in a SQLite catalog — identity survives a rename.</p></div>
+    <div class="feat"><div class="name">audit</div><p data-simple="Checks everything and sorts the problems into groups. Exits with an error code when something is wrong, so scheduled jobs can nag you.">Walks both sides and classifies every path: healthy, duplicate, dangling, orphaned. Exit code 1 on any finding, so cron can alert.</p></div>
+    <div class="feat"><div class="name">locate</div><p data-simple="Tells you where a file lives, even if that disk is unplugged.">"Where does this live?" answered from the catalog, even when the tier holding it is not mounted.</p></div>
+    <div class="feat"><div class="name">restore</div><p data-simple="Puts a file back on the fast disk, checks it, and cleans up the shortcut.">Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
+    <div class="feat"><div class="name">scrub</div><p data-simple="Reads every copy back and compares it to the checksum it recorded. A broken one gets fixed from a good copy. Files on a plugged-in shelf-disk get checked too; if the disk is not plugged in, it says so instead of guessing.">Checks each reachable stored copy against its recorded checksum and repairs rot only from a sibling copy that verifies. A copy on an offline volume is verified the same way when that volume is in the drive, and reported <code class="inline">unavailable</code> by its volume identity — never corrupt, never missing — when it is not.</p></div>
+    <div class="feat"><div class="name">reconcile</div><p data-simple="If a disk comes back missing files, it rebuilds them from good copies - but only after proving each one.">Rebuilds missing copies on reachable disks, proving each against the catalog before recording it.</p></div>
+    <div class="feat"><div class="name">pin</div><p data-simple="Tell it to leave one file alone until a date you pick. After that, the normal rules apply again.">Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
+    <div class="feat"><div class="name">mount</div><p data-simple="Makes everything look like it is still in one folder, even the files on other disks.">Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>
+    <div class="feat"><div class="name">gateway</div><p data-simple="The same one-folder view over the network, for backup programs that cannot mount folders.">Serves the same namespace over an authenticated WebDAV endpoint for backup apps that cannot mount. Reads change nothing; a restore request places bytes through the verified path.</p></div>
+    <div class="feat"><div class="name">mcp</div><p data-simple="Lets a coding agent ask the read-only questions. It cannot move or delete anything unless you turn that on.">Serves the read-only questions — locate, explain, audit, a dry-run scrub — to a coding agent over MCP on stdio. Starts with its client and exits with it, and no tool moves, repairs or deletes anything; <code class="inline">restore</code> appears only when the operator opts in.</p></div>
+    <div class="feat"><div class="name">schedule</div><p data-simple="Runs its own chores on a timetable you set, and tells you what is due.">Runs the maintenance passes <code class="inline">schedule.toml</code> says are due and prints, per pass, the next planned run — so cron can show what it will do before it does it.</p></div>
+    <div class="feat"><div class="name">events</div><p data-simple="Every run writes its report to a log file. The dashboard shows that log live.">Every maintenance pass appends the JSON report it produced to an append-only JSONL file under the <code class="inline">.just_cache</code> prefix the walk skips — the stream a web dashboard tails over SSE, and the command's own report, never a second schema. A torn final line is skipped by readers, not called corrupt.</p></div>
+    <div class="feat"><div class="name">notify</div><p data-simple="Can post a summary to Discord when a scheduled run finishes, if you give it a webhook. No webhook means no messages.">Posts a short summary of a scheduled run, and an <code class="inline">audit</code>'s findings, to a Discord-compatible webhook — only when <code class="inline">notify.toml</code> sits beside the catalog. Unconfigured, no socket is opened; the URL is a credential and is never printed; a delivery failure is a warning, never a failed pass.</p></div>
+    <div class="feat"><div class="name">ui</div><p data-simple="A little website showing all of the above: your tiers, the problems, the schedule, live activity. Read-only.">Serves a small read-only dashboard from the binary: a static shell, JSON views that replay the read-only commands' own documents byte for byte, and the maintenance events streamed live. Token auth from a file or an environment variable, loopback by default, and no route that moves, repairs or deletes anything.</p></div>
+    <div class="feat"><div class="name">unpin</div><p data-simple="Removes a pin.">Clears a pin set by <code class="inline">pin</code>.</p></div>
+    <div class="feat"><div class="name">RAM cache</div><p data-simple="The fast-cache thing from further up the page.">Promotes reads that meet a configured threshold into a bounded RAM/SSD overlay. The durable home stays authoritative; <a href="#ram-cache">see how promotion and eviction work.</a></p></div>
+    <div class="feat"><div class="name">catalog delete</div><p data-simple="Deletes a file's records and its copies, carefully: it refuses when a copy is broken or the file is pinned.">Releases a name and, when it was the object's last, its recorded copies — in one committed step, refusing with a named reason when a pin or a damaged copy makes the delete unsafe. A copy on a tier that is not mounted is held until that tier returns, never guessed at.</p></div>
+    <div class="feat"><div class="name">gc</div><p data-simple="Finds bytes nothing remembers owning, and deletes them only if you say --apply.">Reports the bytes and empty directories on a tier that no catalog row references, and removes them only under <code class="inline">--apply</code>. A copy claimed by a row — even an unverified one — is kept.</p></div>
+    <div class="feat"><div class="name">object-server</div><p data-simple="Runs a fake-S3 server so another computer can be a storage tier.">Serves an S3-compatible object endpoint backed by local directories, so a LAN peer can be a tier without running a full tool install. SigV4 auth; writes land through the same verified path.</p></div>
+    <div class="feat"><div class="name">volume</div><p data-simple="The list of shelf-disks: which one is plugged in, and where the others are.">The vault ledger for offline-volume tiers: which physical volume is in a tier's drive and where the others are. The catalog is the source of truth — no marker file is ever written into the volume.</p></div>
   </div>
 </section>
 
 <section id="dashboard">
   <div class="kicker">The dashboard</div>
   <h2>A read-only window on the whole system</h2>
-  <p class="lead">
+  <p class="lead" data-simple="The tool itself serves a small website: your tiers, the audit results, the schedule, and activity as it happens. Everything on screen comes straight from the commands' own reports.">
     <code class="inline">just_cache ui</code> serves a small dashboard from the binary itself:
     the tier map, the audit findings, the schedule, and the maintenance events as they happen.
     Every number on screen is one of the commands' own <code class="inline">--json</code>
@@ -382,7 +418,7 @@
     <figcaption><b>Schedule</b> — each pass from <code class="inline">schedule --json</code>: cadence, next run, rate and free-space floor, and whether it is due now.</figcaption>
   </figure>
 
-  <div class="note"><strong>These are captures, not a demo.</strong> The screenshots were taken
+  <div class="note" data-simple="The screenshots are real. There is no online demo on purpose: run the three commands above and this is what you get."><strong>These are captures, not a demo.</strong> The screenshots were taken
   from a real server running against a throwaway tree. There is no hosted demo, on purpose: a
   static copy of the page would have no documents to render, and the page does not invent
   numbers its documents do not carry. Run the three commands above and this is what you get.</div>
@@ -391,7 +427,7 @@
 <section id="vision">
   <div class="kicker">Where this goes</div>
   <h2>One namespace over every tier you own</h2>
-  <p class="lead">
+  <p class="lead" data-simple="The long-term idea: one folder view over every disk, server, cloud bucket and shelf-disk you own, with a fast cache in front. Most of that already exists today.">
     The design is one namespace over SSD, spinning disks, a LAN peer, cloud object storage and an
     offline disk in a drawer, with a fast cache overlay in front and placement driven by observed
     use, in the spirit of S3 storage classes. Local tiers are what this repo does today: the mover
@@ -413,5 +449,46 @@
 </footer>
 
 </main>
+
+<div class="brain-toggle" role="group" aria-label="Reading mode">
+  <button type="button" id="brain-big" title="Big brain: the full story" aria-pressed="true">🧠</button>
+  <button type="button" id="brain-small" class="small" title="Small brain: keep it simple" aria-pressed="false">🧠</button>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var KEY = "jc-brain-mode";
+  var els = Array.prototype.slice.call(document.querySelectorAll("[data-simple]"));
+
+  function apply(mode) {
+    var simple = mode === "small";
+    document.body.classList.toggle("simple-mode", simple);
+    els.forEach(function (el) {
+      if (simple) {
+        if (el.dataset.complex === undefined) el.dataset.complex = el.innerHTML;
+        el.textContent = el.getAttribute("data-simple");
+      } else if (el.dataset.complex !== undefined) {
+        el.innerHTML = el.dataset.complex;
+      }
+    });
+    document.getElementById("brain-big").setAttribute("aria-pressed", String(!simple));
+    document.getElementById("brain-small").setAttribute("aria-pressed", String(simple));
+  }
+
+  document.getElementById("brain-big").addEventListener("click", function () {
+    apply("big");
+    try { localStorage.setItem(KEY, "big"); } catch (e) {}
+  });
+  document.getElementById("brain-small").addEventListener("click", function () {
+    apply("small");
+    try { localStorage.setItem(KEY, "small"); } catch (e) {}
+  });
+
+  var saved = "big";
+  try { saved = localStorage.getItem(KEY) === "small" ? "small" : "big"; } catch (e) {}
+  apply(saved);
+})();
+</script>
 </body>
 </html>
