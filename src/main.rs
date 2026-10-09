@@ -1303,7 +1303,7 @@ fn tiers_document(
         out.push_str(&format!(",\"copies\":{}", tier.copies));
         if let Some(cost) = &tier.cost {
             out.push_str(",\"cost\":");
-            out.push_str(&json_string(cost));
+            out.push_str(&json_string(cost.written()));
         }
         if let Some(ref object) = tier.object_config {
             out.push_str(",\"endpoint\":");
