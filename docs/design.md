@@ -1941,6 +1941,19 @@ limits:
   loaded, the copy is reported unavailable by name with the key error as the reason, not read,
   not called corrupt, and not called healthy.
 
+A finished offload now reconciles like a filesystem move does. `sync` still reports the tree
+fact — the watch copy is gone — and leaves the rows alone, because it is report-not-heal; what
+changed is that `catalog resolve` can now conclude it: an object that survives on a tier the
+walk cannot observe (an `offline` volume, or a remote) is evidence that its stale watch-tier
+location row can be dropped, the same "stale hot row replaced by the cold one" rule a
+filesystem move obeys (§3). The name row stays, because it is how `locate` and `restore` find
+the bytes again, and a later `sync` agrees — no difference left to repeat. For the same
+reason, `sync` and `resolve` no longer report an `offline` row as "no file at
+`<volume-id>/<relative>` on its tier any more": that tier is not a scanned root, so the pass
+never looked at the bytes, and claiming their absence would be a lie. Whether an offline
+volume's bytes are still good stays the offline driver's job — `scrub` (#181), and
+`reconcile` (#182) when a volume comes back.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator
