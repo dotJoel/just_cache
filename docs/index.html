@@ -324,7 +324,7 @@
     <div class="feat"><div class="name">audit</div><p>Walks both sides and classifies every path: healthy, duplicate, dangling, orphaned. Exit code 1 on any finding, so cron can alert.</p></div>
     <div class="feat"><div class="name">locate</div><p>"Where does this live?" answered from the catalog, even when the tier holding it is not mounted.</p></div>
     <div class="feat"><div class="name">restore</div><p>Brings an offloaded file's bytes back to its hot path, verified, and collapses the symlink into a real file.</p></div>
-    <div class="feat"><div class="name">scrub</div><p>Checks each reachable stored copy against its recorded checksum and repairs rot only from a sibling copy that verifies.</p></div>
+    <div class="feat"><div class="name">scrub</div><p>Checks each reachable stored copy against its recorded checksum and repairs rot only from a sibling copy that verifies. A copy on an offline volume is verified the same way when that volume is in the drive, and reported <code class="inline">unavailable</code> by its volume identity — never corrupt, never missing — when it is not.</p></div>
     <div class="feat"><div class="name">reconcile</div><p>Rebuilds missing copies on reachable disks, proving each against the catalog before recording it.</p></div>
     <div class="feat"><div class="name">pin</div><p>Keeps one object on its tier until a date you name, whatever the idle rules say. A lapsed pin simply stops mattering, and says so.</p></div>
     <div class="feat"><div class="name">mount</div><p>Mounts the catalog's namespace with FUSE, so a consumer that does not follow symlinks sees real bytes for an offloaded file. Reads recall the bytes and are observed by the mount, not inferred from access time.</p></div>

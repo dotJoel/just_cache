@@ -465,6 +465,8 @@ These are lessons already learned in v0.2.0 and are binding for every driver:
   `kind` dispatch; what each leaves open is in §9. P3 is closed.)*
 - **P4 — cost-aware policy**: per-tier cost models, placement reports, rule
   suggestions from observed access.
+  *(P4 has opened: #163 made a tier's `cost` a model the parse refuses to misread;
+  #164–#166 remain.)*
 
 Each phase ships something usable alone: P0 is a better standalone mover; P1 makes it
 trustworthy; P2 removes the symlink breakage; P3 completes the S3 analogy; P4 is the

@@ -150,6 +150,8 @@ worth reading before editing the code around them.
 | `tests/` | Integration tests against real temporary trees; `tests/support/` for the shared second-filesystem helpers. |
 
 P0–P3 (the phase list in `docs/design.md` §8) are complete: P3 — remote tiers — closed with
-#146, #140, #141, #142, #143 and #144. P4 — cost-aware policy — is next; §9 lists
+#146, #140, #141, #142, #143 and #144. P4 — cost-aware policy — has opened: #163 gave a tier's `cost` a model the parse
+refuses to misread, and #164–#166 (placement reports, rule suggestions, retention)
+remain. §9 lists
 what is still open, and anything you add there should be added to §9 and §10 rather than left
 in a commit message.
