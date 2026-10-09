@@ -1415,14 +1415,39 @@ impl Catalog {
                                 applied: apply,
                             });
                         }
-                        None => irreconcilable.push(Difference {
-                            kind: DifferenceKind::NameVanished,
-                            path: PathBuf::from(path),
-                            detail: format!(
-                                "object {} has no surviving name in the tree; left alone, nothing deleted",
-                                hex(id)
-                            ),
-                        }),
+                        None => {
+                            // The tree no longer holds the name. If the object survives on a
+                            // tier the walk cannot see — an `offline` volume (§3) — this is a
+                            // finished offload, not a difference: the name row stays (it is
+                            // how `locate` and `restore` find the bytes again) and the stale
+                            // watch-tier location row is dropped once, the same "stale hot row
+                            // replaced by the cold one" rule a filesystem move obeys (#181).
+                            match surviving_location(&observation, &existing, id, &hot) {
+                                Some((tier, storage_key)) => {
+                                    if existing.locations.get(&hot) == Some(id) {
+                                        drop_locations.insert(hot.clone());
+                                        resolutions.push(Resolution {
+                                            kind: DifferenceKind::LocationMissing,
+                                            path: PathBuf::from(&hot.1),
+                                            detail: format!(
+                                                "on {}; object {} offloaded to {tier}/{storage_key}; stale row dropped",
+                                                hot.0,
+                                                hex(id)
+                                            ),
+                                            applied: apply,
+                                        });
+                                    }
+                                }
+                                None => irreconcilable.push(Difference {
+                                    kind: DifferenceKind::NameVanished,
+                                    path: PathBuf::from(path),
+                                    detail: format!(
+                                        "object {} has no surviving name in the tree; left alone, nothing deleted",
+                                        hex(id)
+                                    ),
+                                }),
+                            }
+                        }
                     }
                 }
                 Some(new_id) if new_id == id => {}
@@ -1465,6 +1490,14 @@ impl Catalog {
 
         for (key, id) in &existing.locations {
             if handled.contains(key) {
+                continue;
+            }
+            // A row on a tier this pass did not walk — an `offline` volume, or a remote —
+            // is not a filesystem location here: `<volume-id>/<relative>` under a root the
+            // walk never scanned. Whether its bytes are good is the offline driver's job
+            // (`scrub`, and `reconcile` #182), never this pass's guess, so the row is left
+            // alone and reported by nothing (#181).
+            if !observation.roots.contains(&key.0) {
                 continue;
             }
             match observation.locations.get(key) {
@@ -1907,6 +1940,14 @@ impl Catalog {
             // report changes — it must not claim a disappearance the pass did not see
             // (issue #53).
             if observation.unreadable_locations.contains(&observed_key) {
+                continue;
+            }
+            // A row on a tier this pass did not walk (an `offline` volume, or a remote) is
+            // not a filesystem location: `<volume-id>/<relative>` under a root the walk
+            // never scanned, so "no file at ..." would be a claim about a path that was
+            // never checked. Its bytes are the offline driver's to verify or release
+            // (`scrub`, `reconcile` #182); the row is left alone (#181).
+            if !observation.roots.contains(tier) {
                 continue;
             }
             let relocated = *tier == observation.watch_tier
@@ -3251,11 +3292,43 @@ fn surviving_location(
     id: &ObjectId,
     exclude: &LocationKey,
 ) -> Option<LocationKey> {
-    observation
+    if let Some(key) = observation
         .locations
         .iter()
         .find(|(key, object)| {
             *object == id && *key != exclude && existing.locations.get(*key) == Some(*object)
+        })
+        .map(|(key, _)| key.clone())
+    {
+        return Some(key);
+    }
+    // A copy the walk cannot see — an `offline` volume, or a remote tier, whose row is keyed
+    // by the configured tier name and is not a scanned root — still records that the object
+    // lives somewhere real. Without this, a completed offload's stale watch-tier row is an
+    // irreconcilable difference for ever, and every later `scrub` names bytes that are safe
+    // in a drawer as missing (#181).
+    unobservable_survivor(observation, existing, id, exclude)
+}
+
+/// A location row on a tier this observation did not walk: an `offline` volume's copy, or a
+/// remote. The catalog's own row is the record that the object survives off the watched
+/// tree, which is what lets a vanished tree location be dropped rather than kept (invariant
+/// 3: a location is only removed when another one still holds the object). A row the mover
+/// wrote but no digest has vouched for does not count.
+fn unobservable_survivor(
+    observation: &Observation,
+    existing: &Existing,
+    id: &ObjectId,
+    exclude: &LocationKey,
+) -> Option<LocationKey> {
+    existing
+        .locations
+        .iter()
+        .find(|(key, object)| {
+            *object == id
+                && *key != exclude
+                && !observation.roots.contains(&key.0)
+                && !existing.unverified.contains(*key)
         })
         .map(|(key, _)| key.clone())
 }

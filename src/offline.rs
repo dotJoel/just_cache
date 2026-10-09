@@ -214,6 +214,45 @@ pub fn mounted_volume(
         .map_err(|source| OfflineError::Catalog { source })
 }
 
+/// Where an `offline` copy's bytes live *right now*: `<mount>/<relative>`, but only when the
+/// volume ledger says the same volume the key names is the one in the tier's drive.
+///
+/// The key is `<volume-id>/<relative>` (D3), and the `volume` row binding that id to the
+/// tier is what says its disk is present (docs/design.md §3) — the filesystem cannot be asked
+/// whether a *different* disk is mounted in its place. `Ok(None)` therefore means *not this
+/// volume*: the caller reports the copy unavailable by its volume identity rather than
+/// reading another disk's bytes. The mount is joined only after the identity matches, and a
+/// key that would escape the mount is refused with `Ok(None)` for the same reason — a read
+/// path never resolves to a path outside the volume it was told to trust.
+///
+/// This answers *where the bytes are*, not whether the mount is actually there: a tier
+/// recorded mounted whose directory is absent is still the caller's check, because only the
+/// caller knows whether it can say "insert the volume" (D5). The one resolver both the scrub
+/// (#181) and the reconcile (#182) read an `offline` row through, so the identity rule is
+/// written once.
+pub fn resolve_mounted_location(
+    catalog: &catalog::Catalog,
+    tier: &str,
+    storage_key: &str,
+    mount: &Path,
+) -> Result<Option<PathBuf>, OfflineError> {
+    let Some((volume_id, relative)) = parse_storage_key(storage_key) else {
+        return Ok(None);
+    };
+    let mounted = mounted_volume(catalog, tier)?;
+    match mounted {
+        Some(record) if record.id == volume_id => {
+            let path = mount.join(&relative);
+            if path.starts_with(mount) {
+                Ok(Some(path))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// fsync a directory so a rename into it survives a crash. Opening a directory read-only is
 /// enough on the platforms this tool runs on.
 fn sync_dir(dir: &Path) -> Result<(), OfflineError> {

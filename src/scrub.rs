@@ -29,6 +29,20 @@
 //! that "rot" would be a lie. A tier root that does not exist is reported once and its
 //! locations are left unchecked for the same reason.
 //!
+//! # Offline-volume copies (#181)
+//!
+//! A copy on an `offline` tier has no local representation: its bytes sit on a disk a person
+//! inserts, sealed in the [`crate::envelope`], and the object id is the checksum of the
+//! *plaintext*. When the ledger says the volume the location's `<volume-id>/<relative>` key
+//! names is the one in the drive, the copy is read back, decrypted, and hashed exactly like a
+//! local one — and repaired like one, from a verified sibling, by re-exporting that sibling's
+//! plaintext as a fresh envelope. When the volume is *not* in the drive (or no `tiers.toml`
+//! beside the catalog describes its tier), the copy is reported **unavailable by its volume
+//! identity**: never corrupt (nothing was read), never healthy (nothing was proved), and not
+//! a missing file (the row names a disk, not a path that has gone). The tier config is the
+//! config beside the catalog, as every other command defaults to, so the scrub names no new
+//! flag.
+//!
 //! # Resuming instead of re-reading
 //!
 //! The last verification of every location lives in the catalog (`scrub_state`), written
@@ -73,12 +87,19 @@ use thiserror::Error;
 
 use crate::catalog::{Catalog, CatalogError, MalformedRow, ScrubTarget};
 use crate::digest;
+use crate::envelope::Key;
+use crate::offline;
 use crate::restore;
+use crate::tiers::TierSet;
 
 #[derive(Debug, Error)]
 pub enum ScrubError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+    /// A refusal the offline read path raised: a row whose key names no volume, or a ledger
+    /// the catalog could not answer from.
+    #[error(transparent)]
+    Offline(#[from] offline::OfflineError),
 }
 
 /// A wall-clock throttle for the digest read loop.
@@ -142,6 +163,11 @@ enum Check {
     Missing,
     /// The location could not be read at all (permissions, I/O error).
     Unreadable(String),
+    /// An `offline` copy whose volume is not in the drive this run, so its bytes could not be
+    /// reached. A verdict in its own right: never corrupt (nothing was read), never healthy
+    /// (nothing was proved), and not a missing file (the row names a disk, not a path that
+    /// has gone). Reported by its volume identity (issue #181).
+    Unavailable(String),
     /// The row was refused before any filesystem call: its tier is not a trusted root, or
     /// its key would escape one. Reported, never touched (issue #72).
     Malformed,
@@ -169,6 +195,28 @@ pub struct DamageRecord {
     pub detail: String,
 }
 
+/// A recorded `offline` copy this run could not reach, named by the volume its key names.
+///
+/// The scrub keeps three verdicts apart that are easy to blur: a copy that was read and
+/// matched (verified), a copy that was read and did not (corrupt), and a copy that was not
+/// read at all because the disk holding it is not in the drive (unavailable). Only the first
+/// is health and only the second is rot; this is the third, and it is reported by the volume
+/// identity the row names rather than as a missing file — an unplugged disk is not a path
+/// that has vanished, and calling it either healthy or corrupt would be a claim nothing read
+/// can support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableRecord {
+    /// The offline tier whose drive the volume belongs in.
+    pub tier: String,
+    /// The volume the location's storage key names.
+    pub volume: String,
+    /// The storage key as recorded, `<volume-id>/<relative>`.
+    pub storage_key: String,
+    /// Why it could not be reached: the volume is not mounted, the tier is not described
+    /// beside the catalog, or the envelope key could not be loaded.
+    pub detail: String,
+}
+
 /// The whole result of one scrub.
 #[derive(Debug, Default)]
 pub struct ScrubReport {
@@ -187,6 +235,9 @@ pub struct ScrubReport {
     /// Catalog rows refused as paths (issue #72): reported, and no filesystem call was
     /// made for them.
     pub malformed: Vec<MalformedRow>,
+    /// Recorded `offline` copies whose volume is not in the drive this run, named by their
+    /// volume identity (issue #181).
+    pub unavailable: Vec<UnavailableRecord>,
     /// Tier roots that do not exist, named once each rather than as one missing file per
     /// location underneath them.
     pub skipped_tiers: Vec<String>,
@@ -203,6 +254,7 @@ impl ScrubReport {
             || !self.missing.is_empty()
             || !self.unreadable.is_empty()
             || !self.malformed.is_empty()
+            || !self.unavailable.is_empty()
             || !self.skipped_tiers.is_empty()
     }
 
@@ -211,6 +263,12 @@ impl ScrubReport {
         let mut lines = Vec::new();
         for tier in &self.skipped_tiers {
             lines.push(format!("  tier not mounted, not checked: {tier}"));
+        }
+        for copy in &self.unavailable {
+            lines.push(format!(
+                "  unavailable: tier `{}` volume `{}` ({}) — {}",
+                copy.tier, copy.volume, copy.storage_key, copy.detail
+            ));
         }
         for row in &self.malformed {
             lines.push(row.describe());
@@ -255,14 +313,15 @@ impl ScrubReport {
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!("scrub: {}", self.catalog.display())];
         lines.push(format!(
-            "  locations: {} ({} verified, {} already verified (skipped), {} repaired, {} damaged, {} missing, {} malformed)",
+            "  locations: {} ({} verified, {} already verified (skipped), {} repaired, {} damaged, {} missing, {} malformed, {} unavailable)",
             self.locations,
             self.verified,
             self.already_verified,
             self.repairs.len(),
             self.damaged.len(),
             self.missing.len(),
-            self.malformed.len()
+            self.malformed.len(),
+            self.unavailable.len()
         ));
         lines.extend(self.finding_lines());
         if !self.has_findings() {
@@ -358,7 +417,7 @@ impl ScrubReport {
             )
         ));
         out.push_str(&format!(
-            "\"malformed\":[{}]",
+            "\"malformed\":[{}],",
             join(
                 self.malformed
                     .iter()
@@ -367,6 +426,21 @@ impl ScrubReport {
                         json_string(&row.tier),
                         json_string(&row.storage_key),
                         json_string(&row.detail)
+                    ))
+                    .collect()
+            )
+        ));
+        out.push_str(&format!(
+            "\"unavailable\":[{}]",
+            join(
+                self.unavailable
+                    .iter()
+                    .map(|copy| format!(
+                        "{{\"tier\":{},\"volume\":{},\"storage_key\":{},\"detail\":{}}}",
+                        json_string(&copy.tier),
+                        json_string(&copy.volume),
+                        json_string(&copy.storage_key),
+                        json_string(&copy.detail)
                     ))
                     .collect()
             )
@@ -397,6 +471,13 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
     // once, so a hand-edited tier cannot be joined at all (issue #72).
     let roots = catalog.roots()?;
     let mut limiter = RateLimiter::new(request.rate_kib_per_sec);
+
+    // The scrub names no `--tiers`, exactly as it names no `--watch`/`--dest`: an offline
+    // tier's `tiers.toml` sits beside the catalog, the placement every command defaults to,
+    // and the catalog is the source of truth for which volume is in the drive (§3). A config
+    // that is there but broken is not the same as none — it is carried as a refusal so an
+    // offline row reports *why* it could not be read, by name.
+    let offline = OfflineAccess::beside(catalog);
 
     let mut report = ScrubReport {
         catalog: catalog.path().to_path_buf(),
@@ -431,6 +512,7 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
         }
         scrub_object(
             catalog,
+            &offline,
             &targets[start..index],
             &roots,
             &mut limiter,
@@ -444,8 +526,15 @@ pub fn scrub(request: &ScrubRequest<'_>) -> Result<ScrubReport, ScrubError> {
 }
 
 /// Verify every location of one object, then repair the corrupt ones or mark the damage.
+///
+/// Each location is first resolved to something readable — a filesystem copy, an `offline`
+/// copy whose volume is in the drive, or a refusal named for what is known — so the bytes
+/// read below always belong to the copy the row names, never to another disk and never to a
+/// name that escaped its tier.
+#[allow(clippy::too_many_arguments)]
 fn scrub_object(
     catalog: &Catalog,
+    offline: &OfflineAccess,
     group: &[ScrubTarget],
     roots: &[PathBuf],
     limiter: &mut RateLimiter,
@@ -467,30 +556,46 @@ fn scrub_object(
     };
     let object_hex = group[0].object_hex();
 
+    // Resolve every location before touching bytes. The verdict "cannot be reached" is
+    // reached without a read, and is named by what is known (issue #181) rather than read
+    // as a missing file or reported as a failure of the scrub itself.
+    let probes: Vec<Probe> = group
+        .iter()
+        .map(|target| resolve_probe(catalog, offline, target, roots, missing_tiers, report))
+        .collect::<Result<_, _>>()?;
+
     let mut checks: Vec<Check> = Vec::with_capacity(group.len());
-    for target in group {
-        // Every filesystem call below is reached only after the row has proved it stays
-        // under a trusted root; a refused row is reported and skipped untouched (#72).
-        let path = match target.path(roots) {
-            Ok(path) => path,
-            Err(error) => {
-                report
-                    .malformed
-                    .push(MalformedRow::new(&target.tier, &target.storage_key, &error));
+    for (index, probe) in probes.iter().enumerate() {
+        let target = &group[index];
+        match probe {
+            Probe::Unavailable { volume, detail } => {
+                report.unavailable.push(UnavailableRecord {
+                    tier: target.tier.clone(),
+                    volume: volume.clone(),
+                    storage_key: target.storage_key.clone(),
+                    detail: detail.clone(),
+                });
+                checks.push(Check::Unavailable(detail.clone()));
+                continue;
+            }
+            Probe::Malformed => {
                 checks.push(Check::Malformed);
                 continue;
             }
-        };
-        if missing_tiers.contains(&target.tier) {
-            checks.push(Check::Missing);
-            continue;
+            Probe::SkippedTier => {
+                // Reported once as a tier (its root is not there), not as a missing file per
+                // location underneath it.
+                checks.push(Check::Missing);
+                continue;
+            }
+            Probe::File(_) | Probe::Offline { .. } => {}
         }
         if target.is_already_verified() {
             checks.push(Check::AlreadyVerified);
             report.already_verified += 1;
             continue;
         }
-        let check = check_location(&path, target.size, &expected, limiter);
+        let check = probe.verify(target.size, &expected, limiter, offline);
         match &check {
             Check::Clean => {
                 report.verified += 1;
@@ -498,9 +603,9 @@ fn scrub_object(
                     catalog.record_verified(&target.tier, &target.storage_key, &target.object)?;
                 }
             }
-            Check::Missing => report.missing.push(path),
-            Check::Unreadable(detail) => report.unreadable.push((path, detail.clone())),
-            Check::AlreadyVerified | Check::Corrupt | Check::Malformed => {}
+            Check::Missing => report.missing.push(probe.location()),
+            Check::Unreadable(detail) => report.unreadable.push((probe.location(), detail.clone())),
+            Check::Corrupt | Check::Unavailable(_) | Check::AlreadyVerified | Check::Malformed => {}
         }
         checks.push(check);
     }
@@ -526,45 +631,44 @@ fn scrub_object(
     // loop carries on past a failed candidate instead of stopping at the first.
     let mut source = checks.iter().position(|check| *check == Check::Clean);
     if source.is_none() {
-        for (index, target) in group.iter().enumerate() {
+        for (index, probe) in probes.iter().enumerate() {
             if checks[index] != Check::AlreadyVerified {
                 continue;
             }
-            // Each candidate's path comes from the validating accessor: a row that does not
-            // stay under a trusted root is refused rather than read, and is reported as a
-            // catalog problem here instead of being silently skipped (#72).
-            let path = match target.path(roots) {
-                Ok(path) => path,
-                Err(error) => {
-                    report.malformed.push(MalformedRow::new(
-                        &target.tier,
-                        &target.storage_key,
-                        &error,
-                    ));
-                    checks[index] = Check::Malformed;
-                    continue;
-                }
-            };
-            let check = check_location(&path, target.size, &expected, limiter);
+            // The probe already proved the row is a filesystem copy under a trusted root or
+            // an `offline` copy the ledger vouches for; there is no second path to refuse
+            // here — an unresolvable or absent row never reached Check::AlreadyVerified.
+            let check = probe.verify(group[index].size, &expected, limiter, offline);
             // This location was counted as skipped during the first pass, but the fallback
             // read did real work. Move it from the skip count into the actual result count.
             report.already_verified -= 1;
             if check == Check::Clean {
                 report.verified += 1;
                 if !dry_run {
-                    catalog.record_verified(&target.tier, &target.storage_key, &target.object)?;
+                    catalog.record_verified(
+                        &group[index].tier,
+                        &group[index].storage_key,
+                        &group[index].object,
+                    )?;
                 }
                 checks[index] = Check::Clean;
                 source = Some(index);
                 break;
             }
             match &check {
-                Check::Missing => report.missing.push(path),
-                Check::Unreadable(detail) => report.unreadable.push((path, detail.clone())),
+                Check::Missing => report.missing.push(probe.location()),
+                Check::Unreadable(detail) => {
+                    report.unreadable.push((probe.location(), detail.clone()))
+                }
                 // Corruption is the reason to keep looking and to mark it below; the loop
                 // simply carries on to the next already-verified candidate.
                 Check::Corrupt => {}
-                Check::Clean | Check::AlreadyVerified | Check::Malformed => unreachable!(),
+                Check::Clean
+                | Check::AlreadyVerified
+                | Check::Malformed
+                | Check::Unavailable(_) => {
+                    unreachable!()
+                }
             }
             checks[index] = check;
         }
@@ -579,93 +683,471 @@ fn scrub_object(
 
     match source {
         Some(source_index) => {
-            let Ok(good) = group[source_index].path(roots) else {
-                return Ok(());
-            };
-            for i in corrupt_indices {
-                let target = &group[i];
-                // A Corrupt location resolved successfully above, so this is the same path
-                // that was read; a refused row was never Corrupt.
-                let Ok(path) = target.path(roots) else {
-                    continue;
-                };
-                if dry_run {
-                    report.repairs.push(RepairRecord {
-                        path,
-                        object: object_hex.clone(),
-                        source: good.clone(),
-                        bytes: target.size,
-                        applied: false,
-                    });
-                    continue;
+            // The verified source's plaintext: a filesystem copy *is* plaintext; an `offline`
+            // copy is decrypted to a local scratch sibling and removed once the repairs are
+            // done. A source that cannot be materialized (a sealed copy that has since become
+            // unreadable) is treated as no source at all, so nothing is repaired from bytes
+            // that were not re-read.
+            match probes[source_index].plaintext(&expected, offline) {
+                Some(source) => {
+                    for i in corrupt_indices {
+                        let probe = &probes[i];
+                        let target = &group[i];
+                        let destination = probe.location();
+                        if dry_run {
+                            report.repairs.push(RepairRecord {
+                                path: destination,
+                                object: object_hex.clone(),
+                                source: source.display.clone(),
+                                bytes: target.size,
+                                applied: false,
+                            });
+                            continue;
+                        }
+                        match probe.repair_from(&source.path, &expected, offline) {
+                            Ok(bytes) => {
+                                catalog.record_verified(
+                                    &target.tier,
+                                    &target.storage_key,
+                                    &target.object,
+                                )?;
+                                report.repairs.push(RepairRecord {
+                                    path: destination,
+                                    object: object_hex.clone(),
+                                    source: source.display.clone(),
+                                    bytes,
+                                    applied: true,
+                                });
+                            }
+                            Err(error) => {
+                                // The repair itself failed (a permission problem, a torn copy
+                                // that did not hash back). The corrupt bytes are still the
+                                // only ones, so the object is marked damaged rather than
+                                // risked.
+                                let detail = format!(
+                                    "checksum mismatch; repair from {} failed: {error}",
+                                    source.display.display()
+                                );
+                                catalog.mark_damaged(
+                                    &target.tier,
+                                    &target.storage_key,
+                                    &target.object,
+                                    &detail,
+                                )?;
+                                report
+                                    .unreadable
+                                    .push((destination.clone(), detail.clone()));
+                                report.damaged.push(DamageRecord {
+                                    object: object_hex.clone(),
+                                    locations: vec![destination],
+                                    detail,
+                                });
+                            }
+                        }
+                    }
+                    source.cleanup();
                 }
-                match restore::replace_from_verified(&good, &path, &expected) {
-                    Ok(bytes) => {
-                        catalog.record_verified(
-                            &target.tier,
-                            &target.storage_key,
-                            &target.object,
-                        )?;
-                        report.repairs.push(RepairRecord {
-                            path,
-                            object: object_hex.clone(),
-                            source: good.clone(),
-                            bytes,
-                            applied: true,
-                        });
-                    }
-                    Err(error) => {
-                        // The repair itself failed (a permission problem, a torn copy that
-                        // did not hash back). The corrupt bytes are still the only ones, so
-                        // the object is marked damaged rather than risked.
-                        let detail = format!(
-                            "checksum mismatch; repair from {} failed: {error}",
-                            good.display()
-                        );
-                        catalog.mark_damaged(
-                            &target.tier,
-                            &target.storage_key,
-                            &target.object,
-                            &detail,
-                        )?;
-                        report.unreadable.push((path.clone(), detail.clone()));
-                        report.damaged.push(DamageRecord {
-                            object: object_hex.clone(),
-                            locations: vec![path],
-                            detail,
-                        });
-                    }
+                None => {
+                    mark_corrupt_damaged(
+                        catalog,
+                        group,
+                        &probes,
+                        &corrupt_indices,
+                        dry_run,
+                        &object_hex,
+                        "checksum mismatch; the verified repair source could not be re-read",
+                        report,
+                    )?;
                 }
             }
         }
         None => {
             // Corruption with nothing verified to repair from: mark it, report it, and
             // touch none of the bytes.
-            let mut locations = Vec::new();
-            for i in corrupt_indices {
-                let target = &group[i];
-                let Ok(path) = target.path(roots) else {
-                    continue;
-                };
-                locations.push(path);
-                if !dry_run {
-                    catalog.mark_damaged(
-                        &target.tier,
-                        &target.storage_key,
-                        &target.object,
-                        "checksum mismatch; no verified copy to repair from",
-                    )?;
-                }
-            }
-            report.damaged.push(DamageRecord {
-                object: object_hex,
-                locations,
-                detail: "checksum mismatch; no verified copy available".to_string(),
-            });
+            mark_corrupt_damaged(
+                catalog,
+                group,
+                &probes,
+                &corrupt_indices,
+                dry_run,
+                &object_hex,
+                "checksum mismatch; no verified copy to repair from",
+                report,
+            )?;
         }
     }
 
     Ok(())
+}
+
+/// Mark every corrupt location of one object damaged, leaving the bytes where they are.
+#[allow(clippy::too_many_arguments)]
+fn mark_corrupt_damaged(
+    catalog: &Catalog,
+    group: &[ScrubTarget],
+    probes: &[Probe],
+    corrupt_indices: &[usize],
+    dry_run: bool,
+    object_hex: &str,
+    detail: &str,
+    report: &mut ScrubReport,
+) -> Result<(), ScrubError> {
+    let mut locations = Vec::new();
+    for &i in corrupt_indices {
+        let target = &group[i];
+        let path = probes[i].location();
+        locations.push(path);
+        if !dry_run {
+            catalog.mark_damaged(&target.tier, &target.storage_key, &target.object, detail)?;
+        }
+    }
+    report.damaged.push(DamageRecord {
+        object: object_hex.to_string(),
+        locations,
+        detail: detail.to_string(),
+    });
+    Ok(())
+}
+
+/// What a scrub can reach beside the catalog to check an `offline` tier's copies: the tier
+/// config (open-if-present, the placement `catalog sync` and every command default to), why
+/// that config could not be read when it is there but broken, and a local scratch directory
+/// for decrypting a copy so its plaintext can be hashed.
+///
+/// The scratch sits beside the catalog — never on the volume — so plaintext never lands on a
+/// disk that leaves the machine, which is the whole reason an `offline` copy is sealed.
+struct OfflineAccess {
+    tiers: Option<TierSet>,
+    /// Why the config beside the catalog could not be read, when one is there but broken.
+    load_error: Option<String>,
+    /// A local directory for `.just_cache-partial-*` scratch files. Beside the catalog,
+    /// which the scrub already writes `scrub_state` to, so it is writable by construction.
+    scratch: PathBuf,
+}
+
+impl OfflineAccess {
+    /// Load the tier config beside the catalog, open-if-present. A config that is there but
+    /// malformed is carried as `load_error`, not swallowed: an `offline` row then reports
+    /// that it could not be read and why.
+    fn beside(catalog: &Catalog) -> Self {
+        let dir = catalog
+            .path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let (tiers, load_error) = match TierSet::load_beside(&dir) {
+            Ok(set) => (set, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        OfflineAccess {
+            tiers,
+            load_error,
+            scratch: dir,
+        }
+    }
+
+    /// A fresh scratch path for a decrypt, under the local directory (never the volume).
+    fn scratch_path(&self) -> PathBuf {
+        crate::disk_management::partial_sibling(&self.scratch)
+    }
+}
+
+/// One location of an object, resolved to something a scrub can read — or to the refusal
+/// that says why it cannot.
+enum Probe {
+    /// A filesystem location: plaintext bytes at this path, under a trusted root.
+    File(PathBuf),
+    /// An `offline` copy: the sealed envelope at `stored`, opened with `key`, on a volume
+    /// the ledger records mounted.
+    Offline { stored: PathBuf, key: Key },
+    /// A filesystem location whose tier root is a trusted root but is not a directory:
+    /// reported once as a tier, and left unchecked rather than called missing here.
+    SkippedTier,
+    /// An `offline` copy whose volume is not in the drive this run (or whose tier is not
+    /// described beside the catalog), refused by name.
+    Unavailable { volume: String, detail: String },
+    /// A row refused before any filesystem call: its tier is neither a trusted root nor a
+    /// volume in the ledger, or its key would escape one.
+    Malformed,
+}
+
+impl Probe {
+    /// The path a report names for this location: the file for a filesystem copy, the sealed
+    /// file for an offline one. Empty only for a row that never reached a read.
+    fn location(&self) -> PathBuf {
+        match self {
+            Probe::File(path) => path.clone(),
+            Probe::Offline { stored, .. } => stored.clone(),
+            Probe::SkippedTier | Probe::Unavailable { .. } | Probe::Malformed => PathBuf::new(),
+        }
+    }
+
+    /// Read the copy back and compare it with the object's checksum.
+    fn verify(
+        &self,
+        size: u64,
+        expected: &blake3::Hash,
+        limiter: &mut RateLimiter,
+        offline: &OfflineAccess,
+    ) -> Check {
+        match self {
+            Probe::File(path) => check_location(path, size, expected, limiter),
+            Probe::Offline { stored, key, .. } => check_sealed_copy(key, stored, expected, offline),
+            // A verdict reached without a read is never re-read here.
+            Probe::SkippedTier | Probe::Unavailable { .. } | Probe::Malformed => Check::Malformed,
+        }
+    }
+
+    /// Write a fresh copy of the verified source's plaintext over this location, and (for a
+    /// sealed copy) read it back before trusting it. Returns the plaintext length written.
+    fn repair_from(
+        &self,
+        source: &Path,
+        expected: &blake3::Hash,
+        offline: &OfflineAccess,
+    ) -> Result<u64, String> {
+        match self {
+            Probe::File(path) => restore::replace_from_verified(source, path, expected)
+                .map_err(|error| error.to_string()),
+            Probe::Offline { stored, key, .. } => {
+                // A repair of a sealed copy is a fresh export of the verified plaintext,
+                // then a read-back decrypt+hash so a torn rewrite cannot become the copy
+                // (§6) — the same verify-before-delete rule the mover runs. The read-back
+                // scratch is local, never on the volume.
+                offline::export(key, source, stored).map_err(|error| error.to_string())?;
+                let scratch = offline.scratch_path();
+                let _ = fs::remove_file(&scratch);
+                let read = offline::read_verify_decrypt(key, stored, Some(expected), &scratch);
+                let _ = fs::remove_file(&scratch);
+                read.map_err(|error| error.to_string())
+            }
+            Probe::SkippedTier | Probe::Unavailable { .. } | Probe::Malformed => {
+                Err("the location has no reachable copy to repair".to_string())
+            }
+        }
+    }
+
+    /// This location's bytes as a plaintext file a repair can read: the copy itself for a
+    /// filesystem location, a decrypted local scratch sibling for an offline one. `None` when
+    /// the plaintext could not be produced (a sealed copy that no longer reads back).
+    fn plaintext(
+        &self,
+        expected: &blake3::Hash,
+        offline: &OfflineAccess,
+    ) -> Option<PlaintextSource> {
+        match self {
+            Probe::File(path) => Some(PlaintextSource {
+                path: path.clone(),
+                display: path.clone(),
+                scratch: None,
+            }),
+            Probe::Offline { stored, key, .. } => {
+                let scratch = offline.scratch_path();
+                let _ = fs::remove_file(&scratch);
+                match offline::read_verify_decrypt(key, stored, Some(expected), &scratch) {
+                    Ok(_) => Some(PlaintextSource {
+                        path: scratch.clone(),
+                        display: stored.clone(),
+                        scratch: Some(scratch),
+                    }),
+                    Err(_) => {
+                        let _ = fs::remove_file(&scratch);
+                        None
+                    }
+                }
+            }
+            Probe::SkippedTier | Probe::Unavailable { .. } | Probe::Malformed => None,
+        }
+    }
+}
+
+/// A verified copy's plaintext, as a file a repair reads. `display` is what the report names
+/// (the copy's own location) while `path` is where the plaintext actually sits, which for an
+/// offline source is a local scratch sibling rather than the sealed file.
+struct PlaintextSource {
+    path: PathBuf,
+    display: PathBuf,
+    /// A scratch file to remove once the repairs are done, when one was made.
+    scratch: Option<PathBuf>,
+}
+
+impl PlaintextSource {
+    fn cleanup(&self) {
+        if let Some(path) = &self.scratch {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Resolve one recorded location to something readable, or to the refusal that names why it
+/// is not.
+///
+/// A tier that is one of the catalog's recorded roots is a filesystem location, exactly as
+/// before (`target.path` refuses a key that would escape it). A tier that is *not* a root and
+/// whose storage key names a volume in the ledger is an `offline` copy (#144's rule): it
+/// resolves to `<mount>/<relative>` only when the ledger says the same volume is mounted, and
+/// otherwise is reported unavailable by its volume identity.
+fn resolve_probe(
+    catalog: &Catalog,
+    offline: &OfflineAccess,
+    target: &ScrubTarget,
+    roots: &[PathBuf],
+    missing_tiers: &BTreeSet<String>,
+    report: &mut ScrubReport,
+) -> Result<Probe, ScrubError> {
+    let is_root = roots
+        .iter()
+        .any(|root| root.as_path() == Path::new(&target.tier));
+    if !is_root {
+        if let Some(probe) = offline_probe(catalog, offline, target)? {
+            return Ok(probe);
+        }
+    }
+    match target.path(roots) {
+        Ok(path) => {
+            if missing_tiers.contains(&target.tier) {
+                Ok(Probe::SkippedTier)
+            } else {
+                Ok(Probe::File(path))
+            }
+        }
+        Err(error) => {
+            report
+                .malformed
+                .push(MalformedRow::new(&target.tier, &target.storage_key, &error));
+            Ok(Probe::Malformed)
+        }
+    }
+}
+
+/// A probe for an `offline` location, or `None` when the row is not one (its tier is not a
+/// root and its storage key names no volume in the ledger) — the caller then falls back to
+/// the filesystem refusal, exactly as before #181.
+fn offline_probe(
+    catalog: &Catalog,
+    offline: &OfflineAccess,
+    target: &ScrubTarget,
+) -> Result<Option<Probe>, ScrubError> {
+    let Some((volume_id, _relative)) = offline::parse_storage_key(&target.storage_key) else {
+        return Ok(None);
+    };
+    // The ledger vouches for the volume id; that is what makes a `<id>/<path>` key an
+    // `offline` location rather than a filesystem key (the rule `catalog delete` applies).
+    if catalog.volume(&volume_id)?.is_none() {
+        return Ok(None);
+    }
+    let unavailable = |detail: String| {
+        Ok(Some(Probe::Unavailable {
+            volume: volume_id.clone(),
+            detail,
+        }))
+    };
+
+    let Some(set) = &offline.tiers else {
+        return unavailable(match &offline.load_error {
+            Some(error) => format!("cannot read the tiers.toml beside the catalog: {error}"),
+            None => format!(
+                "tier `{}` is offline and no tiers.toml beside the catalog describes its \
+                 mount; place one and insert volume `{volume_id}` so the copy can be checked",
+                target.tier
+            ),
+        });
+    };
+    let Some(tier) = set.get(&target.tier) else {
+        return unavailable(format!(
+            "tier `{}` is offline and no tier of that name is in the tiers.toml beside the \
+             catalog",
+            target.tier
+        ));
+    };
+    let Some(config) = tier.offline_config.as_ref() else {
+        return unavailable(format!(
+            "tier `{}` is not an offline tier, so its storage key `{}` names no volume",
+            target.tier, target.storage_key
+        ));
+    };
+    let mount = &tier.path;
+
+    // The catalog is the source of truth for which volume is in the drive (§3): the
+    // filesystem cannot be asked whether a *different* disk is mounted in its place. An
+    // absent (or wrong) volume is named by its identity — never called corrupt, never
+    // called healthy, and not a generic missing file.
+    let mounted = catalog.mounted_volume_for_tier(&target.tier)?;
+    let mounted_id = mounted.as_ref().map(|row| row.id.as_str());
+    if mounted_id != Some(volume_id.as_str()) {
+        return unavailable(offline::insert_prompt(
+            &target.tier,
+            mount,
+            config.vaults.as_slice(),
+            &volume_id,
+            mounted_id,
+        ));
+    }
+    // The ledger says this volume is mounted, so the shared resolver joins the mount.
+    let Some(stored) =
+        offline::resolve_mounted_location(catalog, &target.tier, &target.storage_key, mount)?
+    else {
+        return unavailable(format!(
+            "storage key `{}` does not resolve to a path under {}",
+            target.storage_key,
+            mount.display()
+        ));
+    };
+    if !mount.is_dir() {
+        // The ledger records the disk in the drive, but the mount point is not there: the
+        // disk is out, or was not mounted. Name the volume and where to find it.
+        return unavailable(format!(
+            "volume `{volume_id}` is recorded mounted in tier `{}` but {} is not there; \
+             insert it and run the next pass",
+            target.tier,
+            mount.display()
+        ));
+    }
+    // The configuration supplies the envelope key (§2 rule 2); without it the copy cannot be
+    // opened, and that is reported by name rather than guessed at.
+    let key = match config.load_encryption_key() {
+        Ok(key) => key,
+        Err(error) => {
+            return unavailable(format!(
+                "cannot load the envelope key for tier `{}`: {error}",
+                target.tier
+            ))
+        }
+    };
+    Ok(Some(Probe::Offline { stored, key }))
+}
+
+/// Read a sealed `offline` copy back, decrypt it, and compare the plaintext with the object.
+///
+/// The recorded digest is the plaintext BLAKE3, so a sound volume verifies exactly like a
+/// local copy and "cannot decrypt" never reads as bitrot. `--rate` does not pace this read:
+/// the envelope reader decrypts in its own loop and offers no hook for the limiter, so the
+/// budget bounds filesystem reads only (named in docs/design.md §9).
+fn check_sealed_copy(
+    key: &Key,
+    stored: &Path,
+    expected: &blake3::Hash,
+    offline: &OfflineAccess,
+) -> Check {
+    match fs::symlink_metadata(stored) {
+        Err(_) => return Check::Missing,
+        Ok(metadata) if !metadata.is_file() => {
+            return Check::Unreadable(format!("not a regular file: {}", stored.display()))
+        }
+        Ok(_) => {}
+    }
+    let scratch = offline.scratch_path();
+    let _ = fs::remove_file(&scratch);
+    let result = offline::read_verify_decrypt(key, stored, Some(expected), &scratch);
+    let _ = fs::remove_file(&scratch);
+    match result {
+        Ok(_) => Check::Clean,
+        // A sealed copy that decrypts but hashes to something else: rot that kept the
+        // envelope intact (a stale or hand-swapped plaintext), not a broken envelope.
+        Err(offline::OfflineError::ChecksumMismatch { .. }) => Check::Corrupt,
+        Err(error) => Check::Unreadable(error.to_string()),
+    }
 }
 
 /// Read one location back and compare it with the object's checksum.

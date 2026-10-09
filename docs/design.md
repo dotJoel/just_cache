@@ -1993,6 +1993,50 @@ honest gaps:
   endpoint's own acceptance of the payload is untested here. DNS resolution is also
   unbounded: `std` gives no timeout around the system resolver, so a stalled name server
   could delay a run before the connect timeout applies — named rather than hidden.
+Closed by #181: `scrub` now checks a registered `offline` tier's copies. A location whose tier
+is not a recorded root and whose `<volume-id>/<relative>` key names a volume in the ledger is
+an `offline` copy: when the ledger says that exact volume is the one in the drive, the sealed
+file is read back, decrypted, and hashed against the object id (the plaintext BLAKE3), so it
+verifies and repairs exactly like a local copy — a corrupt one is re-exported as a fresh
+envelope from a sibling that verifies and read back before it is recorded verified. When the
+volume is *not* in the drive, the copy is reported **unavailable by its volume identity** —
+never corrupt (nothing was read), never healthy (nothing was proved), and not a missing file
+(the row names a disk, not a path that has gone). The tier config is the `tiers.toml` beside
+the catalog, the placement every command defaults to, so the scrub names no new flag. The one
+seam both this pass and `reconcile` (#182) read an `offline` row through is
+`offline::resolve_mounted_location`, so the volume-identity rule is written once. The honest
+limits:
+
+- **`--rate` does not pace an `offline` read.** The envelope reader decrypts in its own loop
+  and offers no hook for the scrub's wall-clock limiter, so a `--rate` budget bounds the
+  filesystem copies a scrub reads and not the `offline` ones it decrypts; the decrypt runs at
+  disk speed.
+- **Verifying an `offline` copy decrypts it to a local scratch.** The plaintext lands in a
+  `.just_cache-partial-*` sibling beside the catalog — never on the volume, so plaintext never
+  lands on a disk that leaves the machine — and is removed when the read finishes. A crash
+  mid-verify leaves a partial the walk already skips (invariant 8), but the plaintext is in
+  the watch tree for that window.
+- **An `offline` row with no `tiers.toml` beside the catalog is named, not checked.** Without
+  the config the mount is unknown, so the copy is reported unavailable and named by its
+  volume; a config that is present but malformed is reported the same way, with the parse
+  error as the reason.
+- **A copy is only decrypted with the key the configuration supplies.** The envelope key comes
+  from the `encryption_key` the tier names (§2 rule 2) — never a guess. If that key cannot be
+  loaded, the copy is reported unavailable by name with the key error as the reason, not read,
+  not called corrupt, and not called healthy.
+
+A finished offload now reconciles like a filesystem move does. `sync` still reports the tree
+fact — the watch copy is gone — and leaves the rows alone, because it is report-not-heal; what
+changed is that `catalog resolve` can now conclude it: an object that survives on a tier the
+walk cannot observe (an `offline` volume, or a remote) is evidence that its stale watch-tier
+location row can be dropped, the same "stale hot row replaced by the cold one" rule a
+filesystem move obeys (§3). The name row stays, because it is how `locate` and `restore` find
+the bytes again, and a later `sync` agrees — no difference left to repeat. For the same
+reason, `sync` and `resolve` no longer report an `offline` row as "no file at
+`<volume-id>/<relative>` on its tier any more": that tier is not a scanned root, so the pass
+never looked at the bytes, and claiming their absence would be a lie. Whether an offline
+volume's bytes are still good stays the offline driver's job — `scrub` (#181), and
+`reconcile` (#182) when a volume comes back.
 
 ## 10. Non-goals
 

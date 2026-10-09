@@ -204,3 +204,77 @@ fn a_released_offline_copy_waits_for_the_right_volume_then_completes() {
         .unwrap()
         .is_empty());
 }
+
+/// A finished offload reconciles like a filesystem move does: `sync` reports the watch copy
+/// is gone and leaves the rows alone, `resolve` drops the stale watch row because the object
+/// survives on the volume, and a scrub then sees one location — the offline copy — and
+/// verifies it.
+#[test]
+fn an_offload_reconciles_through_resolve_and_the_scrub_agrees() {
+    let fixture = fixture();
+    offload(&fixture);
+
+    // `sync` is report-not-heal: the watch copy is gone from the tree, and that is what it
+    // says. It must not claim the *offline* row is missing — its bytes are on a volume the
+    // walk never scanned, not on a disk that lost a file.
+    let synced = sync(&fixture);
+    assert!(
+        stdout(&synced).contains("no file at shows/movie.mkv on"),
+        "the vanished watch copy is reported: {}",
+        stdout(&synced)
+    );
+    assert!(
+        !stdout(&synced).contains("no file at drawer-01"),
+        "an offline row is not a filesystem location to check: {}",
+        stdout(&synced)
+    );
+
+    // `resolve` concludes what the evidence settles: the object survives on the volume, so
+    // the stale watch row is dropped. The name row stays — it is how `locate` and `restore`
+    // find the bytes again.
+    let applied = bin()
+        .args(["catalog", "resolve", "--watch"])
+        .arg(&fixture.hot)
+        .arg("--dest")
+        .arg(&fixture.vol)
+        .arg("--apply")
+        .output()
+        .expect("catalog resolve runs");
+    assert_eq!(
+        code(&applied),
+        0,
+        "resolve failed: {}\n{}",
+        stderr(&applied),
+        stdout(&applied)
+    );
+    assert!(
+        stdout(&applied)
+            .contains("offloaded to drawer/drawer-01/shows/movie.mkv; stale row dropped"),
+        "the stale watch row is named as dropped: {}",
+        stdout(&applied)
+    );
+
+    // The scrub sees the offline copy as the only copy, and it verifies.
+    let scrub = bin()
+        .args(["scrub", "--catalog"])
+        .arg(&fixture.catalog)
+        .output()
+        .expect("scrub runs");
+    assert_eq!(
+        code(&scrub),
+        0,
+        "scrub failed: {}\n{}",
+        stderr(&scrub),
+        stdout(&scrub)
+    );
+    assert!(
+        !stdout(&scrub).contains("missing:"),
+        "the retired watch copy is not reported missing: {}",
+        stdout(&scrub)
+    );
+    assert!(
+        stdout(&scrub).contains("verified"),
+        "the offline copy verifies: {}",
+        stdout(&scrub)
+    );
+}

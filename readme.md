@@ -874,10 +874,11 @@ path is not named in the catalog, `2` bad invocation (missing catalog, unparseab
 ## Scrubbing for bitrot
 
 `catalog sync` records what a copy *should* hash to; `scrub` is what proves it still does.
-Every location in the catalog is read back and hashed against the object id (which is the
-BLAKE3 checksum, so there is no second copy of the truth to drift), and a copy that no
-longer matches is repaired from a sibling that verifies clean — or, if none exists, marked
-damaged and reported, **never deleted**.
+Every location the catalog records is read back and hashed against the object id (which is the
+BLAKE3 checksum, so there is no second copy of the truth to drift) — a registered `offline`
+tier's copies included, whenever their volume is in the drive — and a copy that no longer
+matches is repaired from a sibling that verifies clean — or, if none exists, marked damaged
+and reported, **never deleted**.
 
 ```sh
 # verify every stored copy; --rate caps read throughput (KiB/s) so a busy tier keeps up
@@ -899,6 +900,13 @@ What it guarantees:
 - **A missing copy is reported, not called rot.** An unmounted tier may hold perfectly good
   bytes, so a missing file is a finding, not damage; a tier root that does not exist is
   named once instead of once per location under it.
+- **A copy on an `offline` tier is checked when its volume is in the drive, and named when it
+  is not.** A registered volume's copy is read back, decrypted, and hashed like any other, and
+  a corrupt one is repaired from a verified sibling as a fresh envelope. When the volume is
+  away, the copy is reported **unavailable by its volume identity** — never corrupt (nothing
+  was read), never healthy (nothing was proved), and not a missing file (the row names a disk,
+  not a path that has gone). The `tiers.toml` beside the catalog describes the tier's mount;
+  no new flag is needed.
 - **It resumes.** The last verification of every location is written to the catalog as the
   scrub goes (`scrub_state`), so a run that is killed part-way re-reads only what it had
   not reached, and `audit --catalog` can say "never scrubbed" for a copy instead of

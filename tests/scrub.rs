@@ -695,3 +695,272 @@ fn sync_accepts_multiple_destinations() {
     assert_exit(&sync_multi(&watch, &[&one, &two], &catalog), 0);
     assert_eq!(summary(&catalog).locations, 3);
 }
+
+// ---------------------------------------------------------------------------
+// Offline-volume copies (#181)
+//
+// A copy on an `offline` tier lives on a disk a person inserts, sealed in the envelope, and
+// the object id is the checksum of its *plaintext*. The scrub has to read it back and hash
+// it when the volume is in the drive, report it by its volume identity when it is not, and
+// repair it from a verified sibling like any other copy — never calling an unplugged disk
+// corrupt, and never calling it healthy.
+// ---------------------------------------------------------------------------
+
+const OFFLINE_KEY_ENV: &str = "JC_SCRUB_OFFLINE_KEY";
+const OFFLINE_KEY_HEX: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0\
+                               f0e1d2c3b4a5968778695a4b3c2d1e0f";
+
+/// The commands that load `tiers.toml` need the envelope key the config names, from the
+/// environment (never argv), exactly as the mover does.
+fn offline_bin() -> Command {
+    let mut command = bin();
+    command.env(OFFLINE_KEY_ENV, OFFLINE_KEY_HEX);
+    command
+}
+
+struct Offline {
+    dir: tempfile::TempDir,
+    hot: PathBuf,
+    cold: PathBuf,
+    vol: PathBuf,
+    catalog: PathBuf,
+}
+
+/// A hot tree and a local cold mirror of one file, an empty volume mount, and `tiers.toml`
+/// beside the watch root (the placement the catalog shares) naming the mount as an `offline`
+/// tier. The `tiers.toml` is itself a synced file, so it is one more location the scrub
+/// verifies — the counts below include it.
+fn offline_fixture(payload: &[u8]) -> Offline {
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot");
+    let cold = dir.path().join("cold");
+    let vol = dir.path().join("vol");
+    fs::create_dir_all(hot.join("shows")).unwrap();
+    fs::create_dir_all(cold.join("shows")).unwrap();
+    fs::create_dir_all(&vol).unwrap();
+    fs::write(hot.join("shows/movie.mkv"), payload).unwrap();
+    fs::write(cold.join("shows/movie.mkv"), payload).unwrap();
+    fs::write(
+        hot.join("tiers.toml"),
+        format!(
+            "[tiers.drawer]\n\
+             kind = \"offline\"\n\
+             path = \"{}\"\n\
+             volatility = \"persistent\"\n\
+             recall = \"hours\"\n\
+             copies = 1\n\
+             vaults = [\"shelf-a\"]\n\
+             encryption_key = \"${OFFLINE_KEY_ENV}\"\n",
+            vol.display()
+        ),
+    )
+    .unwrap();
+    Offline {
+        catalog: hot.join(CATALOG_NAME),
+        hot,
+        cold,
+        vol,
+        dir,
+    }
+}
+
+/// Record an `offline` location for `payload`'s object and seal `sealed` (the plaintext to
+/// write) onto the volume there — exactly the catalog row and sealed bytes a sweep onto the
+/// volume leaves, set up directly so the test controls what the volume holds.
+fn add_offline_copy(f: &Offline, payload: &[u8], sealed: &[u8]) {
+    let digest = just_cache::digest::bytes_digest(payload);
+    Catalog::open(&f.catalog)
+        .unwrap()
+        .record_replica(
+            digest.as_bytes(),
+            "drawer",
+            "drawer-01/shows/movie.mkv",
+            true,
+            Some(digest.as_bytes()),
+        )
+        .unwrap();
+    let source = f.dir.path().join("seal-source.bin");
+    fs::write(&source, sealed).unwrap();
+    let key = just_cache::envelope::Key::from_hex(OFFLINE_KEY_HEX).unwrap();
+    just_cache::offline::export(&key, &source, &f.vol.join("shows/movie.mkv")).unwrap();
+}
+
+fn set_volume(f: &Offline, id: &str, state: &str) {
+    let output = offline_bin()
+        .args(["volume", "set", id, state])
+        .args(["--tier", "drawer", "--catalog"])
+        .arg(&f.catalog)
+        .output()
+        .expect("just_cache runs");
+    assert_exit(&output, 0);
+}
+
+fn offline_scrub(f: &Offline, extra: &[&str]) -> Output {
+    let mut command = offline_bin();
+    command
+        .arg("scrub")
+        .arg("--catalog")
+        .arg(&f.catalog)
+        .args(extra);
+    command.output().expect("just_cache runs")
+}
+
+/// A copy on an `offline` tier is read back, decrypted, and hashed when its volume is in the
+/// drive — the same verdict a local copy gets, and a failure to verify is what breaks it.
+#[test]
+fn a_present_volume_copy_is_verified() {
+    let bytes = payload(32 * 1024);
+    let f = offline_fixture(&bytes);
+    assert_exit(&sync(&f.hot, &f.cold, &f.catalog), 0);
+    set_volume(&f, "drawer-01", "mounted");
+    add_offline_copy(&f, &bytes, &bytes);
+
+    let output = offline_scrub(&f, &[]);
+    assert_exit(&output, 0);
+    let text = stdout(&output);
+    assert!(
+        !text.contains("unavailable: tier"),
+        "the volume is present: {text}"
+    );
+    assert!(!text.contains("DAMAGED"), "{text}");
+    let after = summary(&f.catalog);
+    assert_eq!(
+        after.verified, after.locations,
+        "every location, the offline copy included, must be verified: {text}"
+    );
+    assert_eq!(after.damaged, 0);
+}
+
+/// A copy on an offline tier whose volume is *not* in the drive is reported unavailable by
+/// its volume identity: never corrupt (nothing was read), never healthy (nothing was
+/// proved), and not a missing file (the row names a disk, not a path that has gone).
+#[test]
+fn an_absent_volume_is_reported_unavailable_by_volume_identity() {
+    let bytes = payload(8 * 1024);
+    let f = offline_fixture(&bytes);
+    assert_exit(&sync(&f.hot, &f.cold, &f.catalog), 0);
+    set_volume(&f, "drawer-01", "in_vault");
+    add_offline_copy(&f, &bytes, &bytes);
+
+    let output = offline_scrub(&f, &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("unavailable: tier `drawer` volume `drawer-01`"),
+        "the volume must be named by its identity: {text}"
+    );
+    assert!(
+        text.contains("drawer-01/shows/movie.mkv"),
+        "the storage key must be named: {text}"
+    );
+    assert!(
+        !text.contains("missing:"),
+        "an absent volume is not a missing file: {text}"
+    );
+    assert!(
+        !text.contains("DAMAGED"),
+        "an absent volume is not corrupt: {text}"
+    );
+    // Not healthy either: the copy was not verified this run, and the local copies still
+    // were — the report has to keep the two apart.
+    let after = summary(&f.catalog);
+    assert_eq!(after.damaged, 0);
+    assert_eq!(
+        after.never_scrubbed, 1,
+        "the offline copy is unverified, not verified: {text}"
+    );
+    assert!(
+        text.contains("verified"),
+        "the local copies still verify: {text}"
+    );
+}
+
+/// A sealed copy that decrypts but does not match the recorded digest is rot, and with no
+/// verified sibling to repair from it is marked damaged — and never deleted.
+#[test]
+fn a_sealed_copy_that_does_not_match_is_marked_damaged_but_kept() {
+    let bytes = payload(16 * 1024);
+    let f = offline_fixture(&bytes);
+    assert_exit(&sync(&f.hot, &f.cold, &f.catalog), 0);
+    set_volume(&f, "drawer-01", "mounted");
+    // The envelope is intact, so it decrypts; the plaintext inside is simply not the object.
+    add_offline_copy(&f, &bytes, b"a different plaintext entirely");
+    // No verified sibling: the local copies go, leaving the offline copy as the only one.
+    fs::remove_file(f.hot.join("shows/movie.mkv")).unwrap();
+    fs::remove_file(f.cold.join("shows/movie.mkv")).unwrap();
+    let stored = f.vol.join("shows/movie.mkv");
+    let before = fs::read(&stored).unwrap();
+
+    let output = offline_scrub(&f, &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(text.contains("DAMAGED"), "damage must be named: {text}");
+    assert_eq!(summary(&f.catalog).damaged, 1);
+    assert_eq!(
+        fs::read(&stored).unwrap(),
+        before,
+        "the damaged copy is reported, never deleted"
+    );
+}
+
+/// A corrupt copy on an offline tier is repaired from a sibling that verifies — re-exported
+/// as a fresh envelope, read back, and only then recorded verified.
+#[test]
+fn a_corrupt_offline_copy_is_repaired_from_a_verified_sibling() {
+    let bytes = payload(32 * 1024);
+    let f = offline_fixture(&bytes);
+    assert_exit(&sync(&f.hot, &f.cold, &f.catalog), 0);
+    set_volume(&f, "drawer-01", "mounted");
+    add_offline_copy(&f, &bytes, b"a different plaintext entirely");
+    let stored = f.vol.join("shows/movie.mkv");
+
+    let output = offline_scrub(&f, &[]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("repaired ") && text.contains("from verified copy"),
+        "the repair must be named, and its verified source: {text}"
+    );
+    assert!(!text.contains("DAMAGED"), "{text}");
+
+    // The sealed copy now decrypts *and* hashes to the recorded digest: a real repair, not a
+    // rewrite of the bytes that were already there.
+    let key = just_cache::envelope::Key::from_hex(OFFLINE_KEY_HEX).unwrap();
+    let digest = just_cache::digest::bytes_digest(&bytes);
+    let plain = f.dir.path().join("readback.bin");
+    just_cache::offline::read_verify_decrypt(&key, &stored, Some(&digest), &plain)
+        .expect("the repaired copy must verify against the record");
+    assert_eq!(fs::read(&plain).unwrap(), bytes);
+    assert_eq!(summary(&f.catalog).damaged, 0, "a repair is not damage");
+}
+
+/// `--dry-run` reports the repair of an offline copy and changes neither the sealed bytes nor
+/// the recorded state.
+#[test]
+fn dry_run_reports_the_offline_repair_and_changes_nothing() {
+    let bytes = payload(16 * 1024);
+    let f = offline_fixture(&bytes);
+    assert_exit(&sync(&f.hot, &f.cold, &f.catalog), 0);
+    set_volume(&f, "drawer-01", "mounted");
+    add_offline_copy(&f, &bytes, b"a different plaintext entirely");
+    let stored = f.vol.join("shows/movie.mkv");
+    let before = fs::read(&stored).unwrap();
+
+    let output = offline_scrub(&f, &["--dry-run"]);
+    assert_exit(&output, 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains("would repair"),
+        "the dry run must name the repair it would make: {text}"
+    );
+    assert_eq!(
+        fs::read(&stored).unwrap(),
+        before,
+        "a dry run writes no repair"
+    );
+    assert_eq!(
+        summary(&f.catalog).damaged,
+        0,
+        "a dry run records no damage either"
+    );
+}
