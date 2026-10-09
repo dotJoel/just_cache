@@ -2,14 +2,16 @@
 
 ## Supported versions
 
-The current release is [`v0.5.0`][current] — the standalone symlink mover with the
-catalog, the namespace provider, the lifecycle engine, the remote tiers, the MCP server
-and the read-only web dashboard, published as a normal release. Only the current `main` is
-supported: a fix lands there, and the tag is superseded rather than patched in place —
-there is no maintenance branch. A fix on `main` is not in a published tag until the next
-one, so running the release means running fixed-on-main, tagged-sometimes.
+The current release is [`v0.6.0`][current] — the standalone symlink mover with the
+catalog, the namespace provider, the lifecycle engine, the remote tiers (including the scrub
+of copies on an offline volume), the MCP server, the read-only web dashboard, webhook
+notifications for sweep and audit results, and tier cost models, published as a normal
+release. Only the current `main` is supported: a fix lands there, and the tag is superseded
+rather than patched in place — there is no maintenance branch. A fix on `main` is not in a
+published tag until the next one, so running the release means running fixed-on-main,
+tagged-sometimes.
 
-[current]: https://github.com/dotJoel/just_cache/releases/tag/v0.5.0
+[current]: https://github.com/dotJoel/just_cache/releases/tag/v0.6.0
 
 ## Reporting a vulnerability
 
