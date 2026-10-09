@@ -1909,6 +1909,57 @@ left open, and the honest gaps:
   `explain --json`); the live activity view reads the events stream #169 lands. What they
   look like is the frontend's work, in a later issue against the same documents.
 
+Closed by #186 (optional webhook notifications): a scheduled run and an `audit` can post a
+short message to a Discord-compatible webhook. The decisions this issue left open, and the
+honest gaps:
+
+- **`notify.toml`, its own file.** The endpoint is `url = "https://..."` in `notify.toml`
+  beside the catalog, opened only when it is already there and never created — the same
+  posture as `tiers.toml`/`policy.toml`/`schedule.toml` (invariant 9). Absent means
+  notifications are off and the run opens no socket at all. It is its own file, not a
+  `[notify]` section of `schedule.toml` or `tiers.toml`, because it is the one config that
+  holds a *credential*: the operator can make `notify.toml` readable by the cron user alone,
+  rotate the webhook without touching a schedule or a placement, and switch notifications
+  off by deleting one file. A malformed `notify.toml` is a refusal that names the line,
+  exactly like a broken `schedule.toml`; a *delivery* failure is a warning and nothing more.
+- **Only the scheduled run and `audit` notify, and no CLI surface is added.** A summary is
+  sent once, at the end of a `schedule --run` that ran a pass or held one back — so it
+  follows the configured schedule rather than any ad-hoc invocation — and an `audit` that
+  has findings posts them promptly, while a clean audit stays quiet. Nothing else notifies:
+  a manual `sweep` or `scrub` is not a maintenance run the operator asked to hear about, and
+  a flag that made any command notify would be CLI surface the acceptance criteria did not
+  need. `--run --dry-run` sends nothing (it changed nothing), and `audit --no-filesystem`
+  reads no config at all — that mode makes no filesystem access, and reading `notify.toml`
+  is one.
+- **The message is counts, not paths.** A run summary names the catalog by its last path
+  component and gives each pass's counts (scrub's locations/verified/repaired/damaged/
+  missing/malformed; reconcile's rebuilt/adopted/conflicts/refused/failed figures). An audit
+  message gives the total findings, the non-zero counts by verdict kind, and the repair
+  outcome — never a finding's path. A failed pass names the pass, not its error text, which
+  can carry paths and hosts. The webhook URL is a credential: it is never printed, never
+  logged, and never echoed by a config error (which names the line instead); a delivery
+  warning names at most the endpoint's host.
+- **Delivery is hand-rolled over `std::net` + `rustls`, mirroring `object_store`.** It does
+  not reuse `object_store`'s transport: that stream is private and bound to
+  `ObjectTierConfig` and S3 signing, so exposing it would couple a notification to a tier's
+  config type. The JSON body is hand-built (`{"content": ...}`) with the same escaping every
+  `--json` writer uses. Plain `http` is accepted only for a loopback host — so the tests can
+  drive a real socket with no network — and refused elsewhere, so the credential is never
+  sent in the clear.
+- **Bounded and best-effort.** Connect, write and read each carry a 5-second timeout
+  (`NOTIFY_TIMEOUT`): one tiny POST, well under a cron tick; and, unlike `object_store`'s TLS
+  stream, a read timeout is surfaced as an error rather than retried, so a hung endpoint ends
+  the wait instead of spinning. An unreachable endpoint, a TLS failure, a non-2xx answer and
+  a malformed response are each a single warning on stderr — never a nonzero exit, never a
+  failed or retried pass, and never any effect on what the command prints.
+- **Not verified locally: a real Discord delivery.** The tests cover an unconfigured run
+  (nothing sent, nothing dialled), the exact request a configured run sends (method, path,
+  `Content-Type`, `Content-Length`, and a `{"content": ...}` body whose counts and reduced
+  paths are asserted), a `500`, and an unreachable port; no test talks to Discord, so the
+  endpoint's own acceptance of the payload is untested here. DNS resolution is also
+  unbounded: `std` gives no timeout around the system resolver, so a stalled name server
+  could delay a run before the connect timeout applies — named rather than hidden.
+
 ## 10. Non-goals
 
 - **Automating a pin's removal or a restore's placement.** `pin`/`unpin` are operator

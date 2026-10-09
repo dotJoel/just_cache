@@ -19,6 +19,10 @@ pub mod fuse;
 // the `gateway` subcommand reaches it.
 pub mod gateway;
 pub mod namespace;
+// Optional webhook notifications (#186): a short summary of a scheduled run and an
+// audit's findings, posted only when `notify.toml` is configured. Off and socket-free
+// when absent; a delivery failure is only ever a warning.
+pub mod notify;
 pub mod object_server;
 pub mod object_store;
 // The offline-volume tier driver (#143): export to a volume a person inserts, and the
@@ -89,6 +93,10 @@ pub use gc::{
 };
 pub use locate::{locate, LocateError, LocateReport, LocateRequest, QueryKind};
 pub use namespace::{Entry as NamespaceEntry, Namespace, NamespaceError};
+pub use notify::{
+    audit_message, json_body, pass_failed, run_summary, DeliveryError, NotifyConfig, NotifyError,
+    PassCounts, NOTIFY_FILE_NAME, NOTIFY_TIMEOUT,
+};
 pub use observe::{AccessLog, FLUSH_INTERVAL};
 pub use offline::{
     display_key, export, insert_prompt, parse_storage_key, read_verify_decrypt, storage_key,

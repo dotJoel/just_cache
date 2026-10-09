@@ -1308,6 +1308,26 @@ Exit codes: `0` nothing due or every due pass clean, `1` a pass found something 
 back by its floor, `2` a bad invocation (missing catalog, missing explicit `--config`, or a
 malformed `schedule.toml` naming its line).
 
+### Webhook notifications
+
+A scheduled run and an `audit` can post a short message to a Discord-compatible webhook.
+Notifications are off unless `notify.toml` sits beside the catalog — with no file the run
+opens no socket at all:
+
+```toml
+# notify.toml, beside the catalog — absent means notifications are off
+url = "https://discord.com/api/webhooks/<id>/<token>"
+```
+
+A `schedule --run` that ran a pass (or held one back below its floor) posts one run summary
+when it completes, naming the catalog by its last path component and giving each pass's
+counts; the findings an `audit` reports are posted promptly, and a clean audit stays quiet.
+The webhook URL is a credential and is never printed, logged, or echoed by an error. A
+delivery failure — an unreachable endpoint, a TLS error, a non-2xx answer — is a warning on
+stderr and never changes the exit code. `--dry-run` sends nothing, and `audit --no-filesystem`
+reads no config at all. A malformed `notify.toml` is refused with its line, like a broken
+`schedule.toml`.
+
 ## The maintenance events file
 
 Every maintenance pass — `sweep`, `scrub`, `reconcile`, `gc`, `catalog sync`, `audit`, and
@@ -1456,6 +1476,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`src/scrub.rs`](src/scrub.rs) | Reading every stored copy back, repairing rot from a verified sibling, marking what cannot be repaired. |
 | [`src/reconcile.rs`](src/reconcile.rs) | Rebuilding a copy that is missing from a re-added destination root, from a sibling proved against the recorded checksum. |
 | [`src/schedule.rs`](src/schedule.rs) | The maintenance schedule: `schedule.toml`, which pass is due at a given time, the last-run state file, and the free-space floor a pass is held back by. |
+| [`src/notify.rs`](src/notify.rs) | Optional webhook notifications (#186): `notify.toml` beside the catalog, opened only when present; the short run summary and audit-findings messages; and a hand-rolled HTTPS POST that is built on the same `std::net`+`rustls` transport `object_store` uses. Off and socket-free when unconfigured; a delivery failure is only ever a warning. |
 | [`src/events.rs`](src/events.rs) | The append-only maintenance events file (#169): the enveloped report each pass appends, the byte-bounded rotation, and the reader that skips a torn final line. |
 | [`src/ui.rs`](src/ui.rs) | The dashboard server (#170): hand-rolled HTTP like the gateway, the fixed read-only JSON routes that replay each command's own document, the token auth, and the SSE tail over the events file. One thread per connection. |
 | [`src/explain.rs`](src/explain.rs) | Answering, in the mover's evaluation order, why one path is where it is — with the catalog seam for issue #16. |
@@ -1475,6 +1496,7 @@ must not break — the rules that make this tool safe to point at someone's data
 | [`tests/scrub.rs`](tests/scrub.rs) | Scrub through the binary: a hand-corrupted copy repaired, a last copy marked not deleted, `--dry-run`, resume, sparse-file measurement, and `--rate` pacing. |
 | [`tests/reconcile.rs`](tests/reconcile.rs) | Reconcile through the binary: a re-added disk rebuilt from a sibling across a mount point, refusals for same-size/corrupt siblings, a still-out root never created, adoption of a hand-restored copy, and `--dry-run`. |
 | [`tests/schedule.rs`](tests/schedule.rs) | The schedule through the binary: nothing-configured runs nothing, the visible next-run, the configured rate pacing a read, a floor holding a pass back, and find-or-quiet. |
+| [`tests/notify.rs`](tests/notify.rs) | Webhook notifications through the binary (#186): an unconfigured run sends nothing and dials nothing, a configured run posts the expected request and body (counts, no full path), a `500` and an unreachable port are warnings that leave the exit code alone, and a malformed `notify.toml` is refused by line. |
 | [`tests/events.rs`](tests/events.rs) | The maintenance events file through the binary: one parseable line per report for a scripted pass, the walk and `audit` never seeing it, a torn final line skipped by a reader, and `-v`/`-q`/`--json` landing the same record. |
 | [`tests/ui.rs`](tests/ui.rs) | The dashboard through the binary: no token refuses to serve, `401` without one and no token in the log, the JSON routes replay the commands' documents byte for byte, a missing catalog answers with the command's refusal, and an SSE client reads an appended event live. |
 | [`tests/journal.rs`](tests/journal.rs) | Recovery from each crash state, and the CLI around a damaged journal. |
