@@ -73,7 +73,7 @@ vaults = ["drawer-07", "drawer-08"]   # where this tier's volumes physically liv
 | `recall` | Latency class: `us` / `ms` / `s` / `min` / `hours`. Drives policy and recall UX. |
 | `volatility` | `persistent` for every tier of record; `volatile` only for cache overlays (§2.1). |
 | `copies` | Durability floor *within* the tier. The engine schedules replication; scrubbing verifies it. |
-| `cost` | Optional $/GB-month or W-idle. Enables honest placement decisions later. |
+| `cost` | Optional `$/GB-month` price (§9, #163). Enables honest placement decisions later; a W-idle figure is refused by name. |
 
 Hard rules:
 
@@ -1909,6 +1909,90 @@ left open, and the honest gaps:
   `explain --json`); the live activity view reads the events stream #169 lands. What they
   look like is the frontend's work, in a later issue against the same documents.
 
+Closed by #163: a tier's `cost` is a model, not free text. The one form the parse accepts is
+`$<amount>/GB-month` (§2); every other form is refused at parse with the tier, the value and
+the line named, the posture #146 gave `kind`. The decisions this issue had to make, and the
+honest gaps:
+
+- **A W-idle figure is not a model, and is refused by name.** Watts become dollars only
+  through a `$/kWh` price, a duty cycle and an assumption about how long the pool is idle —
+  none of which the config carries — so reading a watt figure as dollars would invent a
+  number and make the placement report lie. A watt-shaped value (`5W`, `5W idle`) is refused
+  with that reason, naming the three missing inputs, rather than parsed as a price. Adding it
+  later means adding those inputs, not a parse rule.
+- **"Not priced" and "priced at zero" are different values in the type.** The field is
+  `Option<TierCost>`: `None` is nobody priced the tier, and a written `$0/GB-month` is a
+  `Some` whose figure is zero. There is no "unknown" state *inside* `TierCost` for a missing
+  price to collapse into; the absence lives entirely in the `Option`. A type-level test pins
+  that the two are unequal, so no report can print `$0.00` for a tier nobody priced.
+- **The price is integer micro-dollars per GB-month, and the GB is decimal.** `$0.02` is
+  exactly 20 000 micro-dollars, never a float, so a report that multiplies many bytes by a
+  price accumulates no binary-float error; `micro_dollars_for_bytes` widens to `u128` and
+  floors, and a report sums a tier's bytes before it calls, so the loss is under one
+  micro-dollar per tier. The billed GB is `BYTES_PER_BILLED_GB` = 10^9 bytes — a provider's
+  billing unit, deliberately not the binary GiB the rest of the tool sizes disks in — and a
+  report that divides by any other constant is pricing a different gigabyte.
+- **Both renderings survive.** The one-line tier rendering prints the written value (a
+  reader's check that the file and the parse agree) unchanged; `audit --json` keeps its
+  `"cost"` string and adds `"cost_model"` beside it — `null` when the tier was not priced,
+  `{"micro_dollars_per_gb_month":N}` when it was — so a JSON consumer can tell the two apart
+  the way the type can; and `tiers --json` (the dashboard's document) keeps its `"cost"`
+  string unchanged.
+
+Still open, and named: the report that consumes this (the next issue), other currencies (`$`
+is the only one, matching §2's one figure per tier), per-tier price changes over time, and
+whether a watt figure ever earns the `$/kWh` price and duty cycle it needs. This issue adds
+no command, no flag and no output line.
+Closed by #186 (optional webhook notifications): a scheduled run and an `audit` can post a
+short message to a Discord-compatible webhook. The decisions this issue left open, and the
+honest gaps:
+
+- **`notify.toml`, its own file.** The endpoint is `url = "https://..."` in `notify.toml`
+  beside the catalog, opened only when it is already there and never created — the same
+  posture as `tiers.toml`/`policy.toml`/`schedule.toml` (invariant 9). Absent means
+  notifications are off and the run opens no socket at all. It is its own file, not a
+  `[notify]` section of `schedule.toml` or `tiers.toml`, because it is the one config that
+  holds a *credential*: the operator can make `notify.toml` readable by the cron user alone,
+  rotate the webhook without touching a schedule or a placement, and switch notifications
+  off by deleting one file. A malformed `notify.toml` is a refusal that names the line,
+  exactly like a broken `schedule.toml`; a *delivery* failure is a warning and nothing more.
+- **Only the scheduled run and `audit` notify, and no CLI surface is added.** A summary is
+  sent once, at the end of a `schedule --run` that ran a pass or held one back — so it
+  follows the configured schedule rather than any ad-hoc invocation — and an `audit` that
+  has findings posts them promptly, while a clean audit stays quiet. Nothing else notifies:
+  a manual `sweep` or `scrub` is not a maintenance run the operator asked to hear about, and
+  a flag that made any command notify would be CLI surface the acceptance criteria did not
+  need. `--run --dry-run` sends nothing (it changed nothing), and `audit --no-filesystem`
+  reads no config at all — that mode makes no filesystem access, and reading `notify.toml`
+  is one.
+- **The message is counts, not paths.** A run summary names the catalog by its last path
+  component and gives each pass's counts (scrub's locations/verified/repaired/damaged/
+  missing/malformed; reconcile's rebuilt/adopted/conflicts/refused/failed figures). An audit
+  message gives the total findings, the non-zero counts by verdict kind, and the repair
+  outcome — never a finding's path. A failed pass names the pass, not its error text, which
+  can carry paths and hosts. The webhook URL is a credential: it is never printed, never
+  logged, and never echoed by a config error (which names the line instead); a delivery
+  warning names at most the endpoint's host.
+- **Delivery is hand-rolled over `std::net` + `rustls`, mirroring `object_store`.** It does
+  not reuse `object_store`'s transport: that stream is private and bound to
+  `ObjectTierConfig` and S3 signing, so exposing it would couple a notification to a tier's
+  config type. The JSON body is hand-built (`{"content": ...}`) with the same escaping every
+  `--json` writer uses. Plain `http` is accepted only for a loopback host — so the tests can
+  drive a real socket with no network — and refused elsewhere, so the credential is never
+  sent in the clear.
+- **Bounded and best-effort.** Connect, write and read each carry a 5-second timeout
+  (`NOTIFY_TIMEOUT`): one tiny POST, well under a cron tick; and, unlike `object_store`'s TLS
+  stream, a read timeout is surfaced as an error rather than retried, so a hung endpoint ends
+  the wait instead of spinning. An unreachable endpoint, a TLS failure, a non-2xx answer and
+  a malformed response are each a single warning on stderr — never a nonzero exit, never a
+  failed or retried pass, and never any effect on what the command prints.
+- **Not verified locally: a real Discord delivery.** The tests cover an unconfigured run
+  (nothing sent, nothing dialled), the exact request a configured run sends (method, path,
+  `Content-Type`, `Content-Length`, and a `{"content": ...}` body whose counts and reduced
+  paths are asserted), a `500`, and an unreachable port; no test talks to Discord, so the
+  endpoint's own acceptance of the payload is untested here. DNS resolution is also
+  unbounded: `std` gives no timeout around the system resolver, so a stalled name server
+  could delay a run before the connect timeout applies — named rather than hidden.
 Closed by #181: `scrub` now checks a registered `offline` tier's copies. A location whose tier
 is not a recorded root and whose `<volume-id>/<relative>` key names a volume in the ledger is
 an `offline` copy: when the ledger says that exact volume is the one in the drive, the sealed

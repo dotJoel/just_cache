@@ -25,6 +25,7 @@ use just_cache::gc::{self, GcRequest};
 use just_cache::journal::{self, Journal};
 use just_cache::locate::{self, LocateRequest};
 use just_cache::mcp::{self, McpConfig};
+use just_cache::notify::{self, NotifyConfig};
 use just_cache::opened::{Coverage, Guards, OpenFiles};
 use just_cache::policy::{Lifecycle, RuleSet};
 use just_cache::reconcile;
@@ -1303,7 +1304,7 @@ fn tiers_document(
         out.push_str(&format!(",\"copies\":{}", tier.copies));
         if let Some(cost) = &tier.cost {
             out.push_str(",\"cost\":");
-            out.push_str(&json_string(cost));
+            out.push_str(&json_string(cost.written()));
         }
         if let Some(ref object) = tier.object_config {
             out.push_str(",\"endpoint\":");
@@ -1414,6 +1415,34 @@ fn record_event(catalog: Option<&Path>, watch: &Path, pass: &str, report_json: &
             "just_cache: warning: could not append the {pass} report to {}: {err}",
             path.display()
         );
+    }
+}
+
+/// Send one notification, best-effort. Every delivery failure is a warning on stderr: it
+/// never changes an exit code, never fails a pass, and never retries. The endpoint's URL
+/// is a credential, so the warning names at most the host, never the URL.
+fn deliver(config: &NotifyConfig, message: &str) {
+    if let Err(err) = config.send(message) {
+        eprintln!("just_cache: warning: could not send a notification: {err}");
+    }
+}
+
+/// The count label for one reconcile outcome, for the notification summary only.
+///
+/// `reconcile::ReconcileOutcome`'s own `kind()` is private to its module (and this branch
+/// must not touch `src/reconcile.rs`), so the mapping is restated here. It is exhaustive,
+/// so a new outcome fails to compile until this summary is updated with it.
+fn reconcile_kind(outcome: &reconcile::ReconcileOutcome) -> &'static str {
+    match outcome {
+        reconcile::ReconcileOutcome::Rebuilt { .. } => "rebuilt",
+        reconcile::ReconcileOutcome::Adopted => "adopted",
+        reconcile::ReconcileOutcome::Conflict { .. } => "conflict",
+        reconcile::ReconcileOutcome::TierUnavailable => "tier-unavailable",
+        reconcile::ReconcileOutcome::NoSource { .. } => "no-source",
+        reconcile::ReconcileOutcome::Malformed { .. } => "malformed-catalog",
+        reconcile::ReconcileOutcome::NoRoom { .. } => "no-room",
+        reconcile::ReconcileOutcome::Deferred { .. } => "deferred",
+        reconcile::ReconcileOutcome::Failed { .. } => "failed",
     }
 }
 
@@ -1988,6 +2017,26 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         .clone()
         .unwrap_or_else(|| catalog::Catalog::default_path(&args.watch));
 
+    // Notifications (#186): opt-in through `notify.toml` beside the catalog, opened only
+    // when it is already there — never created — so an unconfigured audit opens no socket.
+    // `--no-filesystem` promises no filesystem access at all, and reading the config is
+    // one, so that mode is silent here too.
+    let notify = if args.no_filesystem {
+        None
+    } else {
+        let dir = catalog_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(args.watch.as_path());
+        match NotifyConfig::load_beside(dir) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("just_cache: {err}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        }
+    };
+
     let report = if args.no_filesystem {
         // Catalog-only: the catalog must exist — there is no other source, and a mode that
         // silently fell back to the tree would be the filesystem access it promised not to
@@ -2181,6 +2230,29 @@ fn run_audit(args: AuditArgs) -> ExitCode {
         Some(repairs) => repairs.iter().filter(|repair| !repair.repaired()).count(),
         None => report.findings.len(),
     };
+    // A finding is what an operator asks to be told about; a clean run stays quiet. The
+    // message carries counts by kind and the repair outcome — never a path.
+    if unresolved > 0 {
+        if let Some(config) = &notify {
+            let counts: Vec<(&str, usize)> = audit::VerdictKind::problems()
+                .iter()
+                .map(|kind| (kind.as_str(), report.count(*kind)))
+                .collect();
+            let repairs_summary = repairs.as_ref().map(|repairs| {
+                let resolved = repairs.iter().filter(|repair| repair.repaired()).count();
+                (resolved, repairs.len() - resolved)
+            });
+            deliver(
+                config,
+                &notify::audit_message(
+                    &catalog_path,
+                    report.findings.len(),
+                    &counts,
+                    repairs_summary,
+                ),
+            );
+        }
+    }
     if unresolved > 0 {
         ExitCode::from(EXIT_FINDINGS)
     } else {
@@ -2951,6 +3023,18 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
+    // Notifications are opt-in through `notify.toml`, opened beside the catalog only when
+    // it is already there — never created (§9). With no file there is no endpoint, so the
+    // run opens no socket; a malformed file is refused with its line, exactly like a
+    // broken `schedule.toml`.
+    let notify = match notify::NotifyConfig::load_beside(base) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("just_cache: {err}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
     let catalog = match catalog::Catalog::open(&args.catalog) {
         Ok(catalog) => catalog,
         Err(err) => {
@@ -2996,6 +3080,10 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
 
     let mut findings = false;
     let mut ran = false;
+    // What a run summary is built from, when notifications are configured: the passes that
+    // ran with their counts, and the passes a free-space floor held back.
+    let mut summaries: Vec<notify::PassCounts> = Vec::new();
+    let mut held_back: Vec<&'static str> = Vec::new();
     for (pass, config) in schedule.passes() {
         let last = state.last_run(pass);
         if !schedule::is_due(last, config.every, now) {
@@ -3015,6 +3103,7 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                 scope::human_bytes(floor),
                 names.join(", ")
             );
+            held_back.push(pass.name());
             continue;
         }
 
@@ -3032,6 +3121,18 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                         // job, and a dry run records nothing.
                         if !args.dry_run {
                             record_event(Some(&args.catalog), base, "scrub", &report.to_json());
+                            summaries.push(notify::PassCounts::new(
+                                "scrub",
+                                vec![
+                                    ("locations", report.locations),
+                                    ("verified", report.verified),
+                                    ("already verified", report.already_verified),
+                                    ("repaired", report.repairs.len()),
+                                    ("damaged", report.damaged.len()),
+                                    ("missing", report.missing.len()),
+                                    ("malformed", report.malformed.len()),
+                                ],
+                            ));
                         }
                         if report.has_findings() {
                             findings = true;
@@ -3042,6 +3143,9 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                     }
                     Err(err) => {
                         eprintln!("just_cache: scrub pass failed: {err}");
+                        if let Some(config) = &notify {
+                            deliver(config, &notify::pass_failed("scrub"));
+                        }
                         return ExitCode::FAILURE;
                     }
                 }
@@ -3064,6 +3168,28 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                         // stdout summary is empty (#169); a dry run records nothing.
                         if !args.dry_run {
                             record_event(Some(&args.catalog), base, "reconcile", &report.to_json());
+                            let count = |kind: &str| {
+                                report
+                                    .records
+                                    .iter()
+                                    .filter(|record| reconcile_kind(&record.outcome) == kind)
+                                    .count()
+                            };
+                            summaries.push(notify::PassCounts::new(
+                                "reconcile",
+                                vec![
+                                    ("objects", report.objects),
+                                    ("rebuilt", count("rebuilt")),
+                                    ("adopted", count("adopted")),
+                                    ("conflicts", count("conflict")),
+                                    ("tiers unavailable", count("tier-unavailable")),
+                                    ("no verified sibling", count("no-source")),
+                                    ("malformed-catalog", count("malformed-catalog")),
+                                    ("no room", count("no-room")),
+                                    ("deferred", count("deferred")),
+                                    ("failed", count("failed")),
+                                ],
+                            ));
                         }
                         if report.has_findings() {
                             findings = true;
@@ -3074,6 +3200,9 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                     }
                     Err(err) => {
                         eprintln!("just_cache: reconcile pass failed: {err}");
+                        if let Some(config) = &notify {
+                            deliver(config, &notify::pass_failed("reconcile"));
+                        }
                         return ExitCode::FAILURE;
                     }
                 }
@@ -3095,6 +3224,17 @@ fn run_schedule(args: ScheduleArgs) -> ExitCode {
                 "just_cache: could not record the schedule state in {}: {err}",
                 state_path.display()
             );
+        }
+    }
+
+    // The summary follows the schedule: it is sent once a run completes, and only when
+    // something happened. A check that found nothing due is quiet, and a dry run changed
+    // nothing so it sends nothing.
+    if !args.dry_run {
+        if let Some(config) = &notify {
+            if let Some(message) = notify::run_summary(&args.catalog, &summaries, &held_back) {
+                deliver(config, &message);
+            }
         }
     }
 
