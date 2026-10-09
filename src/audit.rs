@@ -892,18 +892,35 @@ impl AuditReport {
                     .tiers()
                     .iter()
                     .map(|tier| {
+                        // The written value stays in `cost` (a reader's check that it parsed)
+                        // and the parsed model rides beside it in `cost_model`: null when the
+                        // tier was not priced, an object when it was — so a consumer can tell
+                        // "not priced" from "priced at zero" the same way the type does.
+                        let cost = tier
+                            .cost
+                            .as_ref()
+                            .map(|cost| json_string(cost.written()))
+                            .unwrap_or_else(|| "null".to_string());
+                        let cost_model = tier
+                            .cost
+                            .as_ref()
+                            .map(|cost| {
+                                format!(
+                                    "{{\"micro_dollars_per_gb_month\":{}}}",
+                                    cost.micro_dollars_per_gb_month()
+                                )
+                            })
+                            .unwrap_or_else(|| "null".to_string());
                         format!(
-                            "{{\"name\":{},\"kind\":{},\"path\":{},\"volatility\":{},\"recall\":{},\"copies\":{},\"cost\":{}}}",
+                            "{{\"name\":{},\"kind\":{},\"path\":{},\"volatility\":{},\"recall\":{},\"copies\":{},\"cost\":{},\"cost_model\":{}}}",
                             json_string(&tier.name),
                             json_string(tier.kind.as_str()),
                             json_string(&tier.path.to_string_lossy()),
                             json_string(tier.volatility.as_str()),
                             json_string(tier.recall.as_str()),
                             tier.copies,
-                            tier.cost
-                                .as_ref()
-                                .map(|cost| json_string(cost))
-                                .unwrap_or_else(|| "null".to_string())
+                            cost,
+                            cost_model
                         )
                     })
                     .collect();
@@ -2048,6 +2065,47 @@ mod tests {
         assert!(summary.contains("duplicate: 1"));
         assert!(summary.contains("dangling-symlink: 1"));
         assert!(summary.contains("healthy: 6"));
+    }
+
+    /// The tiers section of `audit --json` carries the written cost plus the parsed model, and
+    /// keeps "not priced" (both null) distinct from "priced at zero" (a zero in the model).
+    #[test]
+    fn the_tiers_json_carries_the_written_and_parsed_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[tiers.priced]\nkind = \"fs\"\npath = \"/mnt/ssd\"\nvolatility = \"persistent\"\nrecall = \"ms\"\ncopies = 1\ncost = \"$0.02/GB-month\"\n\n[tiers.free]\nkind = \"fs\"\npath = \"/mnt/hdd\"\nvolatility = \"persistent\"\nrecall = \"s\"\ncopies = 1\ncost = \"$0/GB-month\"\n\n[tiers.unpriced]\nkind = \"fs\"\npath = \"/mnt/tape\"\nvolatility = \"persistent\"\nrecall = \"min\"\ncopies = 1\n";
+        let tiers = TierSet::parse(text, &dir.path().join("tiers.toml")).unwrap();
+        let report = AuditReport {
+            watch: PathBuf::from("/watch"),
+            dests: vec![],
+            source: AuditSource::Walk,
+            scanned: 0,
+            healthy: 0,
+            tiers: Some(tiers),
+            scrub: None,
+            catalog_only: None,
+            findings: vec![],
+        };
+        let json = report.to_json(None);
+        assert!(
+            json.contains(
+                "\"name\":\"priced\",\"kind\":\"fs\",\"path\":\"/mnt/ssd\",\"volatility\":\"persistent\",\"recall\":\"ms\",\"copies\":1,\"cost\":\"$0.02/GB-month\",\"cost_model\":{\"micro_dollars_per_gb_month\":20000}}"
+            ),
+            "{json}"
+        );
+        // A zero price is a zero model, never the null a missing price carries.
+        assert!(
+            json.contains(
+                "\"name\":\"free\",\"kind\":\"fs\",\"path\":\"/mnt/hdd\",\"volatility\":\"persistent\",\"recall\":\"s\",\"copies\":1,\"cost\":\"$0/GB-month\",\"cost_model\":{\"micro_dollars_per_gb_month\":0}}"
+            ),
+            "{json}"
+        );
+        // Nobody priced this tier: the written value and the model are both null.
+        assert!(
+            json.contains(
+                "\"name\":\"unpriced\",\"kind\":\"fs\",\"path\":\"/mnt/tape\",\"volatility\":\"persistent\",\"recall\":\"min\",\"copies\":1,\"cost\":null,\"cost_model\":null}"
+            ),
+            "{json}"
+        );
     }
 
     #[test]

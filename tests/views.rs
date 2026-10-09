@@ -84,7 +84,7 @@ fn fixture() -> Fixture {
              volatility = \"persistent\"\n\
              recall = \"ms\"\n\
              copies = 1\n\
-             cost = \"$0.01\"\n\
+             cost = \"$0.01/GB-month\"\n\
              \n\
              [tiers.slow]\n\
              kind = \"fs\"\n\
