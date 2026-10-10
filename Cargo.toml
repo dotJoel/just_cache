@@ -39,7 +39,7 @@ webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-md5 = "0.7"
+md5 = "0.8"
 
 # The MCP adapter (#137): `just_cache mcp` reads newline-delimited JSON-RPC from an agent.
 # Emitting is already hand-rolled everywhere else in this repo — every `--json` writer is a
