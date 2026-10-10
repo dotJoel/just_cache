@@ -34,7 +34,7 @@ zeroize = "1"
 # is the minimal addition that makes the driver work, and the dependency stays inside
 # `src/object_store.rs`; no other module links it.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # AWS SigV4 request signing: HMAC-SHA256, SHA256, and hex for the signature.
 sha2 = "0.10"
 hmac = "0.12"
