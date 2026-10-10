@@ -37,7 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 # AWS SigV4 request signing: HMAC-SHA256, SHA256, and hex for the signature.
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 md5 = "0.7"
 
